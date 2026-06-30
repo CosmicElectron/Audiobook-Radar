@@ -1,0 +1,4 @@
+flask>=3.0
+beautifulsoup4>=4.12
+pystray>=0.19
+pillow>=10.0

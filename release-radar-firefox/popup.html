@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --bg:#161232; --panel:#1c1740; --line:#332a63; --ink:#efe9ff; --muted:#a79fce; --faint:#6f6699; --amber:#f0a500; --green:#56d18a; --red:#ff7a7a; }
+  * { box-sizing:border-box; }
+  body { margin:0; width:360px; padding-right:8px; overflow-x:hidden; background:var(--bg); color:var(--ink); font:13px/1.45 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:8px; padding:12px 14px; border-bottom:1px solid var(--line); }
+  header h1 { font:600 15px/1 Georgia,serif; margin:0; letter-spacing:.2px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--faint); flex:none; }
+  .dot.on { background:var(--green); } .dot.off { background:var(--red); }
+  #appState { margin-left:auto; font-size:11.5px; color:var(--muted); }
+  .pad { padding:12px 14px; }
+  .row { display:flex; gap:8px; }
+  .stat { color:var(--muted); font-size:12px; margin-bottom:10px; }
+  .stat b { color:var(--ink); font-weight:600; }
+  button { font:inherit; border:1px solid var(--line); background:#241d52; color:var(--ink); border-radius:9px; padding:8px 12px; cursor:pointer; }
+  button:hover { border-color:#4a3f87; }
+  button.primary { background:var(--amber); color:#1c1740; border-color:var(--amber); font-weight:600; }
+  button.primary:disabled, button:disabled { opacity:.5; cursor:default; }
+  .btns { display:flex; gap:8px; margin-bottom:12px; }
+  .btns button { flex:1; }
+  .prog { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:12px; }
+  .bar { height:6px; background:#2c2560; border-radius:6px; overflow:hidden; margin-top:8px; }
+  .bar > i { display:block; height:100%; background:var(--amber); width:0%; transition:width .3s; }
+  .bar.indet > i { width:35%; animation:slide 1.1s linear infinite; }
+  @keyframes slide { from{margin-left:-35%} to{margin-left:100%} }
+  .cur { color:var(--muted); font-size:11.5px; margin-top:6px; min-height:1em; }
+  h2 { font:600 11px/1 -apple-system,Segoe UI,sans-serif; letter-spacing:.12em; text-transform:uppercase; color:var(--faint); margin:4px 0 8px; }
+  .series { max-height:240px; overflow:auto; scrollbar-gutter:stable; border:1px solid var(--line); border-radius:10px; }
+  .s-item { display:flex; align-items:center; gap:8px; padding:9px 11px; border-bottom:1px solid var(--line); }
+  .s-item:last-child { border-bottom:0; }
+  .s-name { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .s-item > div:first-child { min-width:0; flex:1; }
+  .logbar { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; padding:0 14px 10px; }
+  .s-sub { color:var(--muted); font-size:11.5px; }
+  .s-right { margin-left:auto; text-align:right; }
+  .pill { display:inline-block; font-size:10.5px; padding:2px 7px; border-radius:20px; background:#2c2560; color:var(--muted); }
+  .pill.ok { color:var(--green); } .pill.err { color:var(--red); }
+  .empty { color:var(--faint); padding:16px; text-align:center; font-size:12px; }
+  .foot { padding:10px 14px; border-top:1px solid var(--line); display:flex; align-items:center; }
+  .link { background:none; border:0; color:var(--faint); padding:0; cursor:pointer; font-size:11.5px; }
+  .link:hover { color:var(--muted); text-decoration:underline; }
+  .warn { background:#3a2342; border:1px solid #5a3157; color:#ffd9b0; border-radius:9px; padding:9px 11px; font-size:12px; margin-bottom:12px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot" id="appdot"></span>
+    <h1>Release Radar</h1>
+    <span id="appState">checking…</span>
+  </header>
+  <div class="pad">
+    <div id="pauseRow" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;margin-bottom:12px">
+      <div style="min-width:0">
+        <div style="font-weight:600" id="pauseTitle">Adding new pages: on</div>
+        <div class="s-sub" id="pauseSub">Opening a book page adds and crawls its series.</div>
+      </div>
+      <button id="pauseBtn" type="button" style="font:inherit;cursor:pointer;border-radius:9px;padding:7px 14px;border:1px solid var(--line);background:#241d52;color:var(--ink);font-weight:600;flex:none">Pause</button>
+    </div>
+    <div id="appWarn" class="warn" style="display:none">Radar app isn't reachable. Open the app (it lives in your system tray) so dates can be saved.</div>
+    <div class="stat" id="stat">Loading…</div>
+    <div class="prog" id="progWrap" style="display:none">
+      <div id="progText">Working…</div>
+      <div class="bar" id="bar"><i id="barFill"></i></div>
+      <div class="cur" id="cur"></div>
+    </div>
+    <div class="btns">
+      <button class="primary" id="crawlBtn" title="Re-crawl every tracked series from scratch — also finds brand-new books added to a series. Slower.">Crawl all now</button>
+      <button id="refreshBtn" title="Quickly re-check only the pages that aren't settled yet (pre-orders, missing audiobooks) for date changes.">Refresh dates</button>
+    </div>
+    <h2>Tracked series</h2>
+    <div class="series" id="series"><div class="empty">No pages registered yet. Open one Amazon/Audible page per series once — it crawls the rest.</div></div>
+
+    <div id="needsCheckWrap" style="display:none;margin-top:14px">
+      <h2 style="color:#ffb88a">Needs a manual check <span id="needsCount"></span></h2>
+      <div class="warn" style="margin-bottom:8px">These pages keep failing to load — usually a sign-in wall on one edition. Radar can't read them, so a date may be missing for that book. Click one to open it: if it loads while you're signed in, Radar reads it automatically; otherwise check that book's date by hand.</div>
+      <div class="series" id="needsCheck"></div>
+      <button class="link" id="clearBadBtn" style="margin-top:8px">Clear this list</button>
+    </div>
+
+    <button id="wipeBtn" style="width:100%;margin-top:12px;border-color:#5a3157;color:#ffb0b0;background:#2a1d3a">Use Amazon data only (wipe app &amp; re-crawl)</button>
+    <div class="s-sub" style="margin-top:6px">Deletes every series in the Radar app (backed up first), then rebuilds from your registered pages.</div>
+  </div>
+  <div class="logbar">
+    <button class="link" id="copyLogBtn">Copy log</button>
+    <button class="link" id="dlLogBtn">Download log</button>
+    <button class="link" id="clearLogBtn">Clear log</button>
+    <button class="link" id="resetBtn" style="margin-left:auto;color:#ffb0b0">Reset if stuck</button>
+  </div>
+  <div class="foot">
+    <span class="s-sub" id="lastline"></span>
+    <button class="link" id="clearBtn" style="margin-left:auto">Clear registered pages</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

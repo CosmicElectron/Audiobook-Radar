@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<!--
+  Release Radar - new tab widget (paste-in version)
+  ---------------------------------------------------
+  Use this ONLY if your new-tab extension lets you paste custom HTML/CSS/JS.
+  If your extension instead lets you set a custom URL, you don't need this file
+  at all - just point it at  http://127.0.0.1:8765/board  instead.
+
+  Release Radar must be running for this to show anything (it reads the local
+  feed). If you changed the port, edit RADAR_URL below to match.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Up Next</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#f1ebdd;
+    background:radial-gradient(1100px 700px at 50% -20%,#241f37 0,#15131f 60%);
+    min-height:100%;display:flex;align-items:center;justify-content:center;padding:6vh 20px}
+  .board{width:100%;max-width:560px}
+  .eyebrow{font-family:"SF Mono",Consolas,monospace;font-size:11px;letter-spacing:.22em;
+    text-transform:uppercase;color:#6f6883;text-align:center;margin-bottom:6px}
+  h1{font-family:"Iowan Old Style","Palatino Linotype",Georgia,serif;font-weight:600;font-size:30px;
+    text-align:center;margin-bottom:26px}
+  .row{display:flex;align-items:center;gap:16px;padding:15px 18px;border:1px solid #332c47;
+    border-radius:14px;background:#1f1c2b;margin-bottom:10px}
+  .row.soon{border-color:#5a4a25;background:linear-gradient(180deg,#2c2417,#1f1c2b)}
+  .cd{font-family:"SF Mono",Consolas,monospace;font-size:26px;font-weight:600;line-height:1;
+    min-width:58px;text-align:center}
+  .row.soon .cd{color:#e7b14c}
+  .cd small{display:block;font-size:11px;color:#9b93ac;font-weight:400;margin-top:3px;font-family:system-ui,sans-serif}
+  .info{flex:1;min-width:0}
+  .title{font-family:"Iowan Old Style",Georgia,serif;font-size:18px;line-height:1.25}
+  .meta{color:#9b93ac;font-size:12.5px;margin-top:3px}
+  .tag{display:inline-block;font-family:"SF Mono",Consolas,monospace;font-size:10px;letter-spacing:.06em;
+    text-transform:uppercase;padding:2px 7px;border-radius:6px;margin-left:6px;border:1px solid #5a4a25;
+    color:#e7b14c;background:#3a2f1b}
+  .tag.novel{color:#9d8cff;border-color:#3a3360;background:#272140}
+  .tag.est{color:#6f6883;border-color:#332c47;background:transparent}
+  .msg{text-align:center;color:#9b93ac;padding:40px 0;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="board">
+  <div class="eyebrow">Release Radar</div>
+  <h1>Up next</h1>
+  <div id="list"><div class="msg">Loading&hellip;</div></div>
+</div>
+<script>
+  const RADAR_URL = "http://127.0.0.1:8765";   // change the port here if you changed it in the app
+  const COUNT = 6;
+
+  function fmtDate(s){
+    if(!s) return s;
+    const d = new Date(s + "T00:00:00");
+    if(isNaN(d)) return s;
+    return d.toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"});
+  }
+  function esc(s){const e=document.createElement("div");e.textContent=s||"";return e.innerHTML;}
+
+  async function load(){
+    try{
+      const r = await fetch(RADAR_URL + "/api/state", {cache:"no-store"});
+      const data = await r.json();
+      const items = (data.all_upcoming || []).slice(0, COUNT);
+      const list = document.getElementById("list");
+      if(!items.length){
+        list.innerHTML = '<div class="msg">Nothing upcoming yet.<br>Add a series in Release Radar.</div>';
+        return;
+      }
+      list.innerHTML = items.map((it,i)=>{
+        const kind = it.kind === "audiobook" ? "Audiobook" : "Novel";
+        const tagcls = it.kind === "novel" ? "novel" : "";
+        const est = it.estimate ? ' <span class="tag est">est</span>' : "";
+        const cd = it.countdown_days;
+        const word = cd===0 ? "today" : (cd===1 ? "day" : "days");
+        const num = cd===0 ? "" : cd;
+        const series = (it.series && it.series !== it.title) ? " &middot; " + esc(it.series) : "";
+        return `<div class="row${i===0?' soon':''}">
+          <div class="cd">${num}<small>${word}</small></div>
+          <div class="info"><div class="title">${esc(it.title)}</div>
+          <div class="meta">${esc(fmtDate(it.date))}<span class="tag ${tagcls}">${kind}</span>${est}${series}</div></div>
+        </div>`;
+      }).join("");
+    }catch(e){
+      document.getElementById("list").innerHTML =
+        '<div class="msg">Couldn\'t reach Release Radar.<br>Make sure the program is running, then reload this tab.</div>';
+    }
+  }
+  load();
+  setInterval(load, 600000); // refresh every 10 minutes
+</script>
+</body>
+</html>

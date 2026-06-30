@@ -1,0 +1,101 @@
+Release Radar — Firefox extension
+=================================
+
+What it does
+------------
+- When you open an Amazon/Audible book or audiobook page, it reads the release
+  date and sends it to your Release Radar app (a small panel confirms it).
+- In the background, on a schedule (about twice a day), it re-checks every page
+  you've opened at least once — with NO tabs open and nothing for you to do. It
+  fetches those pages using your own logged-in Firefox session, so it sees the
+  same real page you would.
+- You "register" a page just by visiting it once. After that it's automatic.
+- Click the toolbar button any time to force a check of everything now.
+
+It talks to the Release Radar app at http://127.0.0.1:8765 — so keep that app
+running (it lives in your system tray). If you run the app on a different port,
+change the RADAR line at the top of background.js.
+
+Installing on a Firefox fork (LibreWolf, Waterfox, Mullvad Browser, etc.)
+------------------------------------------------------------------------
+Most forks allow unsigned extensions. Two ways:
+
+A) Permanent (recommended, if your fork allows unsigned add-ons)
+   1. In the address bar go to:  about:config
+   2. Search for:  xpinstall.signatures.required   — set it to  false
+      (Many forks already have this off. Standard Firefox release does NOT allow
+      this; use Developer Edition / ESR / Nightly, or option B.)
+   3. Zip the CONTENTS of this folder (manifest.json must be at the top of the
+      zip, not inside a subfolder) and rename the .zip to  release-radar.xpi
+      — or just use the release-radar-firefox.xpi provided.
+   4. Open  about:addons  ->  gear icon  ->  "Install Add-on From File…"  ->
+      choose the .xpi.
+
+B) Temporary (works on any Firefox, but is removed when you restart the browser)
+   1. Go to:  about:debugging#/runtime/this-firefox
+   2. Click  "Load Temporary Add-on…"
+   3. Select the  manifest.json  in this folder.
+
+After installing
+----------------
+1. Make sure the Release Radar app is running.
+2. Open the Amazon/Audible pages for the books you track (your tab folder is
+   perfect). Each shows a confirmation panel and is now registered.
+3. You can close the tabs. The extension will re-check those pages on its own
+   from then on.
+
+The dashboard (click the toolbar icon)
+--------------------------------------
+Click the Release Radar toolbar button to open the dashboard. It shows:
+- whether the app is connected (green dot) and how many series it has,
+- how many pages/series are registered and when they were last checked,
+- a live progress bar while a crawl or refresh is running,
+- each tracked series with novel/audio counts and an ok / check status,
+- buttons: "Crawl all now" (full re-crawl to find new books), "Refresh dates"
+  (re-check known pages), "Use Amazon data only (wipe app & re-crawl)" (deletes
+  every series in the app — backed up first — then rebuilds purely from your
+  registered Amazon pages), and "Clear registered pages".
+
+New series get cover art automatically: the crawl reads the cover image from each
+Amazon page and sends it, so series created from Amazon show a cover (it tracks
+the newest book). You can also wipe everything and go Amazon-only from the app
+itself: Settings -> Danger zone -> "Clear all tracked series".
+
+Notes
+-----
+- Background checks use your logged-in session and run at a low frequency, so
+  they look like normal browsing rather than scraping. If Amazon ever returns a
+  sign-in or robot page for a background fetch, that page is simply skipped that
+  round (open the tab once to refresh it).
+- Edited/imported series in Radar are protected: this only fills the dates for
+  the exact book on the page, by its number, and never overwrites your own edits.
+- If Amazon changes their page layout, the only thing that needs updating is the
+  selectors in extract.js (the rpi-attribute fields).
+
+Troubleshooting / logs
+----------------------
+The extension keeps a rolling log of every crawl (each page fetched, skipped,
+timed out, or failed, plus start/finish summaries). If something misbehaves:
+- Open the dashboard and click "Download log" (or "Copy log") and share it.
+- If the progress bar is frozen and won't move for a minute or two, click
+  "Reset if stuck" — that clears the running flag so you can start again.
+Every network request now has a timeout, so a stalled page is logged as TIMEOUT
+and the crawl moves on instead of hanging. If a series isn't fully reached via
+its on-page series list, a "safety net" pass fetches the remaining registered
+pages directly, so you shouldn't need to re-open novels by hand.
+
+Pausing new additions (browse mode)
+-----------------------------------
+The dashboard has an "Adding new pages" switch at the top. Click "Pause" before
+you go browsing Amazon for new novels — while paused, opening a book page does
+nothing (it won't be added or crawled), so you can look around freely. Your
+already-tracked series keep updating on their normal schedule the whole time.
+Click "Resume" when you want opened pages to be added again.
+
+Opening many tabs at once
+-------------------------
+Opening a whole folder of series at once is fine now — each one is queued and the
+extension crawls them one at a time (paced), instead of all at once. Crawling many
+in parallel was what made Amazon return "sign-in/robot" pages before. If you still
+see occasional ROBOT/sign-in lines in the log, the extension now retries those
+once after a pause; persistent ones just mean that page wanted a login.

@@ -1,0 +1,57 @@
+{
+  "manifest_version": 2,
+  "name": "Release Radar — Amazon/Audible reader",
+  "version": "1.0",
+  "description": "Reads book and audiobook release dates from Amazon/Audible pages — live when you visit, and on a background schedule with no tabs open — and sends them to your local Release Radar app.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "release-radar@local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": [
+    "alarms",
+    "storage",
+    "notifications",
+    "clipboardWrite",
+    "https://www.amazon.com.au/*",
+    "https://www.amazon.com/*",
+    "https://www.amazon.co.uk/*",
+    "https://www.audible.com.au/*",
+    "https://www.audible.com/*",
+    "https://www.audible.co.uk/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "scripts": ["extract.js", "background.js"],
+    "persistent": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.amazon.com.au/*",
+        "https://www.amazon.com/*",
+        "https://www.amazon.co.uk/*",
+        "https://www.audible.com.au/*",
+        "https://www.audible.com/*",
+        "https://www.audible.co.uk/*"
+      ],
+      "js": ["extract.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_action": {
+    "default_title": "Release Radar",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  }
+}

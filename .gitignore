@@ -1,0 +1,30 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- PyInstaller build output ---
+build/
+dist/
+*.spec
+
+# --- Runtime data & logs (never commit your own library or webhook) ---
+data.json
+data.json.bak
+*.log
+.release-radar/
+
+# --- Packaged artifacts ---
+*.xpi
+*.zip
+
+# --- Node (only if you install jsdom etc. to test the extension) ---
+node_modules/
+package-lock.json
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
