@@ -46,8 +46,30 @@ Prefer a single double-clickable program with no visible Python?
 1. Double-click **`build.bat`**.
 2. When it finishes, your program is at **`dist\ReleaseRadar.exe`**.
 
-(The `.exe` must be built on Windows, which is why this ships as source + a build
-script rather than a prebuilt binary.)
+(The `.exe` must be built on Windows, so the source ships with a build script. A
+prebuilt `.exe` and the packaged extension may also be attached to a tagged
+**[Release](../../releases)** — see the note below before using them.)
+
+## Prebuilt downloads (Releases)
+
+If a [Release](../../releases) is attached, you can grab a prebuilt `ReleaseRadar.exe`
+and the packaged `release-radar-firefox.xpi` instead of building/zipping yourself. Two
+honest warnings, because both are **unsigned** (code-signing certificates cost money and
+this is a free personal project):
+
+- **The `.exe` will trip Windows SmartScreen** ("Windows protected your PC — unknown
+  publisher") and may get a false-positive from antivirus — both are normal for unsigned
+  PyInstaller builds. To run it anyway: click **More info → Run anyway**. If you'd rather
+  not, the source and `build.bat` are right here — build it yourself and you know exactly
+  what you're running.
+- **The `.xpi` only installs on some browsers.** Standard Firefox (release/beta) refuses
+  to *permanently* install unsigned extensions — that's locked. It works on Firefox forks
+  (LibreWolf, Waterfox, Mullvad), Developer Edition, ESR, and Nightly, or temporarily on
+  any Firefox via `about:debugging` (removed on restart). Full steps are in
+  [`release-radar-firefox/INSTALL.txt`](release-radar-firefox/INSTALL.txt).
+
+If you'd rather avoid all of that, just run from source with `run.bat` — no warnings,
+nothing to trust.
 
 ## How release dates get in
 
@@ -135,8 +157,6 @@ testing. They've since been used in real life, but if something misbehaves on fi
 the cause is logged in `radar.log`, and it's usually a small fix. If Amazon changes their
 page layout, the bit to update is the selectors in `release-radar-firefox/extract.js`.
 
-There are also a couple of inert leftovers in the data model from an earlier version
-(e.g. a `hardcover_token` setting) that nothing uses — harmless, just not cleaned up yet.
 
 It's a personal tool — be reasonable about how often you check, so you're a good citizen
 of the sites you read from.
