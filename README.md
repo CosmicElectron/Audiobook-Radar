@@ -107,6 +107,8 @@ channel → Edit Channel → Integrations → Webhooks → New Webhook → Copy 
 - a ping when a new or changed release date arrives, and/or
 - a ping on release day, after an hour you set (default 3 PM, local time).
 
+- The daily digest's personality lines are plain text files in digest_lines next to your data.json — edit them or drop in someone else's pack; changes apply on the next digest.
+
 Backfilled past dates and re-reads of an already-known date stay silent, so it doesn't
 spam you.
 
