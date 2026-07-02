@@ -2097,7 +2097,10 @@ function timelineHtml(s){
   const ev={};
   const add=(d,k,num)=>{if(!d)return;const e=(ev[d]=ev[d]||{});e[k]=true;if(num!=null){if(k==='novel')e.nN=num;else if(k==='audio')e.aN=num;}};
   const tl=(s.timeline&&s.timeline.length)?s.timeline:null;
-  if(tl){tl.forEach(t=>{add(t.novel,'novel',t.n);add(t.audiobook,'audio',t.n);});}
+  const live={};                                                 // date -> {n:true,a:true} = confirmed buyable
+  const mklive=(d,k)=>{if(d)(live[d]=live[d]||{})[k]=true;};
+  if(tl){tl.forEach(t=>{add(t.novel,'novel',t.n);add(t.audiobook,'audio',t.n);
+    if(t.novel_pre===false)mklive(t.novel,'n');if(t.audio_pre===false)mklive(t.audiobook,'a');});}
   else{(s.history||[]).forEach(h=>{add(h.novel,'novel',h.n);add(h.audiobook,'audio',h.n);});}
   add(s.novel_date,'novel',s.novel_n);                          // always include the tracked book
   if(s.audiobook_status!=='none') add(s.audiobook_date,'audio',s.novel_n);
@@ -2107,17 +2110,18 @@ function timelineHtml(s){
   if(!dates.length) return '';
   const times=dates.map(d=>+new Date(d+'T00:00:00'));
   const min=Math.min(...times),max=Math.max(...times),span=(max-min)||1;
-  const rel=(d)=>{const r=isReleased(d);return r===null?'':(r?' (out)':' (pre-order)');};
+  const isLive=(d,e)=>{const lv=live[d]||{};return (!e.novel||lv.n)&&(!e.audio||lv.a);};
+  const rel=(d,e)=>{const r=isReleased(d);return r===null?'':(r?' (out)':(isTodayStr(d)&&isLive(d,e)?' (out now)':' (pre-order)'));};
   const marks=dates.map(d=>{
     const t=+new Date(d+'T00:00:00');
     const left=dates.length===1?50:((t-min)/span*100);
     const e=ev[d];let cls,title;
     const nn=e.nN!=null?(' #'+e.nN):'', an=e.aN!=null?(' #'+e.aN):'';
-    if(e.novel&&e.audio){cls='both';title=`Novel${nn} + Audiobook${an} · ${fmtDate(d)}${rel(d)}`;}
-    else if(e.novel){cls='novel';title=`Novel${nn} · ${fmtDate(d)}${rel(d)}`;}
-    else if(e.audio){cls='audio';title=`Audiobook${an} · ${fmtDate(d)}${rel(d)}`;}
+    if(e.novel&&e.audio){cls='both';title=`Novel${nn} + Audiobook${an} · ${fmtDate(d)}${rel(d,e)}`;}
+    else if(e.novel){cls='novel';title=`Novel${nn} · ${fmtDate(d)}${rel(d,e)}`;}
+    else if(e.audio){cls='audio';title=`Audiobook${an} · ${fmtDate(d)}${rel(d,e)}`;}
     else{cls='est';title=`Estimated audiobook · likely ~${fmtDate(d)}`;}
-    if(cls!=='est'&&isReleased(d)===false) cls+=' future';   // hollow = upcoming / pre-order
+    if(cls!=='est'&&isReleased(d)===false&&!(isTodayStr(d)&&isLive(d,e))) cls+=' future';   // hollow = still upcoming; confirmed-live today renders solid
     return `<span class="mark ${cls}" style="left:${left.toFixed(1)}%" title="${esc(title)}"></span>`;
   }).join('');
   // "today" line: only when it falls within the span, so past sits left / upcoming right
