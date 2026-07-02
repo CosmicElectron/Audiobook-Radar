@@ -113,11 +113,27 @@ function RR_extract(doc, url) {
              (url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/) || [])[1] || null;
   var canonical = asin ? ("https://" + (host || "www.amazon.com.au") + "/dp/" + asin) : (url.split("?")[0] || url);
 
+  // Pre-order vs live: real DOM elements only (the released page still contains
+  // "PreorderButton" strings inside its scripts, so text search would lie).
+  // true = pre-order, false = buyable now, null = can't tell (treated as no-change).
+  var preorder = null;
+  try {
+    var annText = "";
+    var anns = doc.querySelectorAll('[id$="-announce"]');
+    for (var ai = 0; ai < anns.length; ai++) annText += " | " + clean(anns[ai].textContent);
+    var preEl = doc.querySelector('[id*="preorder"], [class*="a-button-preorder"]');
+    if (preEl || /pre-?order/i.test(annText)) preorder = true;
+    else {
+      var buyEl = doc.querySelector('#one-click-button, #buy-now-button, #add-to-cart-button, [id^="buy-now"], [id^="add-to-cart"]');
+      if (buyEl || /add to (library|cart)|buy now|listen now|read now|read for free|included in/i.test(annText)) preorder = false;
+    }
+  } catch (e) { preorder = null; }
+
   return {
     series: series, author: author, series_total: total,
     book: { n: n, title: title, asin: asin, cover: coverUrl(),
             novel_date: isAudio ? null : dt, audiobook_date: isAudio ? dt : null },
-    _isAudio: isAudio, _date: dt, _url: canonical, _asin: asin
+    _isAudio: isAudio, _date: dt, _url: canonical, _asin: asin, _preorder: preorder
   };
 }
 

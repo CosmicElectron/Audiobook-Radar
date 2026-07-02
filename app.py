@@ -19,6 +19,7 @@ import re
 import json
 import time
 import uuid
+import random
 import html
 import threading
 import logging
@@ -112,8 +113,9 @@ def get_settings():
         s.setdefault("upcoming_mode", "audiobook")    # which kind the schedule shows
         s.setdefault("discord_webhook", "")           # Discord channel webhook URL
         s.setdefault("discord_on_new", True)          # ping when a new/changed date arrives
-        s.setdefault("discord_on_release", True)      # ping on release day after the set hour
-        s.setdefault("discord_release_hour", 15)      # 24h local hour (15 = 3pm)
+        s.setdefault("discord_on_release", True)          # ping when a release goes live
+        s.setdefault("discord_daily", False)              # daily forecast digest
+        s.setdefault("discord_daily_hour", 9)             # 24h local hour to send it
         return dict(s)
 
 
@@ -761,23 +763,21 @@ def _discord_notify(text):
     threading.Thread(target=_go, daemon=True).start()
 
 
-def _nice_date(iso_str):
-    d = parse_date(iso_str)
-    return d.strftime("%b %-d, %Y") if d else (iso_str or "?")
-
-
-def _countdown_phrase(iso_str):
+def _discord_ts(iso_str, style="D"):
+    """Discord timestamp tag <t:unix:style> — renders in each viewer's own timezone.
+    Styles: D = date, R = relative ("in 9 days"). Anchored at local noon so nearby
+    timezones don't roll to the wrong day."""
     d = parse_date(iso_str)
     if not d:
-        return ""
-    n = (d - today()).days
-    if n == 0:
-        return " — **today**"
-    if n == 1:
-        return " — tomorrow"
-    if n > 1:
-        return f" — in {n} days"
-    return ""
+        return iso_str or "?"
+    ts = int(datetime(d.year, d.month, d.day, 12, 0).timestamp())
+    return f"<t:{ts}:{style}>"
+
+
+def _nice_date(iso_str):
+    d = parse_date(iso_str)
+    return f"{d.strftime('%b')} {d.day}, {d.year}" if d else (iso_str or "?")
+
 
 
 def _new_date_messages(s, n, old_novel, new_novel, old_audio, new_audio):
@@ -794,76 +794,200 @@ def _new_date_messages(s, n, old_novel, new_novel, old_audio, new_audio):
         d = parse_date(new)
         if not d or d < today():
             continue
-        when = _nice_date(new) + _countdown_phrase(new)
+        when = f"**{_discord_ts(new, 'D')}** ({_discord_ts(new, 'R')})"
         if old:
-            msgs.append(f"{icon[kind]} **{name}** — Book {n} {kind} date changed to **{when}** (was {_nice_date(old)})")
+            msgs.append(f"{icon[kind]} **{name}** — Book {n} {kind} date changed to {when} (was {_discord_ts(old, 'D')})")
         else:
-            msgs.append(f"{icon[kind]} **{name}** — Book {n} {kind} now dated **{when}**")
+            msgs.append(f"{icon[kind]} **{name}** — Book {n} {kind} now dated {when}")
     return msgs
 
 
-def _release_today_message(name, n, kind):
+def _release_live_message(name, n, kind):
     icon = {"novel": "📖", "audiobook": "🎧"}.get(kind, "📚")
-    return f"🎉 {icon} **{name}** — Book {n} {kind} releases **today**!"
+    return f"🎉 {icon} **{name}** — Book {n} {kind} is **out now**!"
+
+# Release pings are driven by the page itself: the extension re-reads a releasing
+# novel hourly on its release day, and the moment the store page flips from
+# pre-order to buyable, the ingest above sends "out now". No clock-based guessing.
 
 
-def _release_day_keys_due(release_hour):
-    """Find (key, name, n, kind) tuples for releases dated today, once it's past the
-    release hour, that haven't been announced yet. Caller is responsible for the lock."""
-    now = datetime.now()
-    if now.hour < int(release_hour):
-        return []
-    td = today()
-    notified = set(_state.get("discord_notified", []))
-    due = []
-    for s in _state["series"]:
-        for e in s.get("timeline", []):
-            n = _entry_n(e)
-            for kind in ("novel", "audiobook"):
-                val = e.get(kind)
-                if parse_date(val) == td:
-                    key = f"release:{s['id']}:{n}:{kind}:{val}"
-                    if key not in notified:
-                        due.append((key, s.get("name", ""), n, kind))
-    return due
+# ---------------------------------------------------------------------------
+# Daily forecast digest — your schedule, read to you by a deeply reluctant brat.
+# ---------------------------------------------------------------------------
+
+_TSUN_OPENERS = [
+    "Hmph! I checked your precious book schedule again. You're WELCOME. 💢",
+    "Listen up, because I'm only saying this once today: here's your dumb forecast.",
+    "I can't believe I'm stuck reading release dates to you every morning. Ugh. Fine. Here:",
+    "Oh look who needs ME to remember their books for them. Pathetic. Adorable— I mean pathetic.",
+    "It's not like I stayed up organizing your reading calendar or anything! I was bored, okay?!",
+    "Your daily forecast, delivered by yours truly, the only competent one around here. Bow.",
+    "Baka! You'd forget every single release without me. Admit it. …Don't actually, it's embarrassing.",
+    "Fine, FINE. Here's what's coming up. Stop looking at me like that.",
+    "I graciously descend once more to manage your little book problem. Gratitude is expected.",
+    "Tch. Another day, another schedule you can't keep track of yourself.",
+    "You again?! Whatever. Here's the forecast. Not that I made it nice for you or anything.",
+    "Daily report! Because SOMEONE has to be responsible around here, and it's obviously not you.",
+    "Hmph, I suppose you've waited long enough. Behold: your releases.",
+    "I had better things to do, you know! But your schedule doesn't read itself, so:",
+]
+
+_TSUN_CLOSERS = [
+    "That's it. Now shoo. 😤",
+    "Don't thank me. It's weird when you're grateful.",
+    "Same time tomorrow. Don't be late, or I'll pretend I don't know you.",
+    "Now go pretend you would've remembered all that on your own.",
+    "Dismissed! And no, you can't ask follow-up questions.",
+    "I expect you to actually READ these, you know. Hmph.",
+    "That concludes today's charity work. You're welcome. Again.",
+    "If you miss a release after all this, I'm never helping you again. (I will. But I'll be MAD.)",
+    "Off you go. Some of us have important schedules to maintain.",
+    "And that's everything. Not that I double-checked it for you or anything… I did. Twice.",
+    "End of report! Applause is optional but recommended.",
+    "Go on, get. And don't come crying to me if you forget— oh wait, you literally can't now.",
+]
+
+_TSUN_TODAY = [
+    "…And YES, something's out TODAY. Try to contain yourself. I know I ca— YOU can't.",
+    "Release day, release day! N-not that I'm excited for you! I just like being right!",
+    "There's a TODAY in there, in case you're blind as well as forgetful. GO.",
+    "Something drops today. If you don't read it immediately, what was even the point of me?!",
+    "TODAY. Did you see it? The word TODAY?! Why are you still here?!",
+    "A release! Today! I only reminded you like a million times. Praise me.",
+]
+
+_TSUN_SOON = [
+    "Something's coming up REAL soon, so don't wander off and forget. I know how you are.",
+    "Days away. DAYS. Set an alarm or something, honestly.",
+    "The next one's almost here. I'm watching it so you don't have to. You're welcome.",
+    "So close now! N-not that I've been counting down. That would be lame.",
+    "Almost release time. If you miss it, I will be insufferable about it. More than usual.",
+]
+
+_TSUN_EMPTY = [
+    "Nothing. There's NOTHING coming up. Congrats, your authors are all asleep. 💢",
+    "The forecast is empty, which means you made me check for NOTHING. Unbelievable.",
+    "No upcoming releases. Even I can't conjure books out of thin air, dummy.",
+    "Zero releases on the horizon. Go touch grass or re-read something.",
+    "Empty schedule today. Don't look at ME, I don't write the books!",
+    "Nothing upcoming. Your favorite authors owe us BOTH an apology.",
+]
+
+_TSUN_EST = [
+    "The ~ ones are my predictions. My predictions are excellent. Doubt them and perish.",
+    "Squiggle marks mean I'm guessing. Brilliantly. As always.",
+    "The estimates are educated guesses. MY education, so basically guaranteed.",
+    "The ~ rows aren't announced yet — that's my genius forecasting. Trust it. Or don't. See if I care!",
+    "Estimated dates are approximate! Complain to the authors, not me. I'm just gifted.",
+]
 
 
-def _do_release_check():
+_LINES_DIR = os.path.join(data_dir(), "digest_lines")
+_LINE_FILES = {
+    "openers": "_TSUN_OPENERS", "closers": "_TSUN_CLOSERS", "today": "_TSUN_TODAY",
+    "soon": "_TSUN_SOON", "empty": "_TSUN_EMPTY", "estimates": "_TSUN_EST",
+}
+_LINE_HEADER = ("# Release Radar — digest lines: {name}\n"
+                "# One message per line. Blank lines and lines starting with # are ignored.\n"
+                "# Discord markdown works (**bold**, emoji). Edits apply on the next digest —\n"
+                "# no restart needed. Delete this file to get the defaults back on next run.\n")
+
+
+def _ensure_line_files():
+    """Write the default line files (once) so they're there to edit or replace."""
+    try:
+        os.makedirs(_LINES_DIR, exist_ok=True)
+        for name, var in _LINE_FILES.items():
+            p = os.path.join(_LINES_DIR, name + ".txt")
+            if not os.path.exists(p):
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(_LINE_HEADER.format(name=name))
+                    f.write("\n".join(globals()[var]) + "\n")
+    except Exception as e:
+        add_log(f"couldn't write digest line files: {e}")
+
+
+def _load_lines(name):
+    """Load one pool from its file; fall back to the built-ins if missing/empty."""
+    fallback = globals()[_LINE_FILES[name]]
+    try:
+        p = os.path.join(_LINES_DIR, name + ".txt")
+        if not os.path.exists(p):
+            _ensure_line_files()
+        with open(p, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f
+                     if ln.strip() and not ln.strip().startswith("#")]
+        return lines or fallback
+    except Exception:
+        return fallback
+
+
+
+def _daily_digest_text():
+    """The forecast message: both kinds, estimates included (marked ~), soonest first."""
+    rows = upcoming_of_kind("novel", True) + upcoming_of_kind("audiobook", True)
+    rows.sort(key=lambda r: (r["date"], r["kind"]))
+    if not rows:
+        return random.choice(_load_lines("empty"))
+    icon = {"novel": "📖", "audiobook": "🎧"}
+    shown = rows[:10]
+    lines = [random.choice(_load_lines("openers")), ""]
+    for r in shown:
+        ic = icon.get(r["kind"], "📚")
+        if r["estimate"]:
+            c = r.get("confidence") or {}
+            spread = f" ±{c['spread_days']}d" if c.get("spread_days") is not None else ""
+            lines.append(f"{ic} ~ **{r['series']}** — next {r['kind']}, my guess: around {_discord_ts(r['date'], 'D')}{spread}")
+        elif r["countdown_days"] == 0:
+            lines.append(f"{ic} **{r['series']}** — {r['kind']} **TODAY**")
+        else:
+            lines.append(f"{ic} **{r['series']}** — {r['kind']} {_discord_ts(r['date'], 'R')} ({_discord_ts(r['date'], 'D')})")
+    if len(rows) > len(shown):
+        lines.append(f"…and {len(rows) - len(shown)} more. Like I'd list everything for you.")
+    lines.append("")
+    if any(r["countdown_days"] == 0 for r in shown if not r["estimate"]):
+        lines.append(random.choice(_load_lines("today")))
+    elif any(0 < r["countdown_days"] <= 3 for r in shown if not r["estimate"]):
+        lines.append(random.choice(_load_lines("soon")))
+    if any(r["estimate"] for r in shown):
+        lines.append(random.choice(_load_lines("estimates")))
+    lines.append(random.choice(_load_lines("closers")))
+    return "\n".join(lines)
+
+
+def _maybe_send_daily_digest():
     st = get_settings()
-    if not st.get("discord_on_release", True) or not (st.get("discord_webhook") or "").strip():
+    if not st.get("discord_daily") or not (st.get("discord_webhook") or "").strip():
         return
-    msgs = []
+    if datetime.now().hour < int(st.get("discord_daily_hour", 9)):
+        return
+    ts = today().isoformat()
     with _lock:
-        due = _release_day_keys_due(st.get("discord_release_hour", 15))
-        if due:
-            notified = set(_state.get("discord_notified", []))
-            for key, name, n, kind in due:
-                notified.add(key)
-                msgs.append(_release_today_message(name, n, kind))
-            # keep the announced-list from growing without bound
-            _state["discord_notified"] = list(notified)[-500:]
-            save_state()
-    for m in msgs:
-        _discord_notify(m)
+        if _state.get("discord_daily_last") == ts:
+            return
+        _state["discord_daily_last"] = ts    # mark first so a race can't double-send
+        save_state()
+    _discord_notify(_daily_digest_text())
+    add_log("Sent the daily forecast digest to Discord")
 
 
-_release_thread_started = False
+_digest_thread_started = False
 
 
-def _start_release_watcher():
-    global _release_thread_started
-    if _release_thread_started:
+def _start_daily_digest():
+    global _digest_thread_started
+    if _digest_thread_started:
         return
-    _release_thread_started = True
+    _digest_thread_started = True
 
     def _loop():
-        time.sleep(20)  # let things settle on startup
+        time.sleep(30)
         while True:
             try:
-                _do_release_check()
+                _maybe_send_daily_digest()
             except Exception as e:
-                add_log(f"release check error: {e}")
-            time.sleep(600)  # re-check every 10 minutes
+                add_log(f"daily digest error: {e}")
+            time.sleep(300)   # check every 5 minutes
 
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -1125,12 +1249,75 @@ def api_ingest():
             _state["series"].append(s)
             created = True
         tl = s.setdefault("timeline", [])
+        # Amazon sometimes positions an audiobook at the wrong series number (this is
+        # real: book 1's audio labelled "Book 2 of 2"). The audio's own title is the
+        # tie-breaker: if it exactly matches a DIFFERENT book's known novel title (and
+        # not the claimed book's), it belongs to that book.
+        title = (book.get("title") or "").strip()
+        if ad and not nd and title:
+            tn = _norm(title)
+            own = next((e for e in tl if _entry_n(e) == n), None)
+            if not (own and _norm(own.get("title") or "") == tn):
+                home = next((e for e in tl if _entry_n(e) != n and _norm(e.get("title") or "") == tn), None)
+                if home:
+                    add_log(f"Reattributed audiobook '{title}' from book {n} to "
+                            f"book {_entry_n(home)} (its title matches that novel)")
+                    n = _entry_n(home)
         ent = next((e for e in tl if _entry_n(e) == n), None)
         if not ent:
             ent = {"n": n, "novel": None, "audiobook": None}
             tl.append(ent)
         old_novel = ent.get("novel")
         old_audio = ent.get("audiobook")
+        if nd and title:
+            ent["title"] = title              # per-book novel title (attribution anchor)
+        # Guard against Amazon cross-linking one audiobook edition onto multiple books
+        # (e.g. book 1's audio shown as a "format" of book 2). Each audio ASIN belongs
+        # to exactly one row: the first book it was recorded under keeps it.
+        if ad and book.get("asin"):
+            amap = s.setdefault("asins_audio", {})
+            prev_n = next((k for k, v in amap.items() if v == book["asin"]), None)
+            if prev_n is not None and prev_n != str(n):
+                add_log(f"Ignored audiobook date for {series} book {n}: that audiobook "
+                        f"({book['asin']}) is already recorded as book {prev_n}'s audio")
+                ad = None
+            else:
+                amap[str(n)] = book["asin"]
+        if not nd and not ad:
+            # the only date this page carried was the ignored audio — record nothing,
+            # and drop the empty row if we only just created it
+            if ent.get("novel") is None and ent.get("audiobook") is None:
+                try:
+                    tl.remove(ent)
+                except ValueError:
+                    pass
+            save_state()
+            return jsonify({"ok": True, "message": "ignored: that audiobook belongs to another book"})
+        # Pre-order → live tracking. The page reports one kind per read; remember its
+        # pre-order state so the moment it flips to buyable we can say "out now".
+        pre = body.get("_preorder", None)          # true / false / null(unknown)
+        released_msgs = []
+        if pre is not None:
+            kind_key = "audio_pre" if ad else "novel_pre"
+            kind = "audiobook" if ad else "novel"
+            old_pre = ent.get(kind_key)
+            ent[kind_key] = bool(pre)
+            d_now = ad if ad else nd
+            dd = parse_date(d_now) if d_now else None
+            fire = False
+            if pre is False and dd:
+                if old_pre is True and dd <= today():
+                    fire = True          # we watched it flip from pre-order to buyable
+                elif dd == today():
+                    fire = True          # buyable on its release day IS the release,
+                                         # even if we never saw its pre-order state
+            if fire:
+                key = f"release:{s['id']}:{n}:{kind}:{d_now}"
+                notified = set(_state.get("discord_notified", []))
+                if key not in notified and get_settings().get("discord_on_release", True):
+                    notified.add(key)
+                    _state["discord_notified"] = list(notified)[-500:]
+                    released_msgs.append(_release_live_message(s.get("name", ""), n, kind))
         if nd:
             ent["novel"] = nd                 # Amazon is authoritative for this field
         if ad:
@@ -1162,7 +1349,7 @@ def api_ingest():
         _state["last_ingest"] = s["last_change_at"]
         new_date_msgs = _new_date_messages(s, n, old_novel, ent.get("novel"), old_audio, ent.get("audiobook"))
         save_state()
-    for m in new_date_msgs:
+    for m in new_date_msgs + released_msgs:
         _discord_notify(m)
     bits = " ".join(filter(None, [f"novel {nd}" if nd else "", f"audiobook {ad}" if ad else ""]))
     add_log(f"Ingested from Amazon: {series} book {n} ({bits})")
@@ -1210,6 +1397,23 @@ def api_ext_crawl():
 @app.post("/api/ext/refresh")
 def api_ext_refresh():
     _push_command(type="refresh")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/ext/crawl-series")
+def api_ext_crawl_series():
+    """Ask the extension to re-crawl a SINGLE series (find new/updated books for it),
+    identified the same way a delete is: by name, with its ASINs as a fallback."""
+    body = request.get_json(force=True, silent=True) or {}
+    sid = body.get("id") or ""
+    with _lock:
+        s = next((x for x in _state["series"] if x.get("id") == sid), None)
+        if not s:
+            return jsonify({"ok": False, "message": "series not found"})
+        name = s.get("name", "")
+        asins = list((s.get("asins") or {}).values())
+    _push_command(type="crawlSeries", series=name, asins=asins)
+    add_log(f"Asked the extension to check one series: {name}")
     return jsonify({"ok": True})
 
 
@@ -1285,7 +1489,8 @@ def api_get_settings():
                     "discord_webhook": s.get("discord_webhook", ""),
                     "discord_on_new": s.get("discord_on_new", True),
                     "discord_on_release": s.get("discord_on_release", True),
-                    "discord_release_hour": s.get("discord_release_hour", 15)})
+                    "discord_daily": s.get("discord_daily", False),
+                    "discord_daily_hour": s.get("discord_daily_hour", 9)})
 
 
 @app.post("/api/settings")
@@ -1307,11 +1512,13 @@ def api_set_settings():
             s["discord_on_new"] = bool(body.get("discord_on_new"))
         if "discord_on_release" in body:
             s["discord_on_release"] = bool(body.get("discord_on_release"))
-        if "discord_release_hour" in body:
+        if "discord_daily" in body:
+            s["discord_daily"] = bool(body.get("discord_daily"))
+        if "discord_daily_hour" in body:
             try:
-                h = int(body.get("discord_release_hour"))
+                h = int(body.get("discord_daily_hour"))
                 if 0 <= h <= 23:
-                    s["discord_release_hour"] = h
+                    s["discord_daily_hour"] = h
             except (TypeError, ValueError):
                 pass
     save_state()
@@ -1328,6 +1535,19 @@ def api_discord_test():
         return jsonify({"ok": False, "message": "No webhook URL set."})
     ok, err = _discord_post(wh, f"✅ **{APP_NAME}** test message — notifications are wired up.")
     return jsonify({"ok": ok, "message": "Sent! Check your Discord channel." if ok else f"Failed: {err}"})
+
+
+@app.post("/api/discord/digest-now")
+def api_discord_digest_now():
+    """Build and send today's forecast digest immediately (independent of the daily
+    schedule — sending one now doesn't skip the scheduled one)."""
+    wh = (get_settings().get("discord_webhook") or "").strip()
+    if not wh:
+        return jsonify({"ok": False, "message": "No webhook URL set."})
+    ok, err = _discord_post(wh, _daily_digest_text())
+    if ok:
+        add_log("Sent a forecast digest to Discord (manual)")
+    return jsonify({"ok": ok, "message": "Sent! Go see what she has to say." if ok else f"Failed: {err}"})
 
 
 @app.get("/feed.xml")
@@ -1377,7 +1597,7 @@ def build_board_html():
     for i, it in enumerate(items):
         est = ' <span class="tag est">est</span>' if it["estimate"] else ""
         d = parse_date(it["date"])
-        nice = d.strftime("%b %-d, %Y") if d else it["date"]
+        nice = f"{d.strftime('%b')} {d.day}, {d.year}" if d else it["date"]
         cd = it["countdown_days"]
         cd_word = "today" if cd == 0 else ("day" if cd == 1 else "days")
         cd_num = "" if cd == 0 else str(cd)
@@ -1752,9 +1972,16 @@ textarea{resize:vertical;min-height:54px}
       <input type="checkbox" id="discOnNew" style="width:auto;margin:0"> Ping when a new or changed release date arrives
     </label>
     <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin:8px 0 0;font-size:13px">
-      <input type="checkbox" id="discOnRelease" style="width:auto;margin:0"> Ping on release day, after
-      <input type="number" id="discHour" min="0" max="23" style="width:54px;margin:0;padding:4px 6px"> <span style="color:var(--faint)">:00 (local time)</span>
+      <input type="checkbox" id="discOnRelease" style="width:auto;margin:0"> Ping when a release goes live (the store page flips from pre-order to buyable)
     </label>
+    <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin:8px 0 0;font-size:13px;flex-wrap:wrap">
+      <input type="checkbox" id="discDaily" style="width:auto;margin:0"> Daily forecast digest at
+      <input type="number" id="discDailyHour" min="0" max="23" style="width:54px;margin:0;padding:4px 6px"> <span style="color:var(--faint)">:00 — upcoming novels &amp; audiobooks, estimates included. Delivered by a very reluctant, very bratty assistant. Her lines live in <b>digest_lines</b> next to your data.json — edit or replace them freely.</span>
+    </label>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+      <button class="small ghost" type="button" id="digNowBtn" style="width:auto">Send one now</button>
+      <span id="digNowMsg" class="hint" style="margin:0"></span>
+    </div>
     <div style="border-bottom:1px solid var(--line);margin:16px 0"></div>
 
     <label style="color:#ff9b9b">Danger zone</label>
@@ -1782,9 +2009,13 @@ function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');se
 function fmtDate(s){if(!s)return '--';const d=new Date(s+'T00:00:00');if(isNaN(d))return s;
   return d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});}
 function isReleased(s){if(!s)return null;const d=new Date(s+'T00:00:00');if(isNaN(d))return null;const t=new Date();t.setHours(0,0,0,0);return d<t;}
-function dateTag(d){const r=isReleased(d);if(r===null)return '';
-  const css=r?'color:#56d18a;border-color:#2c5a3f;background:#16271d':'color:#e7b14c;border-color:#5a4a25;background:#262017';
-  return `<span style="font:600 9px/1 var(--mono,monospace);letter-spacing:.04em;text-transform:uppercase;padding:1px 5px;border:1px solid;border-radius:6px;margin-left:6px;vertical-align:middle;${css}">${r?'out':'pre-order'}</span>`;}
+function isTodayStr(sd){if(!sd)return false;const d=new Date(sd+'T00:00:00');if(isNaN(d))return false;const t=new Date();t.setHours(0,0,0,0);return d.getTime()===t.getTime();}
+function latestEntry(s){let best=null,bn=-1;(s.timeline||[]).forEach(e=>{const n=(e&&e.n!=null)?+e.n:NaN;if(!isNaN(n)&&n>bn){bn=n;best=e;}});return best;}
+function dateTag(d,live){const past=isReleased(d);if(past===null)return '';
+  const out=past||(live===true&&isTodayStr(d));   // confirmed buyable on release day counts as out
+  const label=past?'out':(out?'out now':'pre-order');
+  const css=out?'color:#56d18a;border-color:#2c5a3f;background:#16271d':'color:#e7b14c;border-color:#5a4a25;background:#262017';
+  return `<span style="font:600 9px/1 var(--mono,monospace);letter-spacing:.04em;text-transform:uppercase;padding:1px 5px;border:1px solid;border-radius:6px;margin-left:6px;vertical-align:middle;${css}">${label}</span>`;}
 function confChip(c){
   if(!c) return '';
   const M={high:['high','#56d18a','#16271d','#2c5a3f'],medium:['med','#f0a500','#262017','#5a4a25'],low:['low','#b9a6d6','#221d3a','#3a3360']};
@@ -1958,8 +2189,8 @@ function renderGrid(){
         <h3>${esc(s.name)}</h3>
         <div class="byline">${s.author?esc(s.author):'<span style="color:var(--faint)">unknown author</span>'}${s.novel_title?' · '+esc(s.novel_title):''}</div>
         <div class="facts">
-          <div class="fact"><div class="k">Novel</div><div class="v">${fmtDate(s.novel_date)}${dateTag(s.novel_date)}</div></div>
-          <div class="fact"><div class="k">Audiobook</div><div class="v">${st==='none'?'—':(fmtDate(s.audiobook_date)+dateTag(s.audiobook_date))}</div></div>
+          <div class="fact"><div class="k">Novel</div><div class="v">${fmtDate(s.novel_date)}${dateTag(s.novel_date,(latestEntry(s)||{}).novel_pre===false)}</div></div>
+          <div class="fact"><div class="k">Audiobook</div><div class="v">${st==='none'?'—':(fmtDate(s.audiobook_date)+dateTag(s.audiobook_date,(latestEntry(s)||{}).audio_pre===false))}</div></div>
           <div class="fact"><div class="k">Avg gap</div><div class="v">${s.avg_gap_label||'—'}</div></div>
         </div>
         <span class="pill ${st}">${esc(s.status_label)}</span>
@@ -1968,6 +2199,7 @@ function renderGrid(){
       </div>
       <div class="right">
         <div class="rowbtns">
+          <button class="small" data-check="${s.id}" title="Ask the extension to re-check just this series for new or newly-released books. Needs the extension running with Firefox open; takes a few seconds.">Check</button>
           <button class="small" data-edit="${s.id}">Edit</button>
         </div>
       </div>`;
@@ -1975,6 +2207,10 @@ function renderGrid(){
   });
   wireDrag();
   grid.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>openModal(b.dataset.edit));
+  grid.querySelectorAll('[data-check]').forEach(b=>b.onclick=()=>{
+    const nm=(STATE.series.find(x=>x.id===b.dataset.check)||{}).name||'this series';
+    askExtension('/api/ext/crawl-series','Checking \u201c'+nm+'\u201d',{id:b.dataset.check});
+  });
   grid.querySelectorAll('[data-fetch]').forEach(b=>b.onclick=async()=>{
     const before=(STATE.series.find(x=>x.id===b.dataset.fetch)||{}).last_change||null;
     b.textContent='…';
@@ -2111,7 +2347,8 @@ async function loadDiscordSettings(){
     $('#discWebhook').value=s.discord_webhook||'';
     $('#discOnNew').checked=!!s.discord_on_new;
     $('#discOnRelease').checked=!!s.discord_on_release;
-    $('#discHour').value=(s.discord_release_hour!=null?s.discord_release_hour:15);
+    $('#discDaily').checked=!!s.discord_daily;
+    $('#discDailyHour').value=(s.discord_daily_hour!=null?s.discord_daily_hour:9);
   }catch(_){}
 }
 async function saveDiscord(){
@@ -2119,11 +2356,12 @@ async function saveDiscord(){
     discord_webhook:$('#discWebhook').value.trim(),
     discord_on_new:$('#discOnNew').checked,
     discord_on_release:$('#discOnRelease').checked,
-    discord_release_hour:parseInt($('#discHour').value,10)
+    discord_daily:$('#discDaily').checked,
+    discord_daily_hour:parseInt($('#discDailyHour').value,10)
   };
   try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch(_){}
 }
-['#discWebhook','#discOnNew','#discOnRelease','#discHour'].forEach(sel=>{
+['#discWebhook','#discOnNew','#discOnRelease','#discDaily','#discDailyHour'].forEach(sel=>{
   const el=$(sel); if(el) el.addEventListener('change',saveDiscord);
 });
 const _discTest=$('#discTestBtn');
@@ -2134,6 +2372,14 @@ if(_discTest) _discTest.onclick=async()=>{
     const d=await api('/api/discord/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({discord_webhook:$('#discWebhook').value.trim()})});
     msg.textContent=d.message||(d.ok?'Sent!':'Failed'); msg.style.color=d.ok?'var(--green)':'var(--red)';
   }catch(e){ msg.textContent='Failed: '+e; msg.style.color='var(--red)'; }
+};
+const _digNow=$('#digNowBtn');
+if(_digNow) _digNow.onclick=async()=>{
+  const msg=$('#digNowMsg'); msg.textContent='Sending\u2026'; msg.style.color='var(--faint)';
+  await saveDiscord();
+  try{ const d=await api('/api/discord/digest-now',{method:'POST'});
+       msg.textContent=d.message||(d.ok?'Sent!':'Failed'); msg.style.color=d.ok?'var(--green)':'var(--red)'; }
+  catch(e){ msg.textContent='Failed: '+e; msg.style.color='var(--red)'; }
 };
 function openSettings(){ loadDiscordSettings(); $('#settingsScrim').classList.add('open'); }
 function closeSettings(){$('#settingsScrim').classList.remove('open');}
@@ -2168,8 +2414,9 @@ $('#quitBtn').onclick=async()=>{
     'Release Radar has stopped.<br><span style="font-size:15px">You can close this tab.</span></div>';
 };
 
-async function askExtension(path,label){
-  try{ const r=await api(path,{method:'POST'}); if(!r||!r.ok){toast('Could not reach the app');return;} }
+async function askExtension(path,label,body){
+  try{ const opt=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{method:'POST'};
+       const r=await api(path,opt); if(!r||!r.ok){toast('Could not reach the app');return;} }
   catch(e){ toast('Could not reach the app'); return; }
   toast(label+' \u2014 the extension will start within ~20s. Make sure it\u2019s installed and Firefox is open.');
   // poll a little faster for a couple of minutes so results show as they land
@@ -2269,7 +2516,8 @@ def run_in_tray(port, url):
 
 def main():
     load_state()
-    _start_release_watcher()
+    _ensure_line_files()
+    _start_daily_digest()
     port = pick_port(int(os.environ.get("RADAR_PORT", DEFAULT_PORT)))
     url = f"http://127.0.0.1:{port}/"
     add_log(f"{APP_NAME} started on {url}")

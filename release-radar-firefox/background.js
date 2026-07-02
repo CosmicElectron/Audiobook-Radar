@@ -13,8 +13,8 @@
 var RADAR_BASE = "http://127.0.0.1:8765";        // change the port here if needed
 var RADAR = RADAR_BASE + "/api/ingest";
 
-var A_REFRESH = "rr-refresh", A_CRAWL = "rr-crawl";
-var REFRESH_MIN = 24 * 60, CRAWL_MIN = 3 * 24 * 60;
+var A_REFRESH = "rr-refresh", A_CRAWL = "rr-crawl", A_RELEASE = "rr-release-hourly";
+var REFRESH_MIN = 24 * 60, CRAWL_MIN = 3 * 24 * 60, RELEASE_MIN = 60;
 var CRAWL_CAP = 120;                  // max pages per series in one pass (safety)
 var MIN_GAP = 2000, JITTER = 2000;    // pacing between fetches (ms)
 var PAGE_TIMEOUT = 25000, APP_TIMEOUT = 10000;
@@ -244,12 +244,67 @@ async function _recrawlInner(force) {
   }
 }
 
+// On a novel's release day, re-check just that novel's page every hour — until the day
+// rolls over or the date moves — so a slipped date or the confirmed release is picked up
+// promptly without waiting for the daily refresh. Scoped to NOVEL pages dated today only;
+// audiobooks and every other book are left alone.
+async function checkReleasingToday() {
+  var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
+  var today = todayISO();
+  var due = Object.keys(urls).filter(function (k) { var u = urls[k]; return u && !u.isAudio && u.date === today; });
+  if (!due.length) return;                            // nothing releasing today — stay quiet
+  if (!acquire()) { logLine("release-day hourly check: worker busy, will retry next hour"); return; }
+  startP("release", due.length);
+  try {
+    logLine("release-day hourly: re-checking " + due.length + " novel" + (due.length === 1 ? "" : "s") + " dated today");
+    var bad = await loadBad();
+    for (var i = 0; i < due.length; i++) {
+      var k = due[i], u = urls[k], a = asinOf(k);
+      if (a && isBad(a, bad)) { logLine("  skip (known-bad) " + shortUrl(k)); continue; }
+      await readPage(k, true, (u && u.series) || "");
+      await sleep(MIN_GAP + Math.random() * JITTER);
+    }
+  } finally { endP(); release(); }
+  logLine("release-day hourly done: fetched " + P.checked + ", sent " + P.sent);
+}
+
 async function recrawlAll(force) {
   if (!acquire()) { logLine("re-crawl skipped (worker busy)"); return { busy: true }; }
   startP("crawl", 0);
   try { await _recrawlInner(force); } finally { endP(); release(); }
   logLine("finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : "") + "  (" + Math.round((Date.now() - (P.startedAt || Date.now())) / 1000) + "s)");
   try { await browser.storage.local.set({ lastCrawl: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
+  return { checked: P.checked, sent: P.sent, failed: P.failed };
+}
+
+// Re-crawl ONE series (the app's per-series "Check" button). Same smart pass as a
+// full crawl — re-reads that series' latest known book + its "in this series" list to
+// catch new/updated books, skipping ones already fully out — but scoped to a single
+// series, matched by normalized name (with ASINs as a fallback), like forgetSeries.
+async function crawlOneSeries(name, asins) {
+  if (!acquire()) { logLine("check-one skipped (worker busy)"); return { busy: true }; }
+  startP("crawl", 0);
+  try {
+    var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
+    var target = norm(name || ""), asinList = asins || [];
+    var seed = null, seedN = -1, matched = 0;
+    Object.keys(urls).forEach(function (k) {
+      var u = urls[k];
+      var mine = (target && norm(u.series) === target) || (u.asin && asinList.indexOf(u.asin) >= 0);
+      if (mine) { matched++; if ((u.n || 0) > seedN) { seedN = (u.n || 0); seed = k; } }
+    });
+    if (!seed) { logLine("check \"" + (name || "?") + "\": no pages known for it yet \u2014 open one of its Amazon/Audible pages once so I learn a URL"); return { ok: false, reason: "no-known-pages" }; }
+    var idx = settledIndex(urls), bad = await loadBad(), visited = {};
+    logLine("check one series: \"" + (name || "?") + "\" (" + matched + " known page(s))  seed " + shortUrl(seed));
+    await crawlSeries(seed, visited, urls, idx, false, bad);
+    // safety net: this series' unsettled pages not reached via the seed's carousel
+    var leftover = Object.keys(urls).filter(function (k) {
+      var u = urls[k], mine = (target && norm(u.series) === target) || (u.asin && asinList.indexOf(u.asin) >= 0);
+      if (!mine) return false; var x = asinOf(k); if (!x || visited[x]) return false; return !pageIsSettled(u, idx);
+    });
+    for (var j = 0; j < leftover.length; j++) { await readPage(leftover[j], false, name || ""); var la = asinOf(leftover[j]); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
+  } finally { endP(); release(); }
+  logLine("check finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   return { checked: P.checked, sent: P.sent, failed: P.failed };
 }
 
@@ -308,6 +363,7 @@ async function pollCommands() {
         else if (c.type === "forgetAll") { await browser.storage.local.set({ urls: {} }); logLine("app reset \u2014 forgot ALL registered pages"); done.push(c.id); }
         else if (c.type === "refresh") { if (_busy) { logLine("app asked to refresh \u2014 waiting, worker busy"); } else { logLine("app requested: refresh dates"); done.push(c.id); refreshKnown(); } }
         else if (c.type === "recrawl") { if (_busy) { logLine("app asked to crawl \u2014 waiting, worker busy"); } else { logLine("app requested: crawl all"); done.push(c.id); recrawlAll(false); } }
+        else if (c.type === "crawlSeries") { if (_busy) { logLine("app asked to check a series \u2014 waiting, worker busy"); } else { logLine("app requested: check series \"" + (c.series || "?") + "\""); done.push(c.id); crawlOneSeries(c.series, c.asins); } }
         else { done.push(c.id); }   // unknown type: drop it
       } catch (e) { /* leave unacked; retry next poll */ }
     }
@@ -349,6 +405,7 @@ async function ensureDashboardTab(focus) {
 function ensureAlarms() {
   browser.alarms.get(A_REFRESH).then(function (x) { if (!x) browser.alarms.create(A_REFRESH, { periodInMinutes: REFRESH_MIN, delayInMinutes: 2 }); });
   browser.alarms.get(A_CRAWL).then(function (x) { if (!x) browser.alarms.create(A_CRAWL, { periodInMinutes: CRAWL_MIN, delayInMinutes: 10 }); });
+  browser.alarms.get(A_RELEASE).then(function (x) { if (!x) browser.alarms.create(A_RELEASE, { periodInMinutes: RELEASE_MIN, delayInMinutes: 5 }); });
 }
 browser.runtime.onInstalled.addListener(function () { logLine("extension installed/updated"); ensureAlarms(); });
 browser.runtime.onStartup.addListener(function () {
@@ -356,7 +413,7 @@ browser.runtime.onStartup.addListener(function () {
   setTimeout(function () { ensureDashboardTab(false); }, 6000);  // wait for session restore to bring back the pinned tab
   setTimeout(function () { refreshKnown(); }, 25000);
 });
-browser.alarms.onAlarm.addListener(function (al) { if (al.name === A_REFRESH) refreshKnown(); else if (al.name === A_CRAWL) recrawlAll(false); });
+browser.alarms.onAlarm.addListener(function (al) { if (al.name === A_REFRESH) refreshKnown(); else if (al.name === A_CRAWL) recrawlAll(false); else if (al.name === A_RELEASE) checkReleasingToday(); });
 
 // poll the app for commands (persistent page keeps this interval alive)
 setInterval(pollCommands, CMD_POLL_MS);
