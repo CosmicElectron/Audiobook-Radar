@@ -2037,7 +2037,7 @@ def _match_tracked_series(name):
 
 @app.route("/api/ingest", methods=["POST", "OPTIONS"])
 def api_ingest():
-    """Accept one book read from an Amazon page (via the extension/userscript) and
+    """Accept one book read from an Amazon page (via the extension) and
     fold it into the matching tracked series by book number. Amazon is treated as
     authoritative for the field it reports, so it sets that book's novel/audiobook
     date directly; everything else is left alone. Creates the series if it's new."""

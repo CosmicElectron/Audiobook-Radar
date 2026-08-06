@@ -175,11 +175,15 @@ to a background fetch, that page is skipped for that round — open it in a tab
 once and it recovers. Pages that repeatedly fail are listed in the extension's
 popup so you can open them yourself.
 
-### Tampermonkey userscript — `release-radar.user.js`
+### Other browsers
 
-If you'd rather not install an extension, this does the live-page half only:
-open or refresh a book page and it sends the date. It does **not** run in the
-background, so nothing updates unless you visit a page.
+Only Firefox is supported. Porting the extension to Chromium (Chrome, Edge,
+Brave, Opera) is a real piece of work rather than a rename, because Manifest V3
+replaces the persistent background page with a service worker that gets shut
+down while idle — and a full crawl takes 13–17 minutes of paced fetches.
+**[CHROMIUM-PORT.md](CHROMIUM-PORT.md)** documents exactly what has to change,
+in enough detail to follow by hand or hand to an AI, including the failure modes
+that look like success.
 
 ### How it lands
 
