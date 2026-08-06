@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "name": "Release Radar — Amazon/Audible reader",
-  "version": "1.0",
-  "description": "Reads book and audiobook release dates from Amazon/Audible pages — live when you visit, and on a background schedule with no tabs open — and sends them to your local Release Radar app.",
+  "name": "Release Radar — Amazon reader",
+  "version": "1.8",
+  "description": "Reads book and audiobook release dates from Amazon pages — live when you visit, and on a background schedule with no tabs open — and sends them to your local Release Radar app.",
   "browser_specific_settings": {
     "gecko": {
       "id": "release-radar@local",
@@ -17,16 +17,11 @@
   "permissions": [
     "alarms",
     "storage",
-    "notifications",
     "clipboardWrite",
     "https://www.amazon.com.au/*",
     "https://www.amazon.com/*",
     "https://www.amazon.co.uk/*",
-    "https://www.audible.com.au/*",
-    "https://www.audible.com/*",
-    "https://www.audible.co.uk/*",
-    "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://127.0.0.1/*"
   ],
   "background": {
     "scripts": ["extract.js", "background.js"],
@@ -37,10 +32,7 @@
       "matches": [
         "https://www.amazon.com.au/*",
         "https://www.amazon.com/*",
-        "https://www.amazon.co.uk/*",
-        "https://www.audible.com.au/*",
-        "https://www.audible.com/*",
-        "https://www.audible.co.uk/*"
+        "https://www.amazon.co.uk/*"
       ],
       "js": ["extract.js", "content.js"],
       "run_at": "document_idle"

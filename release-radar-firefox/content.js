@@ -1,6 +1,6 @@
-// Runs on Amazon/Audible product pages you open. Opening ONE page of a series is
+// Runs on Amazon product pages you open. Opening ONE page of a series is
 // enough: it asks the background to crawl the whole series — every book, both the
-// Kindle (novel) and Audible (audiobook) editions — and send the dates to Radar.
+// Kindle (novel) and audiobook editions — and send the dates to Radar.
 //
 // If collecting is paused, this stays completely silent so you can browse and look
 // at new novels without anything being added or crawled.

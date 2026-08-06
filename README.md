@@ -1,168 +1,174 @@
 # Release Radar
 
-A small, local desktop app that tracks **book and audiobook release dates** for the
-series you follow — with a dashboard, an RSS feed, predicted release windows, and
-optional Discord pings. It runs on your own machine; there's no cloud and no account.
+A small desktop program that tracks novel and audiobook releases for the book
+series you follow. It runs locally, shows a dashboard in your browser, predicts
+when an unannounced audiobook is likely to land, and publishes an RSS feed and a
+calendar feed of what's coming.
 
-> **Heads up — this was "vibe coded."** It was built conversationally with Claude
-> (Anthropic's AI assistant) across many iterative sessions, by someone who isn't a
-> professional developer. It works and gets used daily, but expect the occasional
-> rough edge, and the code carries some lived-in bits from all that iteration.
-> Shared in case it's useful to anyone who wants the same kind of tool. PRs welcome;
-> no promises about polish.
+There is **no cloud, no account, nothing leaves your machine** — the app itself
+makes no outbound calls except to Discord, if you set up a webhook.
 
-## What it does
+---
 
-- Tracks the series you follow and shows, per series, the next novel and audiobook
-  dates on a dashboard at `http://127.0.0.1:8765/`.
-- **Predicts** a likely next audiobook (and next novel) date from the historical gap
-  between past releases, with a confidence badge, until a real date is announced.
-- Publishes an **RSS feed** of your upcoming releases (`/feed.xml`) and a clean
-  **"Up next" board** (`/board`) you can use as a browser new-tab page.
-- Optional **Discord notifications**: a ping when a new or changed date arrives, and
-  a ping on release day.
-- Lives in the **system tray** — no console window needed for the built `.exe`.
+## How it gets its data
 
-It grew up around long-running LitRPG / light-novel series, but works for any book series.
+Everything comes from **the actual Amazon product pages**, read by the
+included Firefox extension through your own logged-in browser session. There is
+no external book database, no API key, and nothing to sign up for.
 
-## Everything stays local
+1. Run the app (below).
+2. Install the extension (`release-radar-firefox/`, see INSTALL.txt).
+3. Open one Amazon page for a series you follow.
 
-No accounts, no telemetry, no cloud. Your data is a plain JSON file on your disk. The
-only outbound traffic is the app/extension reading the product pages you ask it to,
-and — if you turn it on — posting to your own Discord webhook.
+That's the whole setup. The extension reads the page, sends the series name, book
+number, date and format to the app, then crawls the rest of the series by itself.
+From then on it keeps everything current in the background with no tabs open.
 
-## Quick start (no building)
+Anything it gets wrong you can fix by hand — click **Edit** on a card and every
+field is editable, including each row of the release timeline. Your edits are
+kept: later reads fill in blanks and add new books, but never overwrite a value
+you typed.
 
-1. Install **Python 3.9+** from https://www.python.org/downloads/ (tick *"Add Python
-   to PATH"* on Windows).
-2. Double-click **`run.bat`** (Windows), or run `python app.py` on any OS.
+## Quick start
 
-It installs a few small libraries the first time, then serves `http://127.0.0.1:8765/`.
+1. Install Python 3.9+ from https://www.python.org/downloads/ (tick *"Add
+   Python to PATH"*).
+2. Double-click **run.bat**.
 
-## Build a standalone .exe (Windows)
+It installs the dependencies the first time, then serves
+`http://127.0.0.1:8765/`. Close the console window to stop it.
 
-Prefer a single double-clickable program with no visible Python?
+### Build a standalone .exe
 
-1. Double-click **`build.bat`**.
-2. When it finishes, your program is at **`dist\ReleaseRadar.exe`**.
-
-(The `.exe` must be built on Windows, so the source ships with a build script. A
-prebuilt `.exe` and the packaged extension may also be attached to a tagged
-**[Release](../../releases)** — see the note below before using them.)
-
-## Prebuilt downloads (Releases)
-
-If a [Release](../../releases) is attached, you can grab a prebuilt `ReleaseRadar.exe`
-and the packaged `release-radar-firefox.xpi` instead of building/zipping yourself. Two
-honest warnings, because both are **unsigned** (code-signing certificates cost money and
-this is a free personal project):
-
-- **The `.exe` will trip Windows SmartScreen** ("Windows protected your PC — unknown
-  publisher") and may get a false-positive from antivirus — both are normal for unsigned
-  PyInstaller builds. To run it anyway: click **More info → Run anyway**. If you'd rather
-  not, the source and `build.bat` are right here — build it yourself and you know exactly
-  what you're running.
-- **The `.xpi` only installs on some browsers.** Standard Firefox (release/beta) refuses
-  to *permanently* install unsigned extensions — that's locked. It works on Firefox forks
-  (LibreWolf, Waterfox, Mullvad), Developer Edition, ESR, and Nightly, or temporarily on
-  any Firefox via `about:debugging` (removed on restart). Full steps are in
-  [`release-radar-firefox/INSTALL.txt`](release-radar-firefox/INSTALL.txt).
-
-If you'd rather avoid all of that, just run from source with `run.bat` — no warnings,
-nothing to trust.
-
-## How release dates get in
-
-Amazon and Audible are the source of truth, but they block plain server-side page
-reads — so the reliable path is a small browser helper that reads pages using *your
-own logged-in browser session*.
-
-1. **Firefox extension (recommended — hands-off)** — in `release-radar-firefox/`. When
-   you open an Amazon/Audible book or audiobook page it reads the date and sends it to
-   the app; and on a background schedule (with no tabs open) it re-checks every page
-   you've visited once, so pre-orders and newly-announced audiobooks update themselves.
-   Full install steps are in `release-radar-firefox/INSTALL.txt`. Works on Firefox and
-   forks (LibreWolf, Waterfox, Mullvad, …).
-
-2. **Tampermonkey userscript (simpler, live-only)** — `release-radar.user.js`. If you'd
-   rather not install an extension, this reads the page when you open or refresh it and
-   sends the date. It does **not** run in the background. Install via
-   Tampermonkey/Violentmonkey.
-
-3. **Add by hand** — in the dashboard, add a series manually and paste an Amazon/Audible
-   link, then hit **Auto-fill**. The app fetches and parses that page to pre-fill what
-   it can (title, cover, date, ebook vs audiobook); anything it misses, you type.
-
-However the data arrives, dates are matched to the right book **by its number** in the
-series, so your manual edits and other books are never clobbered. Every field —
-including each row of the release timeline — stays editable, and edited entries are
-protected from being overwritten on later updates.
-
-## Discord notifications (optional)
-
-In **Settings → Discord notifications**, paste a channel **webhook URL** (in Discord:
-channel → Edit Channel → Integrations → Webhooks → New Webhook → Copy URL) and hit
-**Send test**. Then choose:
-
-- a ping when a new or changed release date arrives, and/or
-- a ping on release day, after an hour you set (default 3 PM, local time).
-
-- The daily digest's personality lines are plain text files in digest_lines next to your data.json — edit them or drop in someone else's pack; changes apply on the next digest.
-
-Backfilled past dates and re-reads of an already-known date stay silent, so it doesn't
-spam you.
-
-## Accessing it remotely — please read
-
-By default the app listens only on `127.0.0.1` (your machine). **It has no login of its
-own** — it was built to be reachable only by you, locally. If you put it on the internet
-(via a Cloudflare Tunnel, a reverse proxy, or a port-forward), anyone who finds the URL
-can not just view it but control it: delete series, change settings, overwrite your
-Discord webhook, or quit the app.
-
-So if you expose it, **put authentication in front of it** — for example Cloudflare
-Access (Zero Trust), which shows a login before the app is ever reachable. Two
-environment variables help:
-
-- `RADAR_PORT` — change the port (default `8765`).
-- `RADAR_HOST` — set to `0.0.0.0` only if a proxy on a *different* machine must reach it
-  over your LAN. This exposes the unauthenticated panel on your network, so pair it with
-  auth.
-
-## Where your data lives
-
-- Windows: `%APPDATA%\ReleaseRadar\data.json` (with `radar.log` beside it).
-- Other OSes: `~/.release-radar/`.
-
-It's plain JSON — back it up or hand-edit it freely. A `data.json.bak` is written before
-any destructive operation.
+Double-click **build.bat**; the result is **dist\ReleaseRadar.exe**, a single
+double-clickable program with no console window that sits in the system tray.
+(It has to be built on Windows, which is why this ships as source plus a build
+script rather than a prebuilt binary.)
 
 ## Quitting
 
-- **Tray icon** — right-click the Release Radar icon near the clock → **Quit**
-  (left-click opens the dashboard). Easiest for the built `.exe`.
-- **Quit button** in the dashboard toolbar.
-- Close the console window (only the `python app.py` / `run.bat` way has one).
+- **System-tray icon** — left-click opens the dashboard, right-click → **Quit**.
+  This is the one to use for the built exe, since it has no console window.
+- **Quit** button in the dashboard toolbar.
+- Close the console window (only the `run.bat` / `python app.py` way has one).
 
-## Browser new-tab view
+## The dashboard
 
-Point a custom-new-tab extension at `http://127.0.0.1:8765/board` for a styled "Up next"
-page — or, if your extension takes pasted HTML, use the included `newtab.html`. The app
-has to be running either way.
+**Next releases** — the three soonest, with a countdown. `⇄ Show novels`
+switches between audiobooks and novels; **Estimates** includes or hides
+predicted dates in that list.
 
-## Honest caveats
+**Overdue audiobooks** — top right. Any audiobook whose expected window has
+passed with no announcement, with a day counter that keeps climbing, newest
+slip first.
 
-This was vibe-coded with an AI, in an environment that **couldn't reach Amazon or
-Discord, or run a real Firefox / Windows tray** — so those live paths were written
-against saved sample pages and reasoned through, rather than exercised end-to-end in
-testing. They've since been used in real life, but if something misbehaves on first run,
-the cause is logged in `radar.log`, and it's usually a small fix. If Amazon changes their
-page layout, the bit to update is the selectors in `release-radar-firefox/extract.js`.
+**Tracked series** — one card each, showing the cover, the tracked novel and
+audiobook (each labelled with its book number), the average novel→audiobook gap,
+the narrator, a status pill, and the next prediction. **Drag** cards by the grip
+to reorder, or use the **Sort** dropdown (next release / title / status).
 
+Each card has a **release timeline**: a violet dot per novel, amber per
+audiobook, split violet/amber when both land the same day, hollow while still
+upcoming, and a dashed amber ring for a predicted date. Hovering any dot shows
+that book's cover art and details. The colour key sits above the list.
 
-It's a personal tool — be reasonable about how often you check, so you're a good citizen
-of the sites you read from.
+**Refresh dates** and **Crawl all** ask the extension to go and re-read pages
+now; **Check** on a card does the same for one series. They need the extension
+installed and the browser open.
 
-## License
+## How the prediction works
 
-MIT — see [LICENSE](LICENSE). Do what you like with it.
+A confirmed date always wins; a prediction only appears where nothing has been
+announced. Audiobooks are forecast as a **queue**: each undated book is
+projected as the later of two constraints — it can't arrive sooner after its own
+novel than the series' usual lag, and it can't jump ahead of the previous
+audiobook, spaced by the series' own audio cadence. Each projection anchors the
+next, so a backlog forecasts as a queue draining at the real pace.
+
+The averages are recency-weighted with freak outliers ignored (the confidence
+chip's tooltip says when one was). If a series releases day-and-date, a
+confirmed novel date beats the queue rather than being pushed past its own book.
+And when a book misses its window entirely, it's reported as overdue rather than
+being given a fictional new date — nothing behind it can be predicted until it
+lands, so nothing is.
+
+## Discord notifications (optional)
+
+In **Settings**, paste a channel webhook URL (Discord: channel → Edit Channel →
+Integrations → Webhooks → New Webhook → Copy URL). Then choose any of:
+
+- a ping when a new or changed release date arrives,
+- a ping when a release goes live (the store page flips from pre-order to
+  buyable),
+- a recurring forecast digest at an hour you pick.
+
+Messages arrive with cover art, and a same-day novel+audiobook pair is reported
+as one entry. A narrator change gets its own ping. All the wording lives in
+plain text files under `digest_lines\` next to your data — edit or replace any
+of it; changes apply on the next message with no restart.
+
+## Feeds
+
+- **RSS** — `/feed.xml`, your next three releases, for any feed reader.
+- **Calendar** — `/calendar.ics`, upcoming **confirmed** releases as all-day
+  events (estimates deliberately stay out of a calendar, where an entry reads as
+  a commitment). Subscribe by URL from Google Calendar, Outlook, or your phone.
+  Note that Google fetches server-side, so it needs a publicly reachable URL —
+  not `127.0.0.1` — and the path must not sit behind a login.
+- **New tab** — `/board`, a clean "Up next" page for a new-tab extension that
+  takes a URL. If yours takes pasted HTML instead, use the included
+  `newtab.html`.
+
+The app has to be running for any of these to serve.
+
+## Your data
+
+- `%APPDATA%\ReleaseRadar\data.json` — plain JSON you can edit directly.
+- `%APPDATA%\ReleaseRadar\radar.log` — activity log.
+- `%APPDATA%\ReleaseRadar\backups\` — a snapshot per day, newest 14 kept, taken
+  before the first write of each day. A `.bak` is also written before bulk
+  operations such as **Clear all tracked series**.
+
+## Reading pages automatically
+
+### Firefox extension (recommended) — `release-radar-firefox/`
+
+For Firefox and its forks (LibreWolf, Waterfox, Mullvad). It does two things:
+
+- **When you open** an Amazon book page it reads the release date, sends
+  it, registers the page, and crawls that whole series in the background.
+- **On a schedule, with no tabs open**, it re-reads pages through your own
+  logged-in session: once a day for every book that hasn't fully released, and
+  never again once a book's novel and audiobook are both out. The only thing
+  that runs more often is the release-day watcher — on the day a book is due it
+  re-reads that one page hourly until the page reads as buyable, then stops.
+  With nothing due today it makes no requests at all.
+
+Install steps are in `release-radar-firefox/INSTALL.txt`. Forks generally allow
+the unsigned `.xpi`; otherwise load it temporarily from `about:debugging`. After
+editing the extension, repackage it with `python pack_extension.py`.
+
+Because it uses your own session at a low frequency, background reads look like
+normal browsing rather than scraping. If Amazon returns a sign-in or robot page
+to a background fetch, that page is skipped for that round — open it in a tab
+once and it recovers. Pages that repeatedly fail are listed in the extension's
+popup so you can open them yourself.
+
+### Tampermonkey userscript — `release-radar.user.js`
+
+If you'd rather not install an extension, this does the live-page half only:
+open or refresh a book page and it sends the date. It does **not** run in the
+background, so nothing updates unless you visit a page.
+
+### How it lands
+
+The page supplies the series, the book number ("Book 7 of 9"), the date, and
+whether it's the ebook or the audiobook, so there is no fuzzy matching. The app
+files that date against that book number; Amazon is authoritative for the field
+it reports, and your own edits and the other books are untouched.
+
+---
+
+This is a personal tool that reads pages through your own browser session. Be
+reasonable with how often you make it check, so you stay a good citizen of the
+sites it reads.

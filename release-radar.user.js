@@ -1,18 +1,14 @@
 // ==UserScript==
-// @name         Release Radar — Amazon/Audible reader
+// @name         Release Radar — Amazon reader
 // @namespace    release-radar
-// @version      1.0
-// @description  Reads the book or audiobook on the current Amazon/Audible page and sends its release date to your local Release Radar app.
+// @version      1.1
+// @description  Reads the book or audiobook on the current Amazon page and sends its release date to your local Release Radar app.
 // @author       Release Radar
 // @match        https://www.amazon.com.au/*
 // @match        https://www.amazon.com/*
 // @match        https://www.amazon.co.uk/*
-// @match        https://www.audible.com.au/*
-// @match        https://www.audible.com/*
-// @match        https://www.audible.co.uk/*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
-// @connect      localhost
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -126,6 +122,9 @@
       }
     }
 
+    // narrator (audiobook pages only)
+    var narrator = (m["audiobook_details-narrator"] && m["audiobook_details-narrator"].value) || null;
+
     // ASIN
     var asin = (m["book_details-asin"] && m["book_details-asin"].value) ||
                (location.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/) || [])[1] ||
@@ -134,6 +133,7 @@
     return {
       series: series, author: author, series_total: total,
       book: { n: n, title: title, asin: asin,
+              narrator: isAudio ? narrator : null,
               novel_date: isAudio ? null : dt, audiobook_date: isAudio ? dt : null },
       _isAudio: isAudio, _date: dt
     };

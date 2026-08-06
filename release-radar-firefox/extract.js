@@ -107,6 +107,24 @@ function RR_extract(doc, url) {
     }
   }
 
+  // narrator (audiobook pages only) — the app shows it on the card and pings
+  // when a series changes voice
+  var narrator = (m["audiobook_details-narrator"] && m["audiobook_details-narrator"].value) || null;
+  if (!narrator) {
+    var bl = clean((doc.querySelector("#bylineInfo") || {}).textContent || "");
+    var nm = bl.match(/([^(),]+?)\s*\(Narrator\)/);
+    if (nm) narrator = clean(nm[1]);
+  }
+  // the byline runs names together with page controls ("…, see all")
+  if (narrator) {
+    narrator = narrator.replace(/\(\s*narrator[^)]*\)/ig, "");
+    for (var np = null; np !== narrator; ) {
+      np = narrator;
+      narrator = narrator.replace(/\s*(?:,\s*)?(?:see all|see more|and others?|et al\.?|,)\s*$/i, "").trim();
+    }
+    narrator = narrator || null;
+  }
+
   var asin = (m["book_details-asin"] && m["book_details-asin"].value) ||
              db["asin"] ||
              (path.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/) || [])[1] ||
@@ -114,24 +132,33 @@ function RR_extract(doc, url) {
   var canonical = asin ? ("https://" + (host || "www.amazon.com.au") + "/dp/" + asin) : (url.split("?")[0] || url);
 
   // Pre-order vs live: real DOM elements only (the released page still contains
-  // "PreorderButton" strings inside its scripts, so text search would lie).
+  // "PreorderButton" strings inside its scripts, so a raw text search would lie).
   // true = pre-order, false = buyable now, null = can't tell (treated as no-change).
+  //
+  // The buy box differs per format, and the original selectors only covered the
+  // Kindle one — so audiobook pages always came back null and their releases were
+  // never confirmed. Audible-edition pages carry their own buttons/labels, hence
+  // the extra selectors and phrases below.
   var preorder = null;
   try {
     var annText = "";
-    var anns = doc.querySelectorAll('[id$="-announce"]');
+    var anns = doc.querySelectorAll('[id$="-announce"], #buybox .a-button-text, #audibleBuyBoxLabel, #buyboxLabel');
     for (var ai = 0; ai < anns.length; ai++) annText += " | " + clean(anns[ai].textContent);
-    var preEl = doc.querySelector('[id*="preorder"], [class*="a-button-preorder"]');
-    if (preEl || /pre-?order/i.test(annText)) preorder = true;
+    var preEl = doc.querySelector('[id*="preorder"], [id*="preOrder"], [class*="a-button-preorder"], [name*="preorder"]');
+    if (preEl || /pre-?order|releases on|available (?:on|for pre-?order)/i.test(annText)) preorder = true;
     else {
-      var buyEl = doc.querySelector('#one-click-button, #buy-now-button, #add-to-cart-button, [id^="buy-now"], [id^="add-to-cart"]');
-      if (buyEl || /add to (library|cart)|buy now|listen now|read now|read for free|included in/i.test(annText)) preorder = false;
+      var buyEl = doc.querySelector(
+        '#one-click-button, #buy-now-button, #add-to-cart-button, [id^="buy-now"], [id^="add-to-cart"],' +
+        ' #audibleBuyButton, #adbl_buy_button, [name="submit.add-to-cart"], [name="submit.buy-now"],' +
+        ' #newAccordionRow_1 input[name^="submit."]');
+      if (buyEl || /add to (library|cart|basket)|buy now|buy with 1-click|buy for |listen now|read now|read for free|included (?:in|with)|start (?:listening|reading)|deliver to/i.test(annText)) preorder = false;
     }
   } catch (e) { preorder = null; }
 
   return {
     series: series, author: author, series_total: total,
     book: { n: n, title: title, asin: asin, cover: coverUrl(),
+            narrator: isAudio ? narrator : null,
             novel_date: isAudio ? null : dt, audiobook_date: isAudio ? dt : null },
     _isAudio: isAudio, _date: dt, _url: canonical, _asin: asin, _preorder: preorder
   };

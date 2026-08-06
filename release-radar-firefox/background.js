@@ -53,8 +53,25 @@ async function loadBad() { try { var o = await browser.storage.local.get("bad");
 // ---- single-worker lock (synchronous, so it actually serializes) ----
 var _busy = false;
 var _seedQueue = [];
+// Work that arrived while the lock was held. Without this, queued crawl seeds
+// strand forever (only the crawl worker drains them) and an hourly release check
+// that lands during a refresh is silently dropped rather than deferred.
+var _pending = { refresh: false, release: false, crawl: false };
+// Bumped by the popup's "Reset if stuck": running loops compare against it and
+// bail out, so freeing the lock cannot leave two unpaced loops fetching at once.
+var _gen = 0;
 function acquire() { if (_busy) return false; _busy = true; return true; }
-function release() { _busy = false; }
+function release() {
+  _busy = false;
+  setTimeout(drainPending, 0);      // async so it never re-enters a finally block
+}
+function drainPending() {
+  if (_busy) return;
+  if (_seedQueue.length) { runSeedWorker(); return; }
+  if (_pending.release) { _pending.release = false; checkReleasingToday(); return; }
+  if (_pending.refresh) { _pending.refresh = false; refreshKnown(true); return; }
+  if (_pending.crawl) { _pending.crawl = false; recrawlAll(false); return; }
+}
 
 // ---- log ----
 var _log = [];
@@ -89,29 +106,95 @@ function postRadar(data) {
 function pad2(n) { n = String(n); return n.length < 2 ? "0" + n : n; }
 function todayISO() { var t = new Date(); return t.getFullYear() + "-" + pad2(t.getMonth() + 1) + "-" + pad2(t.getDate()); }
 function isPastDate(d) { return !!(d && /^\d{4}-\d{2}-\d{2}$/.test(d) && d < todayISO()); }
+// Whole days since a date: >0 past, 0 today, <0 future, null if unusable.
+function daysSince(d) {
+  if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+  var a = new Date(d + "T00:00:00"), b = new Date(todayISO() + "T00:00:00");
+  if (isNaN(a)) return null;
+  return Math.round((b - a) / 86400000);
+}
+
+// A page is FINISHED once its release has happened AND we either watched it go
+// live or waited long enough that nothing more can be learned. Date arithmetic
+// alone is not enough: a date can pass while Firefox is closed, and retiring a
+// page on that basis throws away the release confirmation for good.
+var SETTLE_GRACE_DAYS = 3;
+function pageDone(u) {
+  var dd = daysSince(u && u.date);
+  if (dd === null || dd <= 0) return false;
+  return u.live === true || dd > SETTLE_GRACE_DAYS;
+}
+// Keyed through norm() because the app matches series names fuzzily; an edition
+// naming variation must not split one book across two buckets.
 function settledIndex(urls) {
   var m = {};
   Object.keys(urls || {}).forEach(function (k) {
-    var u = urls[k]; var key = (u.series || "") + "\u0000" + u.n;
+    var u = urls[k]; var key = norm(u.series) + "\u0000" + u.n;
     if (!m[key]) m[key] = { novel: null, audio: null };
-    if (u.isAudio) { if (u.date) m[key].audio = u.date; } else { if (u.date) m[key].novel = u.date; }
+    if (!u.date) return;
+    if (u.isAudio) m[key].audio = pageDone(u); else m[key].novel = pageDone(u);
   });
   return m;
 }
-function pageIsSettled(u, idx) { if (!u) return false; var bk = idx[(u.series || "") + "\u0000" + u.n]; return bk ? (isPastDate(bk.novel) && isPastDate(bk.audio)) : false; }
+function pageIsSettled(u, idx) {
+  if (!u) return false;
+  var bk = idx[norm(u.series) + "\u0000" + u.n];
+  return bk ? (bk.novel === true && bk.audio === true) : false;
+}
 function nodeSettled(url, urls, idx) { var u = urls[url]; return u ? pageIsSettled(u, idx) : false; }
+
+// A page still worth a daily read: anything whose book hasn't fully finished.
+// Once both editions are out AND confirmed, it is never fetched again.
+function refreshDue(u, idx) { return !pageIsSettled(u, idx); }
+
+// Already fetched since midnight? Stops a crawl and the daily refresh from
+// reading the same page twice on the same day.
+function readToday(u) {
+  if (!u || !u.lastChecked) return false;
+  var d = new Date(u.lastChecked);
+  return (d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate())) === todayISO();
+}
+
+// Has a whole-library job run recently? Firefox does not persist alarms across
+// browser sessions, so without this gate every restart re-runs the schedule.
+async function ranWithin(key, ms) {
+  try {
+    var o = await browser.storage.local.get(key);
+    var t = o[key] && o[key].at;
+    return !!(t && (Date.now() - t) < ms);
+  } catch (e) { return false; }
+}
+var REFRESH_MIN_MS = 20 * 60 * 60 * 1000;      // ~once a day
+var CRAWL_MIN_MS = CRAWL_MIN * 60 * 1000;      // the crawl alarm's own period
 
 async function remember(data, url, ok) {
   try {
     var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
-    urls[data._url || url] = { asin: data._asin || asinOf(url), series: data.series, n: data.book.n,
-      isAudio: data._isAudio, date: data._date, lastChecked: Date.now(), lastResult: ok ? "ok" : "err" };
+    var key = data._url || url;
+    var prev = urls[key] || {};
+    // `live` is what the watcher stops on, and it is deliberately STICKY and
+    // conservative: set only when the page read as buyable AND the app accepted
+    // the POST. A read the app never received is not a delivered release, and a
+    // later unreadable page (pre-order state comes back null on some layouts)
+    // must not un-confirm one. A date that moves back into the future reopens it.
+    var live = prev.live === true || (data._preorder === false && ok === true);
+    if (prev.date && data._date && prev.date !== data._date) {
+      var dd = daysSince(data._date);
+      if (dd !== null && dd < 0) live = false;
+    }
+    urls[key] = { asin: data._asin || asinOf(url), series: data.series, n: data.book.n,
+      isAudio: data._isAudio, date: data._date, lastChecked: Date.now(), lastResult: ok ? "ok" : "err",
+      // last raw reading: true = pre-order, false = buyable, null = couldn't tell
+      preorder: (data._preorder === undefined ? null : data._preorder),
+      live: live };
     await browser.storage.local.set({ urls: urls });
   } catch (e) {}
 }
 
 // Fetch one page, with one retry after a pause if it looks blocked/timed-out.
-async function readPage(url, force, seriesHint) {
+// opts.backfill marks the ingest as aux-only (app fills missing dates but never
+// overwrites existing ones — protects hand edits from backfill re-reads).
+async function readPage(url, force, seriesHint, opts) {
   var started = Date.now(), out = { ok: false }, tries = 0;
   while (true) {
     tries++;
@@ -123,6 +206,7 @@ async function readPage(url, force, seriesHint) {
       else {
         var doc = new DOMParser().parseFromString(await resp.text(), "text/html");
         var data = RR_extract(doc, url);
+        if (data && opts && opts.backfill) data._backfill = true;
         out.related = RR_related(doc);
         if (RR_valid(data)) {
           var res = await postRadar(data);
@@ -158,12 +242,13 @@ async function readPage(url, force, seriesHint) {
 
 async function crawlSeries(seedUrl, visited, urls, idx, force, bad) {
   visited = visited || {}; urls = urls || {}; idx = idx || {}; bad = bad || {};
-  var origin = originOf(seedUrl), queue = [seedUrl], local = 0, first = true, skippedBad = 0;
+  var origin = originOf(seedUrl), queue = [seedUrl], local = 0, first = true, skippedBad = 0, skippedToday = 0;
   var seriesHint = (urls[seedUrl] && urls[seedUrl].series) || "";
   while (queue.length && local < CRAWL_CAP) {
     var url = queue.shift(), a = asinOf(url);
     if (a) { if (visited[a]) continue; visited[a] = 1; }
     if (!first && !force && nodeSettled(url, urls, idx)) { logLine("SKIP settled  " + shortUrl(url)); continue; }
+    if (!first && !force && readToday(urls[url])) { skippedToday++; continue; }   // already read since midnight
     if (!first && a && isBad(a, bad)) { skippedBad++; continue; }   // sign-in/unparseable page; don't re-hammer
     first = false;
     var r = await readPage(url, force, seriesHint);
@@ -175,6 +260,7 @@ async function crawlSeries(seedUrl, visited, urls, idx, force, bad) {
     await sleep(MIN_GAP + Math.random() * JITTER);
   }
   if (skippedBad) logLine("skipped " + skippedBad + " known-bad page(s) on " + shortUrl(seedUrl) + " (will retry after a week)");
+  if (skippedToday) logLine("skipped " + skippedToday + " page(s) already read today on " + shortUrl(seedUrl));
   if (local >= CRAWL_CAP) logLine("note: hit per-series page cap (" + CRAWL_CAP + ") on " + shortUrl(seedUrl));
 }
 
@@ -189,12 +275,13 @@ function enqueueCrawl(url) {
 }
 
 async function runSeedWorker() {
-  if (!acquire()) return;                 // already crawling/refreshing; seeds wait in the queue
+  if (!acquire()) return;                 // busy; release() drains the queue afterwards
+  var gen = _gen;
   startP("crawl", 0);
   logLine("crawl worker started (" + _seedQueue.length + " series queued)");
   var visited = {}, bad = await loadBad();
   try {
-    while (_seedQueue.length) {
+    while (_seedQueue.length && gen === _gen) {
       var url = _seedQueue.shift(), a = asinOf(url);
       if (a && visited[a]) continue;      // same series already covered this run
       logLine("series from " + shortUrl(url) + (_seedQueue.length ? ("  (" + _seedQueue.length + " more queued)") : ""));
@@ -204,19 +291,35 @@ async function runSeedWorker() {
   } finally { endP(); release(); }
   logLine("crawl worker finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   try { await browser.storage.local.set({ lastCrawl: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
-  if (_seedQueue.length) runSeedWorker(); // seeds that arrived after we emptied the queue
+  // no self-restart here: release() already scheduled drainPending(), which picks
+  // up seeds that arrived late without racing for the lock
 }
 
-async function refreshKnown() {
-  if (!acquire()) { logLine("refresh skipped (worker busy)"); return { busy: true }; }
+async function refreshKnown(force) {
+  if (!force && await ranWithin("lastRefresh", REFRESH_MIN_MS)) {
+    logLine("refresh skipped (already ran within the day)"); return { skipped: true };
+  }
+  if (!acquire()) { _pending.refresh = true; logLine("refresh deferred (worker busy)"); return { busy: true }; }
+  var gen = _gen;
   startP("refresh", 0);
   try {
     var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
-    var idx = settledIndex(urls);
-    var list = Object.keys(urls).filter(function (k) { return !pageIsSettled(urls[k], idx); });
+    var idx = settledIndex(urls), bad = await loadBad();
+    var skippedBad = 0, skippedToday = 0;
+    var list = Object.keys(urls).filter(function (k) {
+      var u = urls[k];
+      if (!refreshDue(u, idx)) return false;
+      // honour the same cooldowns the other paths do — this is the highest
+      // frequency path, so it must not be the one that hammers a dead page
+      if (u.asin && isBad(u.asin, bad)) { skippedBad++; return false; }
+      if (readToday(u)) { skippedToday++; return false; }
+      return true;
+    });
     P.total = list.length; saveP();
-    logLine("refresh started: " + list.length + " unsettled of " + Object.keys(urls).length + " known pages");
-    for (var i = 0; i < list.length; i++) { await readPage(list[i], false, (urls[list[i]] || {}).series || ""); await sleep(MIN_GAP + Math.random() * JITTER); }
+    logLine("refresh started: " + list.length + " due of " + Object.keys(urls).length + " known pages" +
+            (skippedToday ? (", " + skippedToday + " already read today") : "") +
+            (skippedBad ? (", " + skippedBad + " on the needs-a-check list") : ""));
+    for (var i = 0; i < list.length && gen === _gen; i++) { await readPage(list[i], false, (urls[list[i]] || {}).series || ""); await sleep(MIN_GAP + Math.random() * JITTER); }
   } finally { endP(); release(); }
   logLine("refresh finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   try { await browser.storage.local.set({ lastRefresh: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
@@ -237,39 +340,57 @@ async function _recrawlInner(force) {
     logLine("series seed [" + (i + 1) + "/" + names.length + "] " + (names[i] || "?") + "  " + shortUrl(su));
     await crawlSeries(su, visited, urls, idx, force, bad);
   }
-  var leftover = Object.keys(urls).filter(function (k) { var x = asinOf(k); if (!x || visited[x]) return false; return force || !pageIsSettled(urls[k], idx); });
+  var leftover = Object.keys(urls).filter(function (k) {
+    var x = asinOf(k); if (!x || visited[x]) return false;
+    if (!force && readToday(urls[k])) return false;      // already read since midnight
+    return force || !pageIsSettled(urls[k], idx);
+  });
   if (leftover.length) {
     logLine("safety net: " + leftover.length + " known page(s) not reached via carousels; fetching directly");
     for (var j = 0; j < leftover.length; j++) { var lu = leftover[j]; await readPage(lu, force); var la = asinOf(lu); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
   }
 }
 
-// On a novel's release day, re-check just that novel's page every hour — until the day
-// rolls over or the date moves — so a slipped date or the confirmed release is picked up
-// promptly without waiting for the daily refresh. Scoped to NOVEL pages dated today only;
-// audiobooks and every other book are left alone.
+// On and just after a book's release day, re-check that book's page every hour so
+// the moment it flips from pre-order to buyable is caught promptly. Deliberately
+// narrow, because this is the only thing that runs more than once a day:
+//   * only pages dated today, or up to RELEASE_WATCH_DAYS past (a US publisher on
+//     an AU storefront can flip hours after local midnight, and Firefox may have
+//     been closed on the day itself)
+//   * only until the release is CONFIRMED — a page that read as buyable and whose
+//     reading the app accepted is done; nothing re-arms it
+//   * with nothing outstanding it makes no network calls at all
+var RELEASE_WATCH_DAYS = 2;
 async function checkReleasingToday() {
   var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
-  var today = todayISO();
-  var due = Object.keys(urls).filter(function (k) { var u = urls[k]; return u && !u.isAudio && u.date === today; });
-  if (!due.length) return;                            // nothing releasing today — stay quiet
-  if (!acquire()) { logLine("release-day hourly check: worker busy, will retry next hour"); return; }
+  var due = Object.keys(urls).filter(function (k) {
+    var u = urls[k];
+    if (!u || u.live === true) return false;          // already confirmed live
+    var dd = daysSince(u.date);
+    return dd !== null && dd >= 0 && dd <= RELEASE_WATCH_DAYS;
+  });
+  if (!due.length) return;                            // nothing outstanding — stay quiet
+  if (!acquire()) { _pending.release = true; logLine("release watch deferred (worker busy)"); return; }
+  var gen = _gen;
   startP("release", due.length);
   try {
-    logLine("release-day hourly: re-checking " + due.length + " novel" + (due.length === 1 ? "" : "s") + " dated today");
+    logLine("release watch: " + due.length + " unconfirmed book" + (due.length === 1 ? "" : "s") + " due now or in the last " + RELEASE_WATCH_DAYS + " days");
     var bad = await loadBad();
-    for (var i = 0; i < due.length; i++) {
+    for (var i = 0; i < due.length && gen === _gen; i++) {
       var k = due[i], u = urls[k], a = asinOf(k);
       if (a && isBad(a, bad)) { logLine("  skip (known-bad) " + shortUrl(k)); continue; }
       await readPage(k, true, (u && u.series) || "");
       await sleep(MIN_GAP + Math.random() * JITTER);
     }
   } finally { endP(); release(); }
-  logLine("release-day hourly done: fetched " + P.checked + ", sent " + P.sent);
+  logLine("release watch done: fetched " + P.checked + ", sent " + P.sent);
 }
 
-async function recrawlAll(force) {
-  if (!acquire()) { logLine("re-crawl skipped (worker busy)"); return { busy: true }; }
+async function recrawlAll(force, auto) {
+  if (auto && await ranWithin("lastCrawl", CRAWL_MIN_MS)) {
+    logLine("crawl skipped (one already ran inside the crawl interval)"); return { skipped: true };
+  }
+  if (!acquire()) { _pending.crawl = true; logLine("re-crawl deferred (worker busy)"); return { busy: true }; }
   startP("crawl", 0);
   try { await _recrawlInner(force); } finally { endP(); release(); }
   logLine("finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : "") + "  (" + Math.round((Date.now() - (P.startedAt || Date.now())) / 1000) + "s)");
@@ -293,7 +414,7 @@ async function crawlOneSeries(name, asins) {
       var mine = (target && norm(u.series) === target) || (u.asin && asinList.indexOf(u.asin) >= 0);
       if (mine) { matched++; if ((u.n || 0) > seedN) { seedN = (u.n || 0); seed = k; } }
     });
-    if (!seed) { logLine("check \"" + (name || "?") + "\": no pages known for it yet \u2014 open one of its Amazon/Audible pages once so I learn a URL"); return { ok: false, reason: "no-known-pages" }; }
+    if (!seed) { logLine("check \"" + (name || "?") + "\": no pages known for it yet \u2014 open one of its Amazon pages once so I learn a URL"); return { ok: false, reason: "no-known-pages" }; }
     var idx = settledIndex(urls), bad = await loadBad(), visited = {};
     logLine("check one series: \"" + (name || "?") + "\" (" + matched + " known page(s))  seed " + shortUrl(seed));
     await crawlSeries(seed, visited, urls, idx, false, bad);
@@ -305,6 +426,28 @@ async function crawlOneSeries(name, asins) {
     for (var j = 0; j < leftover.length; j++) { await readPage(leftover[j], false, name || ""); var la = asinOf(leftover[j]); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
   } finally { endP(); release(); }
   logLine("check finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
+  return { checked: P.checked, sent: P.sent, failed: P.failed };
+}
+
+// Re-read a specific list of pages the app says are missing cover art or
+// narrator info (books tracked before per-book capture existed). Settled-page
+// skipping doesn't apply — the whole point is re-reading old books, once.
+async function coverFill(list) {
+  list = list || [];
+  if (!list.length) return { ok: true, checked: 0 };
+  if (!acquire()) { logLine("cover backfill skipped (worker busy, will retry on next poll)"); return { busy: true }; }
+  startP("refresh", list.length);
+  try {
+    logLine("cover/narrator backfill: " + list.length + " page(s)");
+    var bad = await loadBad();
+    for (var i = 0; i < list.length; i++) {
+      var a = asinOf(list[i]);
+      if (a && isBad(a, bad)) { logLine("  skip (known-bad) " + shortUrl(list[i])); continue; }
+      await readPage(list[i], true, "", { backfill: true });
+      await sleep(MIN_GAP + Math.random() * JITTER);
+    }
+  } finally { endP(); release(); }
+  logLine("backfill finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   return { checked: P.checked, sent: P.sent, failed: P.failed };
 }
 
@@ -335,6 +478,14 @@ function appPing() {
 // (crawl/refresh requested from the app's buttons; "forget" when a series is
 // deleted in the app; "forgetAll" on a full app reset.)
 var _polling = false;
+// Commands the app keeps re-delivering because an ack POST failed must not be
+// executed again — the app only drops a command once it is acked.
+var _handledCmds = {};
+function markHandled(id) {
+  _handledCmds[id] = Date.now();
+  var keys = Object.keys(_handledCmds);
+  if (keys.length > 200) keys.slice(0, keys.length - 200).forEach(function (k) { delete _handledCmds[k]; });
+}
 
 async function forgetSeries(c) {
   var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
@@ -358,12 +509,14 @@ async function pollCommands() {
     var done = [];
     for (var i = 0; i < cmds.length; i++) {
       var c = cmds[i];
+      if (_handledCmds[c.id]) { done.push(c.id); continue; }   // already ran; just re-ack
       try {
         if (c.type === "forget") { await forgetSeries(c); done.push(c.id); }
         else if (c.type === "forgetAll") { await browser.storage.local.set({ urls: {} }); logLine("app reset \u2014 forgot ALL registered pages"); done.push(c.id); }
-        else if (c.type === "refresh") { if (_busy) { logLine("app asked to refresh \u2014 waiting, worker busy"); } else { logLine("app requested: refresh dates"); done.push(c.id); refreshKnown(); } }
-        else if (c.type === "recrawl") { if (_busy) { logLine("app asked to crawl \u2014 waiting, worker busy"); } else { logLine("app requested: crawl all"); done.push(c.id); recrawlAll(false); } }
-        else if (c.type === "crawlSeries") { if (_busy) { logLine("app asked to check a series \u2014 waiting, worker busy"); } else { logLine("app requested: check series \"" + (c.series || "?") + "\""); done.push(c.id); crawlOneSeries(c.series, c.asins); } }
+        else if (c.type === "refresh") { if (_busy) { logLine("app asked to refresh \u2014 waiting, worker busy"); } else { logLine("app requested: refresh dates"); done.push(c.id); markHandled(c.id); refreshKnown(true); } }
+        else if (c.type === "recrawl") { if (_busy) { logLine("app asked to crawl \u2014 waiting, worker busy"); } else { logLine("app requested: crawl all"); done.push(c.id); markHandled(c.id); recrawlAll(false); } }
+        else if (c.type === "crawlSeries") { if (_busy) { logLine("app asked to check a series \u2014 waiting, worker busy"); } else { logLine("app requested: check series \"" + (c.series || "?") + "\""); done.push(c.id); markHandled(c.id); crawlOneSeries(c.series, c.asins); } }
+        else if (c.type === "coverfill") { if (_busy) { logLine("app asked for cover backfill \u2014 waiting, worker busy"); } else { done.push(c.id); markHandled(c.id); coverFill(c.urls); } }
         else { done.push(c.id); }   // unknown type: drop it
       } catch (e) { /* leave unacked; retry next poll */ }
     }
@@ -411,9 +564,16 @@ browser.runtime.onInstalled.addListener(function () { logLine("extension install
 browser.runtime.onStartup.addListener(function () {
   ensureAlarms();
   setTimeout(function () { ensureDashboardTab(false); }, 6000);  // wait for session restore to bring back the pinned tab
-  setTimeout(function () { refreshKnown(); }, 25000);
+  setTimeout(function () { refreshKnown(); }, 25000);   // self-gating: no-op if one already ran today
 });
-browser.alarms.onAlarm.addListener(function (al) { if (al.name === A_REFRESH) refreshKnown(); else if (al.name === A_CRAWL) recrawlAll(false); else if (al.name === A_RELEASE) checkReleasingToday(); });
+browser.alarms.onAlarm.addListener(function (al) {
+  // scheduled runs pass no force / auto=true so they honour the interval gates —
+  // Firefox recreates alarms on every browser start, which without this made a
+  // restart re-trigger the whole schedule
+  if (al.name === A_REFRESH) refreshKnown();
+  else if (al.name === A_CRAWL) recrawlAll(false, true);
+  else if (al.name === A_RELEASE) checkReleasingToday();
+});
 
 // poll the app for commands (persistent page keeps this interval alive)
 setInterval(pollCommands, CMD_POLL_MS);
@@ -430,15 +590,20 @@ setTimeout(pollCommands, 5000);
 browser.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   if (!msg) return;
   if (msg.type === "crawl") { enqueueCrawl(msg.url); sendResponse({ queued: true, pending: _seedQueue.length }); return false; }
-  if (msg.type === "ingest") { postRadar(msg.data).then(sendResponse, function (e) { sendResponse({ ok: false, message: String(e) }); }); return true; }
-  if (msg.type === "recrawl") { recrawlAll(false).then(sendResponse); return true; }
+  if (msg.type === "recrawl") { recrawlAll(false).then(sendResponse); return true; }   // user-triggered: no auto gate
   if (msg.type === "wipeAndCrawl") { wipeAndCrawl().then(sendResponse); return true; }
-  if (msg.type === "refresh") { refreshKnown().then(sendResponse); return true; }
+  if (msg.type === "refresh") { refreshKnown(true).then(sendResponse); return true; }  // user-triggered: force
   if (msg.type === "appPing") { appPing().then(sendResponse); return true; }
   if (msg.type === "clearList") { browser.storage.local.set({ urls: {} }).then(function () { logLine("registered pages cleared by user"); sendResponse({ ok: true }); }); return true; }
   if (msg.type === "getLog") { sendResponse({ log: _log }); return true; }
   if (msg.type === "clearLog") { _log = []; browser.storage.local.set({ log: [] }); sendResponse({ ok: true }); return true; }
-  if (msg.type === "reset") { _seedQueue = []; release(); endP(); logLine("manual reset (worker freed, queue cleared)"); sendResponse({ ok: true }); return true; }
+  if (msg.type === "reset") {
+    // bump the generation FIRST: running loops check it each iteration and bail,
+    // so freeing the lock cannot leave two unpaced loops fetching in parallel
+    _gen++; _seedQueue = []; _pending.refresh = _pending.release = _pending.crawl = false;
+    release(); endP(); logLine("manual reset (running work cancelled, queue cleared)");
+    sendResponse({ ok: true }); return true;
+  }
   if (msg.type === "setPaused") {
     browser.storage.local.set({ paused: !!msg.paused }).then(function () {
       logLine(msg.paused ? "auto-add of opened pages PAUSED (browsing freely)" : "auto-add of opened pages resumed");

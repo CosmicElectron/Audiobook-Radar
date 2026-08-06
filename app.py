@@ -14,19 +14,19 @@ The RSS feed lives at:     http://127.0.0.1:8765/feed.xml
 """
 
 import os
-import sys
 import re
 import json
 import time
 import uuid
 import random
 import html
+import statistics
 import threading
 import logging
 import webbrowser
 from datetime import datetime, date, timedelta
 from email.utils import format_datetime
-from urllib.parse import urlencode
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -81,7 +81,7 @@ _state = {"version": 1, "last_check": None, "series": [], "log": [], "settings":
 
 def default_state():
     return {"version": 1, "last_check": None, "series": [], "log": [], "ext_commands": [], "cmd_seq": 0,
-            "settings": {"hardcover_token": "", "region": "us"}}
+            "settings": {}}
 
 
 def load_state():
@@ -116,11 +116,40 @@ def get_settings():
         s.setdefault("discord_on_release", True)          # ping when a release goes live
         s.setdefault("discord_daily", False)              # daily forecast digest
         s.setdefault("discord_daily_hour", 9)             # 24h local hour to send it
+        s.setdefault("discord_digest_days", 1)            # 1=daily, 2/3, 7=weekly
         return dict(s)
+
+
+BACKUP_DIR = os.path.join(data_dir(), "backups")
+BACKUP_KEEP = 14           # rolling daily snapshots — two weeks of undo
+
+
+def _daily_backup():
+    """Snapshot data.json into backups/ once per day, before the day's first
+    write, keeping the newest BACKUP_KEEP. Hand edits stay recoverable even when
+    no bulk operation ever wrote a .bak."""
+    try:
+        if not os.path.exists(DATA_FILE):
+            return
+        dest = os.path.join(BACKUP_DIR, "data-%s.json" % today().isoformat())
+        if os.path.exists(dest):
+            return
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        with open(DATA_FILE, "rb") as f:
+            blob = f.read()
+        with open(dest, "wb") as g:
+            g.write(blob)
+        old = sorted(x for x in os.listdir(BACKUP_DIR)
+                     if x.startswith("data-") and x.endswith(".json"))
+        for x in old[:-BACKUP_KEEP]:
+            os.remove(os.path.join(BACKUP_DIR, x))
+    except Exception as e:
+        log.info("daily backup failed: %s", e)
 
 
 def save_state():
     with _lock:
+        _daily_backup()
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_state, f, indent=2)
@@ -177,13 +206,17 @@ def today():
 # ---------------------------------------------------------------------------
 
 def gap_days_list(series):
-    out = []
+    """Novel→audio gaps in CHRONOLOGICAL order (oldest first). The recency
+    weighting downstream keys off list position, and hand-edited timelines can
+    be stored in any row order — sort here, like novel_gap_days_list does."""
+    pairs = []
     for pair in series.get("history", []):
         n = parse_date(pair.get("novel"))
         a = parse_date(pair.get("audiobook"))
         if n and a:
-            out.append((a - n).days)
-    return out
+            pairs.append((n, (a - n).days))
+    pairs.sort(key=lambda p: p[0])
+    return [g for _, g in pairs]
 
 
 def avg_gap_days(series):
@@ -191,6 +224,38 @@ def avg_gap_days(series):
     if not gaps:
         return None
     return round(sum(gaps) / len(gaps))
+
+
+def _robust_gaps(gaps):
+    """(kept_gaps, dropped_count): the gap list with wild outliers removed.
+
+    One freak gap (an audiobook delayed a year, a pandemic-era novel) shouldn't
+    wreck every future guess. With 4+ datapoints, gaps outside the Tukey fences
+    (1.5×IQR beyond the quartiles) are dropped; fewer than 4 and there's no way
+    to call anything an outlier, so everything is kept."""
+    if not gaps:
+        return [], 0
+    if len(gaps) < 4:
+        return list(gaps), 0
+    # inclusive: with the 4-8 datapoints a series realistically has, exclusive
+    # interpolation lets the extreme value drag its own fence out of reach
+    q1, _, q3 = statistics.quantiles(gaps, n=4, method="inclusive")
+    iqr = q3 - q1
+    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    kept = [g for g in gaps if lo <= g <= hi] or list(gaps)
+    return kept, len(gaps) - len(kept)
+
+
+def predicted_gap_days(gaps):
+    """Days to project forward: recency-weighted mean of the outlier-filtered
+    gaps, or None. Newest gap weighs ~2x a gap three books back (0.75^age) —
+    cadences drift, and the recent books know the current publisher/narrator
+    situation better than the launch-era ones."""
+    kept, _ = _robust_gaps(gaps)
+    if not kept:
+        return None
+    ws = [0.75 ** (len(kept) - 1 - i) for i in range(len(kept))]
+    return round(sum(g * w for g, w in zip(kept, ws)) / sum(ws))
 
 
 def gap_label(days):
@@ -204,29 +269,234 @@ def gap_label(days):
     return f"~{round(days / 30.4)} mo"
 
 
-def predicted_audiobook_date(series):
-    """Only meaningful when there is no announcement yet."""
+def audio_gap_days_list(series):
+    """PER-VOLUME spacing (days) between audiobook releases, chronological. This
+    is the series' audio rhythm, which is what actually paces a backlog.
+
+    Normalized by how many volumes separate the two books: when a publisher
+    announces book 9's audio while 4-8 are still unannounced, the raw date gap
+    spans six volumes, and counting it as one 'gap' would read as a dramatically
+    slower cadence instead of the same pace across more books."""
+    pts = [(a, _entry_n(e)) for e in series.get("timeline", [])
+           for a in [parse_date(e.get("audiobook"))] if a]
+    pts.sort(key=lambda p: p[0])
+    out = []
+    for i in range(1, len(pts)):
+        (d0, n0), (d1, n1) = pts[i - 1], pts[i]
+        days = (d1 - d0).days
+        if days <= 0:
+            continue
+        steps = (n1 - n0) if (n0 is not None and n1 is not None and n1 > n0) else 1
+        out.append(round(days / steps))
+    return out
+
+
+def _audio_cadence(series):
+    """How far apart this series' audiobooks land, or None.
+
+    Prefers the audio's own measured rhythm, but only once there are two gaps to
+    average — a single gap is usually the launch-era delay (first audiobook lags,
+    then the line settles), so with less than that the novel cadence is the better
+    proxy for how fast the publisher moves."""
+    gaps = audio_gap_days_list(series)
+    if len(gaps) >= 2:
+        return predicted_gap_days(gaps)
+    return predicted_gap_days(novel_gap_days_list(series))
+
+
+AUDIO_MIN_SEPARATION = 21     # no series ships two of its audiobooks days apart
+AUDIO_LAG_TIGHT = 21          # spread under this = a dependable novel→audio lag
+
+
+def _safe_add_days(d, days):
+    """d + days, or None if that runs off the end of the calendar (a hand-typed
+    '9999-12-31' must not 500 the whole dashboard)."""
+    if d is None or days is None:
+        return None
+    try:
+        return d + timedelta(days=days)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _audio_lag_is_reliable(series):
+    """True when this series ships audio at a consistent remove from the novel
+    (day-and-date, or a steady lag). Then the NOVEL date — especially a confirmed
+    pre-order — is the better predictor and the queue must not override it: for a
+    same-day series the 'queue' is just a noisy restatement of the novel cadence,
+    and letting it win pushes the audiobook past its own novel."""
+    c = _estimate_confidence(gap_days_list(series))
+    return bool(c and c["n"] >= 2 and c.get("spread_days") is not None
+                and c["spread_days"] <= AUDIO_LAG_TIGHT)
+
+
+def _audio_schedule(series):
+    """Projected audiobook dates for every book still missing one, in book order:
+    [{n, date, novel, queued, after_n}, ...].
+
+    Two things bind an audiobook's release, and the later one wins:
+      production — it can't arrive sooner after its novel than the usual lag
+      queue      — a series' audiobooks come out in order, spaced by their cadence
+    Each projection becomes the anchor for the next, so a backlog (several novels
+    out, audio still catching up) forecasts as a queue draining at the series'
+    real pace instead of everything landing at once. A CONFIRMED date — including
+    a pre-order for an earlier book — is simply the strongest possible anchor:
+    it's where the queue currently stands, which is why an announcement makes the
+    following books' estimates sharper rather than deleting them."""
+    gap_model = predicted_gap_days(gap_days_list(series))
+    cadence = _audio_cadence(series)
+    lag_reliable = _audio_lag_is_reliable(series)
+    # Numbered books only: an unnumbered row can't be identified on a card or in
+    # the schedule, and sorting it to the front would let it hijack the forecast.
+    entries = sorted((e for e in series.get("timeline", []) if _entry_n(e) is not None),
+                     key=lambda e: (_entry_n(e), e.get("novel") or ""))
+    out = []
+    last_audio, last_n = None, None
+    for e in entries:
+        a = parse_date(e.get("audiobook"))
+        if a:
+            # walk the queue forward book by book, so the anchor is always an
+            # EARLIER book — a later volume's announcement must never push an
+            # earlier, still-missing audiobook behind it
+            if last_audio is None or a > last_audio:
+                last_audio, last_n = a, _entry_n(e)
+            continue
+        nd = parse_date(e.get("novel"))
+        prod = _safe_add_days(nd, gap_model) if nd is not None else None
+        queue = None
+        if last_audio is not None:
+            if lag_reliable:
+                # trust the lag; the queue only enforces ordering here
+                queue = _safe_add_days(last_audio, 1)
+            else:
+                step = max(cadence if cadence is not None else 0, AUDIO_MIN_SEPARATION)
+                queue = _safe_add_days(last_audio, step)
+        if prod is None and queue is None:
+            continue
+        if prod is None:
+            est, queued = queue, True
+        elif queue is None:
+            est, queued = prod, False
+        else:
+            est, queued = (queue, True) if queue > prod else (prod, False)
+        out.append({"n": _entry_n(e), "date": est, "novel": nd,
+                    "queued": queued, "after_n": last_n})
+        if est < today():
+            # This book's window has passed with nothing announced, and the next
+            # volume cannot possibly come out before it — so how late this one
+            # ends up running is exactly how little we know about the rest. The
+            # honest answer for everything behind it is "no idea", not a number
+            # anchored on a date that already failed. It surfaces as overdue.
+            break
+        last_audio, last_n = est, _entry_n(e)
+    return out
+
+
+def _audio_confidence_gaps(series, fc):
+    """The gap list that actually produced this forecast, so the confidence chip
+    describes the model that made the call rather than a model that didn't."""
+    if fc and fc.get("queued"):
+        ag = audio_gap_days_list(series)
+        if len(ag) >= 2:
+            return ag
+        return novel_gap_days_list(series)     # cadence fell back to the novel rhythm
+    return gap_days_list(series)
+
+
+def _audio_schedule_usable(series):
+    """The projected schedule, or [] when this series shouldn't be forecast at all
+    (its tracked book's audio is already announced/released, or the series has
+    visibly stopped producing audiobooks)."""
     status = series.get("audiobook_status", "unknown")
     if status in ("released", "announced"):
-        return None
-    avg = avg_gap_days(series)
-    nd = parse_date(series.get("novel_date"))
-    if avg is None or nd is None:
-        return None
-    return nd + timedelta(days=avg)
+        return []
+    sched = _audio_schedule(series)
+    if not sched:
+        return []
+    # Don't keep projecting a pattern the series itself has broken: count novels
+    # whose audiobook is well overdue by the novel→audio model (novel + gap + 60d
+    # grace, still nothing). When the contradictions match or outnumber the real
+    # gap datapoints, that premise is dead — e.g. one simultaneous release followed
+    # by three novels with no audio at all should NOT predict a same-day audiobook.
+    # Only applies when the forecast actually rests on that model: a queue-paced
+    # one is built from the audio's own (slower) rhythm, where a backlog of
+    # audio-less novels is exactly what the model already expects.
+    if not sched[0]["queued"]:
+        gaps = gap_days_list(series)
+        avg = predicted_gap_days(gaps)
+        if avg is not None and gaps:
+            t = today()
+            overdue = 0
+            for e in series.get("timeline", []):
+                n_d = parse_date(e.get("novel"))
+                if n_d and n_d < t and not e.get("audiobook") and t > n_d + timedelta(days=avg + 60):
+                    overdue += 1
+            if overdue >= len(gaps):
+                return []
+    return sched
+
+
+def _audio_forecast(series):
+    """The FIRST book still missing an audiobook, as the schedule dict, or None.
+
+    First in book order, not first still-in-the-future: audiobooks come out in
+    order, so the earliest undated book is genuinely the next one due. When its
+    projection has already passed, that book is overdue and the card says so —
+    quietly skipping to a later book would hide a late audiobook behind a
+    confident-looking date months out."""
+    sched = _audio_schedule_usable(series)
+    return sched[0] if sched else None
+
+
+def _audio_next_forecast(series):
+    """The soonest projection still ahead of us, or None.
+
+    Distinct from _audio_forecast, which reports the first missing book even when
+    that book is overdue. This one answers 'what audiobook is there to look
+    forward to', so one late book can't erase the series from the schedule, feed,
+    calendar and digest."""
+    t = today()
+    for r in _audio_schedule_usable(series):
+        if r["date"] >= t:
+            return r
+    return None
+
+
+def _predicted_audio_pair(series):
+    """(predicted_date, the novel date it was predicted from) or (None, None)."""
+    f = _audio_forecast(series)
+    return (f["date"], f["novel"]) if f else (None, None)
+
+
+def predicted_audiobook_date(series):
+    """Only meaningful when there is no announcement yet."""
+    return _predicted_audio_pair(series)[0]
 
 
 def next_release(series):
-    """The next dated event for this series: (date, kind, is_estimate) or None."""
+    """The next dated event for this series: (date, kind, is_estimate) or None.
+
+    Real dates are gathered from EVERY timeline entry, not just the series-level
+    headline fields — those mirror only the latest book, so an announced audiobook
+    for an earlier book (status still "none") would otherwise be invisible and an
+    estimate would show in its place."""
     t = today()
+    real = []
+    for e in series.get("timeline", []):
+        for key, kind in (("novel", "novel"), ("audiobook", "audiobook")):
+            d = parse_date(e.get(key))
+            if d and d >= t:
+                real.append((d, kind))
     status = series.get("audiobook_status", "unknown")
     ad = parse_date(series.get("audiobook_date"))
-    nd = parse_date(series.get("novel_date"))
-
     if status in ("announced", "released") and ad and ad >= t:
-        return ad, "audiobook", False
+        real.append((ad, "audiobook"))
+    nd = parse_date(series.get("novel_date"))
     if nd and nd >= t:
-        return nd, "novel", False
+        real.append((nd, "novel"))
+    if real:
+        d, kind = min(real)
+        return d, kind, False
     pred = predicted_audiobook_date(series)
     if pred and pred >= t:
         return pred, "audiobook", True
@@ -261,7 +531,7 @@ def predicted_novel_date(series):
     nd = parse_date(series.get("novel_date"))
     if nd is None or nd >= today():
         return None
-    avg = avg_novel_gap_days(series)
+    avg = predicted_gap_days(novel_gap_days_list(series))
     if avg is None:
         return None
     return nd + timedelta(days=avg)
@@ -269,16 +539,19 @@ def predicted_novel_date(series):
 
 def _estimate_confidence(gaps):
     """How much to trust a gap-based projection, from the number and consistency of
-    the past gaps it averages. Returns {level, n, spread_days} or None.
+    the past gaps it averages. Returns {level, n, spread_days, outliers} or None.
     'spread_days' is the typical deviation of those gaps — roughly how far off the
-    guess could be. More data + tighter spread -> higher confidence."""
-    n = len(gaps)
+    guess could be. Judged on the same outlier-filtered set the prediction uses
+    ('outliers' = how many wild gaps were ignored), so one freak delay doesn't
+    tank the confidence of an otherwise clockwork series."""
+    kept, dropped = _robust_gaps(gaps)
+    n = len(kept)
     if n == 0:
         return None
     if n == 1:
-        return {"level": "low", "n": 1, "spread_days": None}
-    mean = sum(gaps) / n
-    sd = (sum((g - mean) ** 2 for g in gaps) / n) ** 0.5
+        return {"level": "low", "n": 1, "spread_days": None, "outliers": dropped}
+    mean = sum(kept) / n
+    sd = (sum((g - mean) ** 2 for g in kept) / n) ** 0.5
     sd_i = int(round(sd))
     if n >= 3 and sd <= 10:
         level = "high"      # several releases, all landing within ~10 days of the average
@@ -286,12 +559,19 @@ def _estimate_confidence(gaps):
         level = "medium"    # within ~3 weeks
     else:
         level = "low"       # scattered enough that the date is a rough guess
-    return {"level": level, "n": n, "spread_days": sd_i}
+    return {"level": level, "n": n, "spread_days": sd_i, "outliers": dropped}
 
 
 # ---------------------------------------------------------------------------
 # Scraping (best effort - hand-editable fallback always available)
 # ---------------------------------------------------------------------------
+
+def fetch_bytes(url, timeout=15):
+    """Raw bytes GET with the browser UA (for image analysis)."""
+    req = Request(url, headers={"User-Agent": USER_AGENT})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
 
 def fetch_url(url, timeout=20):
     req = Request(url, headers={
@@ -439,84 +719,26 @@ def parse_product(html_text, url=""):
     return result
 
 
-# ---------------------------------------------------------------------------
-# External data sources (cross-referenced)
-#   - Apple iTunes Search API : keyless, audiobook release dates + covers
-#   - Audnexus (audnex.us)    : keyless, Audible data by ASIN
-#   - Hardcover GraphQL       : needs a free token, enumerates a whole series
-# None of these raise; on any failure they return None / an {"error": ...}.
-# ---------------------------------------------------------------------------
-
-
 def _norm(s):
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
-# Hardcover blocks pattern-matching operators, so we use its Typesense-backed
-# search to resolve a name to a series id, then fetch that id's books (the
-# allowed _eq operator). Search is fuzzy and typo-tolerant.
-HC_SEARCH_QUERY = """
-query SearchSeries($q: String!) {
-  search(query: $q, query_type: "Series", per_page: 8, page: 1) { ids results }
-}
-""".strip()
-
-_HC_BOOK_FIELDS = """
-      position
-      book {
-        id
-        title
-        release_date
-        release_year
-        default_audio_edition { release_date }
-      }
-"""
-
-HC_BOOKS_QUERY = """
-query SeriesBooks($id: Int!) {
-  series(where: {id: {_eq: $id}}, limit: 1) {
-    id
-    name
-    author { name }
-    book_series(
-      distinct_on: position
-      order_by: [{position: asc}, {book: {users_count: desc}}]
-      where: {book: {canonical_id: {_is_null: true}, is_partial_book: {_eq: false}}, compilation: {_eq: false}}
-    ) {
-__FIELDS__
-    }
-  }
-}
-""".replace("__FIELDS__", _HC_BOOK_FIELDS).strip()
-
-# Looser fallback (no book-level filters) for sparsely-catalogued series.
-HC_BOOKS_QUERY_LOOSE = """
-query SeriesBooksLoose($id: Int!) {
-  series(where: {id: {_eq: $id}}, limit: 1) {
-    id
-    name
-    author { name }
-    book_series(distinct_on: position, order_by: [{position: asc}, {book: {users_count: desc}}]) {
-__FIELDS__
-    }
-  }
-}
-""".replace("__FIELDS__", _HC_BOOK_FIELDS).strip()
+_NARRATOR_TAIL = re.compile(
+    r"\s*(?:,\s*)?(?:see all|see more|and others?|et al\.?|,)\s*$", re.I)
 
 
-HC_BOOK_QUERY = """
-query BookById($id: Int!) {
-  books(where: {id: {_eq: $id}}, limit: 1) {
-    id
-    title
-    release_date
-    release_year
-    default_audio_edition { release_date }
-    contributions(limit: 1) { author { name } }
-    book_series(limit: 5) { series { id name books_count author { name } } }
-  }
-}
-""".strip()
+def clean_narrator(s):
+    """Strip the store's UI furniture off a scraped narrator credit.
+
+    Amazon's byline runs the names together with page controls, so a read can
+    come back as 'Christian J. Gilliland, see all' or '... (Narrator)'."""
+    s = " ".join((s or "").split())
+    s = re.sub(r"\(\s*(?:narrator|narrated by)[^)]*\)", "", s, flags=re.I)
+    prev = None
+    while prev != s:
+        prev = s
+        s = _NARRATOR_TAIL.sub("", s).strip()
+    return s or None
 
 
 def _entry_n(e):
@@ -531,22 +753,7 @@ def _history_from_timeline(tl):
             for e in tl if e.get("novel") and e.get("audiobook")]
 
 
-# ---------------------------------------------------------------------------
-# Per-series refresh (re-checks against the databases, no URL needed)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Daily check + scheduler
-# ---------------------------------------------------------------------------
-
 _tray_icon = None  # set when the system-tray icon is running
-
-
-# ---------------------------------------------------------------------------
-# Re-import all (re-pull every tracked series from Hardcover)
-# ---------------------------------------------------------------------------
-
-_reimport_lock = threading.Lock()
 
 
 def _backup_state():
@@ -579,10 +786,32 @@ def series_view(s):
     pred = predicted_audiobook_date(s)
     n_avg = avg_novel_gap_days(s)
     n_pred = predicted_novel_date(s)
-    audio_conf = _estimate_confidence(gap_days_list(s))
+    audio_fc = _audio_forecast(s)
+    audio_next = _audio_next_forecast(s)
+    audio_conf = _estimate_confidence(_audio_confidence_gaps(s, audio_fc))
     novel_conf = _estimate_confidence(novel_gap_days_list(s))
     nxt = next_release(s)
     status = s.get("audiobook_status", "unknown")
+    # Derived display status: the raw status mirrors only the LATEST book, but a
+    # real still-upcoming audiobook for an earlier book is an announcement the
+    # card should wear — pill + counts say "Audio pre-order" instead of "No
+    # audiobook yet". The raw status is kept untouched (edit modal, ingest).
+    t = today()
+    has_future_audio = any(
+        (lambda d: d and d >= t)(parse_date(e.get("audiobook")))
+        for e in s.get("timeline", []))
+    if status in ("none", "unknown") and has_future_audio:
+        status_class, status_label = "announced", "Audio pre-order"
+    else:
+        status_class, status_label = status, STATUS_LABELS.get(status, "Unknown")
+    # Narrator: the most recent book that names one speaks for the series.
+    narrator = None
+    for e in sorted(s.get("timeline", []), key=lambda e: _entry_n(e) or 0):
+        # cleaned on the way out too, so credits captured before the extension
+        # learned to strip page furniture still display properly
+        cleaned = clean_narrator(e.get("narrator"))
+        if cleaned:
+            narrator = cleaned
     view = {
         "id": s["id"],
         "name": s.get("name", ""),
@@ -592,12 +821,18 @@ def series_view(s):
         "novel_date": s.get("novel_date"),
         "audiobook_date": s.get("audiobook_date"),
         "audiobook_status": status,
-        "status_label": STATUS_LABELS.get(status, "Unknown"),
+        "status_class": status_class,
+        "status_label": status_label,
+        "narrator": narrator,
         "cover_url": s.get("cover_url", ""),
         "history": s.get("history", []),
         "timeline": s.get("timeline", []),
+        "novel_n": s.get("novel_n"),
+        "store_host": s.get("store_host", ""),
+        "asins": s.get("asins", {}) or {},
+        "asins_novel": s.get("asins_novel", {}) or {},
+        "asins_audio": s.get("asins_audio", {}) or {},
         "edited": bool(s.get("edited")),
-        "linked": bool(s.get("hardcover_series_id") or s.get("hardcover_book_id")),
         "notes": s.get("notes", ""),
         "last_fetched": s.get("last_fetched"),
         "last_change": s.get("last_change"),
@@ -608,7 +843,14 @@ def series_view(s):
         "avg_gap_label": gap_label(avg),
         "history_count": len(gap_days_list(s)),
         "predicted_date": iso(pred),
+        "predicted_book_n": audio_fc.get("n") if audio_fc else None,
+        "predicted_queued": bool(audio_fc and audio_fc.get("queued")),
+        "predicted_after_n": audio_fc.get("after_n") if audio_fc else None,
         "predicted_confidence": pred and audio_conf,
+        # the soonest projection still ahead — same as predicted_* unless the
+        # first missing book is overdue, in which case the card shows both
+        "next_est_date": iso(audio_next["date"]) if audio_next else None,
+        "next_est_book_n": audio_next.get("n") if audio_next else None,
         "avg_novel_gap_label": gap_label(n_avg),
         "novel_history_count": len(novel_gap_days_list(s)),
         "predicted_novel_date": iso(n_pred),
@@ -634,87 +876,197 @@ def next_audiobook(series, include_estimates):
     near) the novel date, which is exactly the 'likely simultaneous' case. Plain
     novels are intentionally excluded so this list stays audiobook-focused."""
     t = today()
+    real = [d for d in (parse_date(e.get("audiobook")) for e in series.get("timeline", []))
+            if d and d >= t]
     status = series.get("audiobook_status", "unknown")
     ad = parse_date(series.get("audiobook_date"))
     if status in ("announced", "released") and ad and ad >= t:
-        return ad, False, None
+        real.append(ad)
+    if real:
+        return min(real), False, None
     if include_estimates:
-        pred = predicted_audiobook_date(series)
-        if pred and pred >= t:
-            nd = parse_date(series.get("novel_date"))
-            gap = (pred - nd).days if nd else None
-            if gap is None:
-                note = "estimated from past releases"
-            elif gap <= 3:
-                note = "likely same day as the novel"
-            elif gap < 21:
-                note = f"~{gap} days after the novel"
-            else:
-                note = f"~{round(gap / 7)} weeks after the novel"
-            return pred, True, note
+        est = _audio_estimate(series)
+        if est:
+            return est[0], True, est[1]
     return None
 
 
-def next_novel(series, include_estimates):
-    """Next NOVEL event: (date, is_estimate, note) or None. The latest known novel
-    counts when it's still upcoming (pre-order/announced). When it's already out, a
-    predicted next book counts only when novel estimates are on."""
-    t = today()
-    nd = parse_date(series.get("novel_date"))
-    if nd and nd >= t:
-        return nd, False, None
-    if include_estimates:
-        pred = predicted_novel_date(series)
-        if pred and pred >= t:
-            avg = avg_novel_gap_days(series)
-            if avg is None:
-                note = "estimated from past releases"
-            elif avg < 21:
-                note = f"~{avg} days after the last book"
-            elif avg < 90:
-                note = f"~{round(avg / 7)} weeks after the last book"
-            else:
-                note = f"~{round(avg / 30.4)} months after the last book"
-            return pred, True, note
-    return None
+def _audio_estimate(series):
+    """(predicted_date, note) for the audiobook forecast, or None. Independent of
+    any real upcoming audiobook — callers decide precedence (the forecast lists
+    show both: real rows for dated books, this row for the next undated one)."""
+    f = _audio_next_forecast(series)
+    if not f:
+        return None
+    pred = f["date"]
+    if f["queued"]:
+        # the audio queue, not the novel, is what's holding this one back — say so
+        after = f" book {f['after_n']}'s" if f.get("after_n") is not None else " the previous"
+        return pred, f"next in the audio queue after{after}"
+    nd = f["novel"] or parse_date(series.get("novel_date"))
+    gap = (pred - nd).days if nd else None
+    if gap is None:
+        note = "estimated from past releases"
+    elif gap <= 3:
+        note = "likely same day as the novel"
+    elif gap < 21:
+        note = f"~{gap} days after the novel"
+    else:
+        note = f"~{round(gap / 7)} weeks after the novel"
+    return pred, note
 
 
-def next_of_kind(series, kind, include_estimates):
-    return next_novel(series, include_estimates) if kind == "novel" else next_audiobook(series, include_estimates)
+def _novel_estimate(series):
+    """(predicted_date, note) for the next-novel forecast, or None."""
+    pred = predicted_novel_date(series)
+    if not pred or pred < today():
+        return None
+    avg = predicted_gap_days(novel_gap_days_list(series))
+    if avg is None:
+        note = "estimated from past releases"
+    elif avg < 21:
+        note = f"~{avg} days after the last book"
+    elif avg < 90:
+        note = f"~{round(avg / 7)} weeks after the last book"
+    else:
+        note = f"~{round(avg / 30.4)} months after the last book"
+    return pred, note
+
+
+def _book_label(s, e, kind):
+    """'Chrysalis 10' style label for one timeline entry."""
+    n = _entry_n(e)
+    base = (e.get("title") or "").strip()
+    if not base:
+        base = s.get("novel_title", "") if n == s.get("novel_n") else ""
+    if not base:
+        base = s.get("name", "")
+        return f"{base} {n}" if n is not None else base
+    return base
 
 
 def upcoming_of_kind(kind, include_estimates):
     """Upcoming releases of one kind ('novel' or 'audiobook'), soonest first.
-    Backs the schedule view, the board, and the RSS feed."""
+
+    ONE ROW PER BOOK, not per series: a series can have several things pending at
+    once (an announced audiobook for book 5 AND a pre-ordered novel for book 6),
+    and every one of them deserves its own row. Real dates come from the timeline;
+    at most one estimate per series is appended (the soonest predicted book that
+    isn't already covered by a real date).
+    """
     rows = []
+    t = today()
     with _lock:
         for s in _state["series"]:
-            nxt = next_of_kind(s, kind, include_estimates)
-            if not nxt:
+            seen = set()
+            for e in s.get("timeline", []):
+                d = parse_date(e.get(kind))
+                if not d or d < t:
+                    continue
+                n = _entry_n(e)
+                seen.add(n)
+                rows.append({
+                    "series_id": s["id"],
+                    "series": s.get("name", ""),
+                    "title": _book_label(s, e, kind),
+                    "book_n": n,
+                    "author": s.get("author", ""),
+                    "date": iso(d),
+                    "kind": kind,
+                    "estimate": False,
+                    "note": None,
+                    "confidence": None,
+                    "countdown_days": (d - t).days,
+                    "cover": e.get("cover") or s.get("cover_url") or None,
+                })
+            if not include_estimates:
                 continue
-            nd, est, note = nxt
-            conf = None
-            if est:
-                gaps = novel_gap_days_list(s) if kind == "novel" else gap_days_list(s)
-                conf = _estimate_confidence(gaps)
+            est_pair = _novel_estimate(s) if kind == "novel" else _audio_estimate(s)
+            if not est_pair:
+                continue
+            nd, note = est_pair
+            if nd < t:
+                continue                      # stale guess; real dates came from the timeline
+            ent = None
+            n = None
+            fc = None
+            if kind == "novel":
+                # The predicted novel doesn't exist as a timeline entry yet — it's
+                # the book AFTER the latest known NOVEL (the estimate anchors on
+                # novel_date, so an audio-only pre-order entry with a higher n
+                # must not shift the label). Never borrow the current book's title.
+                maxn = max((_entry_n(e) for e in s.get("timeline", [])
+                            if _entry_n(e) is not None and e.get("novel")), default=None)
+                if maxn is None:
+                    maxn = s.get("novel_n")
+                n = (maxn + 1) if maxn is not None else None
+            else:
+                # The forecast names the exact book it projected, so take the
+                # number straight from the same row that produced the date.
+                fc = _audio_next_forecast(s)
+                n = fc.get("n") if fc else None
+                ent = next((e for e in s.get("timeline", []) if _entry_n(e) == n), None) if n is not None else None
+            if n is not None and n in seen:
+                continue                      # this book already has a real date listed
+            if ent:
+                title = _book_label(s, ent, kind)
+            elif kind == "novel":
+                # generic label — the released latest book's exact title must not
+                # appear on a row for a book that doesn't exist yet
+                title = (f"{s.get('name', '')} {n}".strip() if n is not None
+                         else s.get("name", ""))
+            else:
+                title = s.get("novel_title") or s.get("name", "")
+            # same gap list the card's chip uses, so one prediction never carries
+            # two different confidence badges across surfaces
+            gaps = (novel_gap_days_list(s) if kind == "novel"
+                    else _audio_confidence_gaps(s, fc))
             rows.append({
                 "series_id": s["id"],
                 "series": s.get("name", ""),
-                "title": s.get("novel_title") or s.get("name", ""),
+                "title": title,
+                "book_n": n,
                 "author": s.get("author", ""),
                 "date": iso(nd),
                 "kind": kind,
-                "estimate": est,
+                "estimate": True,
                 "note": note,
-                "confidence": conf,
-                "countdown_days": (nd - today()).days,
+                "confidence": _estimate_confidence(gaps),
+                "countdown_days": (nd - t).days,
+                "cover": (ent.get("cover") if ent else None) or s.get("cover_url") or None,
             })
-    rows.sort(key=lambda r: r["date"])
+    rows.sort(key=lambda r: (r["date"], r["estimate"]))
     return rows
 
 
-def upcoming_audiobooks(include_estimates):
-    return upcoming_of_kind("audiobook", include_estimates)
+def overdue_audiobooks():
+    """Books whose projected audiobook window has passed with nothing announced,
+    most-overdue first. These are deliberately kept OUT of the upcoming schedule —
+    a date that already failed isn't a forecast — and reported on their own so a
+    late audiobook is visible rather than silently distorting the queue."""
+    t = today()
+    rows = []
+    with _lock:
+        for s in _state["series"]:
+            for r in _audio_schedule_usable(s):
+                if r["date"] >= t:
+                    break            # book order: everything after this is ahead
+                ent = next((e for e in s.get("timeline", [])
+                            if _entry_n(e) == r["n"]), None)
+                rows.append({
+                    "series_id": s["id"],
+                    "series": s.get("name", ""),
+                    "title": _book_label(s, ent, "audiobook") if ent else s.get("name", ""),
+                    "book_n": r["n"],
+                    "expected": iso(r["date"]),
+                    "days_late": (t - r["date"]).days,
+                    "novel_date": iso(r["novel"]) if r.get("novel") else None,
+                    "cover": (ent.get("cover") if ent else None) or s.get("cover_url") or None,
+                })
+    # newest overdue first: the one that just slipped is the live news, while a
+    # book that's been late for months is old information sitting at the bottom
+    rows.sort(key=lambda r: r["days_late"])
+    return rows
 
 
 def _upcoming_settings():
@@ -732,16 +1084,36 @@ def _upcoming_settings():
 # Discord notifications (via a channel webhook the user pastes into settings)
 # ---------------------------------------------------------------------------
 
-def _discord_post(webhook, text):
-    """Blocking POST to a Discord webhook. Returns (ok, error_str)."""
-    try:
-        data = json.dumps({"content": text[:1900]}).encode("utf-8")
+KIND_COLOR = {"novel": 0x9D8CFF, "audiobook": 0xE7B14C,   # dashboard violet / amber
+              "both": 0xC29BA6}                           # day-and-date blend
+
+
+def _discord_post(webhook, text, embeds=None, fallback_text=None):
+    """Blocking POST to a Discord webhook. Returns (ok, error_str). If an embed
+    payload is rejected, retries once as plain text (fallback_text when given, so
+    rich digests can degrade to their full text form) — a ping must never die
+    because an embed was malformed."""
+    def _send(payload):
+        data = json.dumps(payload).encode("utf-8")
         req = Request(webhook, data=data,
                       headers={"Content-Type": "application/json", "User-Agent": APP_NAME})
         with urlopen(req, timeout=10) as resp:
             resp.read()
+
+    embeds = [e for e in (embeds or []) if e]
+    payload = {"content": (text or "")[:1900]}
+    if embeds:
+        payload["embeds"] = embeds[:10]
+    try:
+        _send(payload)
         return True, ""
     except HTTPError as e:
+        if embeds:
+            try:
+                _send({"content": ((fallback_text or text) or "")[:1900]})
+                return True, ""
+            except Exception:
+                pass
         return False, f"HTTP {e.code}"
     except URLError as e:
         return False, str(getattr(e, "reason", e))
@@ -749,18 +1121,26 @@ def _discord_post(webhook, text):
         return False, str(e)
 
 
-def _discord_notify(text):
+def _discord_notify(text, embeds=None):
     """Fire-and-forget Discord message (no-op if no webhook configured)."""
     wh = (get_settings().get("discord_webhook") or "").strip()
     if not wh:
         return
 
     def _go():
-        ok, err = _discord_post(wh, text)
+        ok, err = _discord_post(wh, text, embeds)
         if not ok:
             add_log(f"Discord notify failed: {err}")
 
     threading.Thread(target=_go, daemon=True).start()
+
+
+def _book_embed(series, n, cover):
+    """Small embed that puts the book's cover art beside a ping (None if no art)."""
+    if not cover:
+        return None
+    title = f"{series} — Book {n}" if n is not None else (series or "")
+    return {"title": title[:256], "thumbnail": {"url": cover}, "color": KIND_COLOR["audiobook"]}
 
 
 def _discord_ts(iso_str, style="D"):
@@ -772,12 +1152,6 @@ def _discord_ts(iso_str, style="D"):
         return iso_str or "?"
     ts = int(datetime(d.year, d.month, d.day, 12, 0).timestamp())
     return f"<t:{ts}:{style}>"
-
-
-def _nice_date(iso_str):
-    d = parse_date(iso_str)
-    return f"{d.strftime('%b')} {d.day}, {d.year}" if d else (iso_str or "?")
-
 
 
 def _new_date_messages(s, n, old_novel, new_novel, old_audio, new_audio):
@@ -796,15 +1170,17 @@ def _new_date_messages(s, n, old_novel, new_novel, old_audio, new_audio):
             continue
         when = f"**{_discord_ts(new, 'D')}** ({_discord_ts(new, 'R')})"
         if old:
-            msgs.append(f"{icon[kind]} **{name}** — Book {n} {kind} date changed to {when} (was {_discord_ts(old, 'D')})")
+            msgs.append(_fmt_line("date_changed", icon=icon[kind], series=name, n=n,
+                                  kind=kind, when=when, was=_discord_ts(old, 'D')))
         else:
-            msgs.append(f"{icon[kind]} **{name}** — Book {n} {kind} now dated {when}")
+            msgs.append(_fmt_line("new_date", icon=icon[kind], series=name, n=n,
+                                  kind=kind, when=when))
     return msgs
 
 
 def _release_live_message(name, n, kind):
     icon = {"novel": "📖", "audiobook": "🎧"}.get(kind, "📚")
-    return f"🎉 {icon} **{name}** — Book {n} {kind} is **out now**!"
+    return _fmt_line("out_now", icon=icon, series=name, n=n, kind=kind)
 
 # Release pings are driven by the page itself: the extension re-reads a releasing
 # novel hourly on its release day, and the moment the store page flips from
@@ -882,10 +1258,78 @@ _TSUN_EST = [
 ]
 
 
+_TSUN_NEWDATE = [
+    "{icon} Big news, listen up! **{series}** Book {n} {kind} finally has a date: {when}. I found out first, obviously.",
+    "{icon} Hmph, guess what: **{series}** Book {n} {kind} is set for {when}. You may celebrate. Quietly.",
+    "{icon} NEW DATE. **{series}** Book {n} {kind}: {when}. I dropped everything to tell you. …Don't read into that.",
+    "{icon} **{series}** Book {n} {kind} just got scheduled: {when}. Mark it down. I'm not reminding you. (I am.)",
+    "{icon} Oh? OH? **{series}** Book {n} {kind} — {when}. You'd better look excited.",
+    "{icon} Announcement! **{series}** Book {n} {kind} lands {when}. Say 'thank you'. Actually don't, it's weird.",
+]
+
+_TSUN_CHANGED = [
+    "{icon} Ugh, they MOVED it. **{series}** Book {n} {kind} is now {when} (was {was}). Not my fault!",
+    "{icon} Date shuffle! **{series}** Book {n} {kind}: {when} now, not {was}. Keep up.",
+    "{icon} Correction, because SOMEONE'S publisher can't commit: **{series}** Book {n} {kind} → {when} (was {was}).",
+    "{icon} **{series}** Book {n} {kind} slid to {when} (was {was}). I'm as annoyed as you are. More, probably.",
+    "{icon} Heads up: **{series}** Book {n} {kind} changed to {when}. It used to be {was}. Authors, honestly.",
+    "{icon} New date alert: **{series}** Book {n} {kind} is {when} now (was {was}). Adjust your little plans.",
+]
+
+_TSUN_OUTNOW = [
+    "🎉 {icon} IT'S OUT. **{series}** Book {n} {kind} is live RIGHT NOW. Why are you still reading this?!",
+    "🎉 {icon} **{series}** Book {n} {kind} just went live! Go! GO! You can thank me later. (Do thank me.)",
+    "🎉 {icon} Release confirmed: **{series}** Book {n} {kind} is out now. I checked the page myself. You're welcome.",
+    "🎉 {icon} **{series}** Book {n} {kind}: OUT. NOW. Drop everything. The dishes can wait.",
+    "🎉 {icon} It's here, it's here! **{series}** Book {n} {kind} is buyable this very second. Move it!",
+    "🎉 {icon} **{series}** Book {n} {kind} is officially out. I watched that page like a hawk for you. Praise is acceptable.",
+]
+
+_TSUN_TEST = [
+    "✅ Testing, testing… yes, I can reach this channel. Obviously. I'm very competent.",
+    "✅ It works. Of course it works, I set it up. You may stop poking the button now.",
+    "✅ Test received! Congratulations on pressing a button. The notifications will flow.",
+    "✅ Hello? HELLO? …Good, it's connected. Don't make me do that again.",
+    "✅ Yes yes, the webhook works. I'll take my applause in book recommendations.",
+]
+
+_TSUN_MORE = [
+    "…and {count} more. Like I'd list everything for you.",
+    "…plus {count} others I'm keeping to myself. Ask nicely tomorrow.",
+    "…and {count} more beyond that. My patience has limits, you know.",
+    "…{count} more exist. The list stops here because I say so.",
+]
+
+_TSUN_NARRATOR = [
+    "{icon} Ears up! **{series}** Book {n} has a NEW narrator: **{narrator}** (was {was}). I noticed immediately, obviously.",
+    "{icon} Casting news: **{series}** Book {n} is read by **{narrator}** now, not {was}. Don't shoot the messenger. Or do, see if I care!",
+    "{icon} They swapped narrators on **{series}** Book {n} — **{narrator}** takes over from {was}. Your ears, your problem.",
+    "{icon} PSA: **{series}** Book {n} sounds different. New narrator **{narrator}** (was {was}). You're welcome for the warning.",
+]
+
 _LINES_DIR = os.path.join(data_dir(), "digest_lines")
 _LINE_FILES = {
     "openers": "_TSUN_OPENERS", "closers": "_TSUN_CLOSERS", "today": "_TSUN_TODAY",
     "soon": "_TSUN_SOON", "empty": "_TSUN_EMPTY", "estimates": "_TSUN_EST",
+    "new_date": "_TSUN_NEWDATE", "date_changed": "_TSUN_CHANGED",
+    "out_now": "_TSUN_OUTNOW", "test": "_TSUN_TEST", "more": "_TSUN_MORE",
+    "narrator": "_TSUN_NARRATOR",
+}
+_LINE_PLACEHOLDERS = {
+    "new_date": "{icon} {series} {n} {kind} {when}",
+    "date_changed": "{icon} {series} {n} {kind} {when} {was}",
+    "out_now": "{icon} {series} {n} {kind}",
+    "more": "{count}",
+    "narrator": "{icon} {series} {n} {narrator} {was}",
+}
+# used verbatim if a user-edited template has a typo'd placeholder
+_LINE_SAFE = {
+    "new_date": "{icon} **{series}** — Book {n} {kind} now dated {when}",
+    "date_changed": "{icon} **{series}** — Book {n} {kind} date changed to {when} (was {was})",
+    "out_now": "🎉 {icon} **{series}** — Book {n} {kind} is **out now**!",
+    "test": "✅ Release Radar test message — notifications are wired up.",
+    "more": "…and {count} more.",
+    "narrator": "{icon} **{series}** — Book {n} audiobook narrated by {narrator} (previously {was})",
 }
 _LINE_HEADER = ("# Release Radar — digest lines: {name}\n"
                 "# One message per line. Blank lines and lines starting with # are ignored.\n"
@@ -902,9 +1346,23 @@ def _ensure_line_files():
             if not os.path.exists(p):
                 with open(p, "w", encoding="utf-8") as f:
                     f.write(_LINE_HEADER.format(name=name))
+                    if name in _LINE_PLACEHOLDERS:
+                        f.write("# Available placeholders (keep the curly braces): "
+                                + _LINE_PLACEHOLDERS[name] + "\n")
                     f.write("\n".join(globals()[var]) + "\n")
     except Exception as e:
         add_log(f"couldn't write digest line files: {e}")
+
+
+def _fmt_line(name, **fields):
+    """Random line from a pool, with {placeholders} filled. A template with a bad
+    placeholder falls back to a plain factual line instead of crashing."""
+    tpl = random.choice(_load_lines(name))
+    try:
+        return tpl.format(**fields)
+    except (KeyError, IndexError, ValueError):
+        add_log(f"digest_lines/{name}.txt has a bad placeholder in: {tpl[:60]!r} — used plain wording")
+        return _LINE_SAFE.get(name, tpl).format(**fields)
 
 
 def _load_lines(name):
@@ -914,7 +1372,7 @@ def _load_lines(name):
         p = os.path.join(_LINES_DIR, name + ".txt")
         if not os.path.exists(p):
             _ensure_line_files()
-        with open(p, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8-sig") as f:
             lines = [ln.strip() for ln in f
                      if ln.strip() and not ln.strip().startswith("#")]
         return lines or fallback
@@ -923,27 +1381,94 @@ def _load_lines(name):
 
 
 
-def _daily_digest_text():
-    """The forecast message: both kinds, estimates included (marked ~), soonest first."""
+DIGEST_ICON = {"novel": "📖", "audiobook": "🎧", "both": "📖🎧"}
+DIGEST_KIND_WORD = {"novel": "novel", "audiobook": "audiobook", "both": "novel + audiobook"}
+
+
+def _merged_upcoming_rows():
+    """Digest rows, soonest first, with a day-and-date novel+audiobook pair for
+    the SAME book folded into one kind='both' row — two lines for one release
+    event read like a stutter. Only confirmed dates merge; an estimate never
+    hides inside a real row (its ~ marking must stay visible)."""
     rows = upcoming_of_kind("novel", True) + upcoming_of_kind("audiobook", True)
     rows.sort(key=lambda r: (r["date"], r["kind"]))
+    merged, seen = [], {}
+    for r in rows:
+        key = (r["series_id"], r.get("book_n"), r["date"])
+        mergeable = r.get("book_n") is not None and not r["estimate"]
+        prev = seen.get(key)
+        if mergeable and prev is not None and prev["kind"] != r["kind"]:
+            prev["kind"] = "both"
+            continue
+        if mergeable:
+            r = dict(r)             # don't mutate the shared upcoming row
+            seen[key] = r
+        merged.append(r)
+    # A confirmed novel row also answers the reader's next question: when's the
+    # audio? Real announced date if the book has one (a same-day pair already
+    # merged above), the gap model's expectation otherwise, or an honest "not
+    # announced". ('real'/'est'/'none', iso_date_or_None)
+    with _lock:
+        by_id = {s["id"]: s for s in _state["series"]}
+    for r in merged:
+        if r["kind"] != "novel" or r["estimate"]:
+            continue
+        s = by_id.get(r["series_id"])
+        if not s:
+            continue
+        ent = next((e for e in s.get("timeline", [])
+                    if _entry_n(e) == r.get("book_n")), None)
+        ad = parse_date(ent.get("audiobook")) if ent else None
+        if ad:
+            r["audio_follow"] = ("real", iso(ad))
+        else:
+            # take THIS book's row out of the same schedule the rest of the app
+            # uses — recomputing it from the novel date alone would reintroduce
+            # the very estimate the queue model exists to correct
+            proj = next((x for x in _audio_schedule_usable(s)
+                         if x["n"] == r.get("book_n")), None)
+            r["audio_follow"] = ("est", iso(proj["date"])) if proj else ("none", None)
+    return merged
+
+
+def _audio_follow_text(r):
+    """One short clause describing a novel row's audiobook outlook, or ''."""
+    kind, dt = r.get("audio_follow") or (None, None)
+    if kind == "real":
+        return f"🎧 audiobook {_discord_ts(dt, 'D')}"
+    if kind == "est":
+        return f"🎧 audio expected ~ {_discord_ts(dt, 'D')}"
+    if kind == "none":
+        return "🎧 no audiobook announced yet"
+    return ""
+
+
+def _daily_digest_text():
+    """The forecast message: both kinds, estimates included (marked ~), soonest first."""
+    rows = _merged_upcoming_rows()
     if not rows:
         return random.choice(_load_lines("empty"))
-    icon = {"novel": "📖", "audiobook": "🎧"}
-    shown = rows[:10]
+    shown = rows[:5]
     lines = [random.choice(_load_lines("openers")), ""]
     for r in shown:
-        ic = icon.get(r["kind"], "📚")
+        ic = DIGEST_ICON.get(r["kind"], "📚")
+        kw = DIGEST_KIND_WORD.get(r["kind"], r["kind"])
         if r["estimate"]:
             c = r.get("confidence") or {}
             spread = f" ±{c['spread_days']}d" if c.get("spread_days") is not None else ""
-            lines.append(f"{ic} ~ **{r['series']}** — next {r['kind']}, my guess: around {_discord_ts(r['date'], 'D')}{spread}")
+            bk = f" #{r['book_n']}" if r.get("book_n") is not None else ""
+            lines.append(f"{ic} ~ **{r['series']}**{bk} — {kw}, my guess: around {_discord_ts(r['date'], 'D')}{spread}")
         elif r["countdown_days"] == 0:
-            lines.append(f"{ic} **{r['series']}** — {r['kind']} **TODAY**")
+            bk = f" #{r['book_n']}" if r.get("book_n") is not None else ""
+            af = _audio_follow_text(r)
+            lines.append(f"{ic} **{r['series']}**{bk} — {kw} **TODAY**" + (f" · {af}" if af else ""))
         else:
-            lines.append(f"{ic} **{r['series']}** — {r['kind']} {_discord_ts(r['date'], 'R')} ({_discord_ts(r['date'], 'D')})")
+            bk = f" #{r['book_n']}" if r.get("book_n") is not None else ""
+            af = _audio_follow_text(r)
+            lines.append(f"{ic} **{r['series']}**{bk} — {kw} {_discord_ts(r['date'], 'R')} ({_discord_ts(r['date'], 'D')})"
+                         + (f" · {af}" if af else ""))
     if len(rows) > len(shown):
-        lines.append(f"…and {len(rows) - len(shown)} more. Like I'd list everything for you.")
+        lines.append(_fmt_line("more", count=len(rows) - len(shown)))
     lines.append("")
     if any(r["countdown_days"] == 0 for r in shown if not r["estimate"]):
         lines.append(random.choice(_load_lines("today")))
@@ -955,20 +1480,238 @@ def _daily_digest_text():
     return "\n".join(lines)
 
 
+def _daily_digest_payload():
+    """(content, embeds) for the rich digest: tsundere opener as the message text,
+    each release as an embed with its cover art, closing remarks in a final embed.
+    The plain _daily_digest_text stays as the degrade path if Discord rejects it."""
+    rows = _merged_upcoming_rows()
+    if not rows:
+        return random.choice(_load_lines("empty")), []
+    shown = rows[:5]
+    embeds = []
+    for r in shown:
+        ic = DIGEST_ICON.get(r["kind"], "📚")
+        bk = f" #{r['book_n']}" if r.get("book_n") is not None else ""
+        title = f"{'~ ' if r['estimate'] else ''}{ic} {r['series']}{bk} — {DIGEST_KIND_WORD.get(r['kind'], r['kind'])}"
+        if r["estimate"]:
+            c = r.get("confidence") or {}
+            spread = f" ±{c['spread_days']}d" if c.get("spread_days") is not None else ""
+            desc = f"my guess: around {_discord_ts(r['date'], 'D')}{spread}"
+            if r.get("note"):
+                desc += f"\n{r['note']}"
+        elif r["countdown_days"] == 0:
+            desc = "**TODAY**"
+        else:
+            desc = f"{_discord_ts(r['date'], 'R')} ({_discord_ts(r['date'], 'D')})"
+        af = _audio_follow_text(r)
+        if af:
+            desc += f"\n{af}"
+        e = {"title": title[:256], "description": desc,
+             "color": KIND_COLOR.get(r["kind"], KIND_COLOR["audiobook"])}
+        if r.get("cover"):
+            e["thumbnail"] = {"url": r["cover"]}
+        embeds.append(e)
+    tail = []
+    if len(rows) > len(shown):
+        tail.append(_fmt_line("more", count=len(rows) - len(shown)))
+    if any(r["countdown_days"] == 0 for r in shown if not r["estimate"]):
+        tail.append(random.choice(_load_lines("today")))
+    elif any(0 < r["countdown_days"] <= 3 for r in shown if not r["estimate"]):
+        tail.append(random.choice(_load_lines("soon")))
+    if any(r["estimate"] for r in shown):
+        tail.append(random.choice(_load_lines("estimates")))
+    tail.append(random.choice(_load_lines("closers")))
+    embeds.append({"description": "\n".join(tail), "color": 0x332C47})
+    return random.choice(_load_lines("openers")), embeds
+
+
+def _send_digest(webhook):
+    """Send the rich digest, degrading to the full plain-text version if Discord
+    rejects the embeds. Returns (ok, error_str)."""
+    content, embeds = _daily_digest_payload()
+    return _discord_post(webhook, content, embeds, fallback_text=_daily_digest_text())
+
+
+PLACEHOLDER_SAT = 9.5     # mean px saturation below this = "cover to be revealed"
+
+
+def _cover_bytes_look_placeholder(data):
+    """True when the image looks like a publisher's 'cover to be revealed' card.
+    Those are near-greyscale; real covers have color. Measured on the live
+    library (5 placeholders vs 15 real covers): placeholders' mean saturation
+    topped out at 7.3, the most muted real cover sat at 12.5 — the 9.5 line
+    splits them with margin. A genuinely greyscale real cover would false-
+    positive, which only means the card shows the previous book's art."""
+    try:
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(data)).convert("RGB").resize((64, 64))
+        px = list(im.getdata())
+        sat = sum(max(c) - min(c) for c in px) / len(px)
+        return sat < PLACEHOLDER_SAT
+    except Exception:
+        return False
+
+
+def _cover_is_placeholder(url):
+    """Cached placeholder check for a cover URL. Fetches (outside the state
+    lock) at most once per URL; on any fetch/decode failure the answer is False
+    — never block a real cover on a network hiccup."""
+    if not url:
+        return False
+    with _lock:
+        cache = _state.setdefault("cover_checks", {})
+        if url in cache:
+            return cache[url]
+    try:
+        verdict = _cover_bytes_look_placeholder(fetch_bytes(url))
+    except Exception:
+        verdict = False
+    with _lock:
+        cache = _state.setdefault("cover_checks", {})
+        cache[url] = verdict
+        while len(cache) > 300:
+            cache.pop(next(iter(cache)))
+    return verdict
+
+
+COVERFILL_CAP = 20        # backfill page-reads per round; the extension paces them
+COVERFILL_EVERY_HOURS = 24  # cover art is cosmetic — trickle it, don't hammer
+COVERFILL_MAX_TRIES = 3   # after this many reads with no yield, the page simply
+                          # doesn't carry the field — stop spending reads on it
+COVERFILL_RETRY_DAYS = 14 # backoff between repeat attempts at the same page
+
+
+def _maybe_queue_cover_backfill():
+    """Once a day, hand the extension a bounded list of book pages to re-read so
+    back-catalogue entries pick up their own cover art (and audiobooks their
+    narrator) — routine crawls skip settled books, so these fields would
+    otherwise stay empty forever on books tracked before per-book capture
+    existed. Uses only the extension's normal logged-in page reads."""
+    with _lock:
+        # Don't stack: if the last list is still waiting for the extension
+        # (Firefox closed, worker busy), pushing another would replay near-
+        # identical forced crawls back-to-back when it returns.
+        if any(c.get("type") == "coverfill" for c in _state.get("ext_commands", [])):
+            return
+        # Once a day. This is cosmetic backfill of old books, so it rides along
+        # with the extension's own daily refresh rather than adding rounds of its
+        # own — at COVERFILL_CAP a round it still drains a full library in days.
+        last = _state.get("coverfill_last")
+        if last:
+            try:
+                if datetime.now() - datetime.fromisoformat(last) < timedelta(hours=COVERFILL_EVERY_HOURS):
+                    return
+            except ValueError:
+                pass
+        urls = []
+        for s in _state["series"]:
+            host = s.get("store_host")
+            if not host:
+                continue
+            a_nov = s.get("asins_novel") or {}
+            a_all = s.get("asins") or {}
+            a_aud = s.get("asins_audio") or {}
+            for e in s.get("timeline", []):
+                n = _entry_n(e)
+                if n is None:
+                    continue
+                key = str(n)
+                if not e.get("cover"):
+                    asin = a_nov.get(key) or a_all.get(key)
+                    if asin:
+                        urls.append(f"https://{host}/dp/{asin}")
+                if e.get("audiobook") and not (e.get("narrator") or "").strip():
+                    asin = a_aud.get(key)
+                    if asin:
+                        urls.append(f"https://{host}/dp/{asin}")
+        candidates = list(dict.fromkeys(urls))
+        now = datetime.now()
+        tried = _state.setdefault("coverfill_tried", {})
+        # forget tracking for pages that are no longer candidates (field filled,
+        # or the book/series is gone) so the map stays small and honest
+        for u in list(tried):
+            if u not in candidates:
+                del tried[u]
+
+        def _eligible(u):
+            e = tried.get(u)
+            if not e:
+                return True
+            if e.get("n", 0) >= COVERFILL_MAX_TRIES:
+                return False
+            try:
+                t = datetime.fromisoformat(e.get("t", ""))
+            except ValueError:
+                return True
+            return now - t >= timedelta(days=COVERFILL_RETRY_DAYS)
+
+        # never-tried pages first so the tail of a long list can't be starved by
+        # head-of-list pages that keep yielding nothing; retries queue behind
+        fresh = [u for u in candidates if u not in tried]
+        retry = [u for u in candidates if u in tried and _eligible(u)]
+        urls = (fresh + retry)[:COVERFILL_CAP]
+        _state["coverfill_last"] = now.isoformat(timespec="seconds")
+        if not urls:
+            save_state()
+            return
+        for u in urls:
+            e = tried.setdefault(u, {"n": 0})
+            e["n"] = e.get("n", 0) + 1
+            e["t"] = now.isoformat(timespec="seconds")
+    _push_command(type="coverfill", urls=urls)
+    add_log(f"Asked the extension to backfill covers/narrators for {len(urls)} book page(s)")
+
+
+def _maybe_fix_placeholder_covers():
+    """Once a day: a card whose cover is a 'to be revealed' placeholder falls
+    back to the newest book that has real art (per-book covers arrive via the
+    backfill). The revealed cover replaces it automatically later through the
+    normal newest-book ingest path."""
+    with _lock:
+        if _state.get("coverfix_last") == today().isoformat():
+            return
+        _state["coverfix_last"] = today().isoformat()
+        work = [(s, s.get("cover_url"),
+                 [e.get("cover") for e in sorted(s.get("timeline", []),
+                                                 key=lambda e: _entry_n(e) or 0, reverse=True)
+                  if e.get("cover")])
+                for s in _state["series"] if s.get("cover_url")]
+    changed = 0
+    for s, url, cands in work:
+        if not _cover_is_placeholder(url):
+            continue
+        best = next((c for c in cands if c != url and not _cover_is_placeholder(c)), None)
+        if best:
+            with _lock:
+                s["cover_url"] = best
+            changed += 1
+            add_log(f"'{s.get('name', '?')}': cover not revealed yet — showing the previous book's art")
+    if changed:
+        with _lock:
+            save_state()
+
+
 def _maybe_send_daily_digest():
     st = get_settings()
-    if not st.get("discord_daily") or not (st.get("discord_webhook") or "").strip():
+    wh = (st.get("discord_webhook") or "").strip()
+    if not st.get("discord_daily") or not wh:
         return
     if datetime.now().hour < int(st.get("discord_daily_hour", 9)):
         return
-    ts = today().isoformat()
+    every = int(st.get("discord_digest_days", 1) or 1)
+    ts = today()
     with _lock:
-        if _state.get("discord_daily_last") == ts:
+        last = parse_date(_state.get("discord_daily_last") or "")
+        if last and (ts - last).days < every:
             return
-        _state["discord_daily_last"] = ts    # mark first so a race can't double-send
+        _state["discord_daily_last"] = ts.isoformat()    # mark first so a race can't double-send
         save_state()
-    _discord_notify(_daily_digest_text())
-    add_log("Sent the daily forecast digest to Discord")
+    ok, err = _send_digest(wh)
+    if not ok:
+        add_log(f"Daily digest failed: {err}")
+    else:
+        add_log("Sent the daily forecast digest to Discord")
 
 
 _digest_thread_started = False
@@ -987,6 +1730,14 @@ def _start_daily_digest():
                 _maybe_send_daily_digest()
             except Exception as e:
                 add_log(f"daily digest error: {e}")
+            try:
+                _maybe_queue_cover_backfill()
+            except Exception as e:
+                add_log(f"cover backfill error: {e}")
+            try:
+                _maybe_fix_placeholder_covers()
+            except Exception as e:
+                add_log(f"placeholder cover fix error: {e}")
             time.sleep(300)   # check every 5 minutes
 
     threading.Thread(target=_loop, daemon=True).start()
@@ -1006,15 +1757,16 @@ def build_state_payload():
         "series": views,
         "upcoming": up[:FEED_ITEM_COUNT],
         "all_upcoming": up,
+        "overdue": overdue_audiobooks(),
         "upcoming_mode": mode,
         "show_estimates": get_settings().get("show_estimates", True),
         "show_estimates_novel": get_settings().get("show_estimates_novel", True),
         "log": log_rows,
         "counts": {
             "total": len(views),
-            "out": sum(1 for v in views if v["audiobook_status"] == "released"),
-            "announced": sum(1 for v in views if v["audiobook_status"] == "announced"),
-            "waiting": sum(1 for v in views if v["audiobook_status"] in ("none", "unknown")),
+            "out": sum(1 for v in views if v["status_class"] == "released"),
+            "announced": sum(1 for v in views if v["status_class"] == "announced"),
+            "waiting": sum(1 for v in views if v["status_class"] in ("none", "unknown")),
         },
     }
 
@@ -1048,7 +1800,7 @@ def build_rss(base_url):
             + f". {kind} releasing {it['date']}{est}. "
             + f"{it['countdown_days']} day(s) to go."
         )
-        guid = f"{it['series_id']}-{it['date']}-{it['kind']}"
+        guid = f"{it['series_id']}-{it['date']}-{it['kind']}-b{it.get('book_n')}"
         parts += [
             "<item>",
             f"<title>{html.escape(title)}</title>",
@@ -1059,6 +1811,80 @@ def build_rss(base_url):
         ]
     parts.append("</channel></rss>")
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# iCalendar feed — subscribe from any calendar app (phone included, via the
+# tunnel). REAL releases only, both kinds, as all-day events — a calendar entry
+# reads as a commitment, so estimates stay on the dashboard/digest instead.
+# ---------------------------------------------------------------------------
+
+def _ics_escape(s):
+    return (str(s or "").replace("\\", "\\\\").replace(";", "\\;")
+            .replace(",", "\\,").replace("\n", "\\n"))
+
+
+def _ics_fold(line):
+    """RFC 5545 §3.1 line folding: content lines SHOULD stay within 75 octets;
+    continuation lines start with a single space. Folds on UTF-8 byte length
+    without ever splitting inside a multi-byte character (emoji in summaries)."""
+    if len(line.encode("utf-8")) <= 75:
+        return [line]
+    out, cur, cur_len = [], [], 0
+    limit = 75
+    for ch in line:
+        b = len(ch.encode("utf-8"))
+        if cur_len + b > limit:
+            out.append("".join(cur))
+            cur, cur_len = [" ", ch], 1 + b
+        else:
+            cur.append(ch)
+            cur_len += b
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def build_ics():
+    rows = [r for r in upcoming_of_kind("novel", True) + upcoming_of_kind("audiobook", True)
+            if not r["estimate"]]
+    rows.sort(key=lambda r: (r["date"], r["kind"]))
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Release Radar//local//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Release Radar",
+        "X-WR-CALDESC:Upcoming novel & audiobook releases",
+    ]
+    for r in rows:
+        d = parse_date(r["date"])
+        if not d:
+            continue
+        icon = "🎧" if r["kind"] == "audiobook" else "📖"
+        summary = f"{icon} {r['title']} — {r['kind']}"
+        desc_bits = [r["series"]]
+        if r.get("author"):
+            # scraped bylines sometimes keep their own "by " prefix
+            desc_bits.append("by " + re.sub(r"^by\s+", "", r["author"], flags=re.I))
+        # book_n is part of the key: one series can release two same-kind books on
+        # one day, and calendar clients dedupe by UID — a collision loses an event
+        uid = f"{r['series_id']}-{r['date']}-{r['kind']}-b{r.get('book_n')}@release-radar"
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART;VALUE=DATE:{d.strftime('%Y%m%d')}",
+            f"DTEND;VALUE=DATE:{(d + timedelta(days=1)).strftime('%Y%m%d')}",
+            f"SUMMARY:{_ics_escape(summary)}",
+            f"DESCRIPTION:{_ics_escape(' · '.join(desc_bits))}",
+            "TRANSP:TRANSPARENT",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(fl for ln in lines for fl in _ics_fold(ln)) + "\r\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1111,15 +1937,10 @@ def api_state():
 @app.post("/api/series")
 def api_add():
     body = request.get_json(force=True, silent=True) or {}
-
-    def _int_or_none(v):
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
-    hsid = _int_or_none(body.get("hardcover_series_id"))
-    hbid = _int_or_none(body.get("hardcover_book_id"))
+    # Normalize timeline rows to ISO on the way in, exactly like PUT does — raw
+    # hand-typed dates ("Aug 25, 2026") parse fine server-side but are invisible
+    # to the dashboard JS, which reads timeline dates as strict ISO.
+    tl = _clean_timeline(body.get("timeline"))
     s = {
         "id": uuid.uuid4().hex[:12],
         "name": (body.get("name") or "").strip(),
@@ -1130,12 +1951,9 @@ def api_add():
         "audiobook_date": iso(parse_date(body.get("audiobook_date"))),
         "audiobook_status": body.get("audiobook_status") or "unknown",
         "cover_url": (body.get("cover_url") or "").strip(),
-        "history": _clean_history(body.get("history")),
-        "timeline": body.get("timeline") or [],
+        "history": _history_from_timeline(tl) if tl else _clean_history(body.get("history")),
+        "timeline": tl,
         "notes": (body.get("notes") or "").strip(),
-        "hardcover_series_id": hsid,
-        "hardcover_book_id": hbid,
-        "source": body.get("source") or ("hardcover" if (hsid or hbid) else "manual"),
         "last_fetched": None,
         "last_change": None,
         "fetch_error": None,
@@ -1164,7 +1982,7 @@ def api_update(sid):
         if "audiobook_date" in body:
             s["audiobook_date"] = iso(parse_date(body.get("audiobook_date")))
         if "timeline" in body:
-            tl = _clean_timeline(body.get("timeline"))   # rows of {n, novel, audiobook}
+            tl = _clean_timeline(body.get("timeline"), s.get("timeline"))   # rows of {n, novel, audiobook}
             s["timeline"] = tl
             s["history"] = _history_from_timeline(tl)
             s["edited"] = True          # your dates win; new info still merges in by number
@@ -1219,7 +2037,7 @@ def _match_tracked_series(name):
 
 @app.route("/api/ingest", methods=["POST", "OPTIONS"])
 def api_ingest():
-    """Accept one book read from an Amazon/Audible page (via the userscript) and
+    """Accept one book read from an Amazon page (via the extension/userscript) and
     fold it into the matching tracked series by book number. Amazon is treated as
     authoritative for the field it reports, so it sets that book's novel/audiobook
     date directly; everything else is left alone. Creates the series if it's new."""
@@ -1236,6 +2054,12 @@ def api_ingest():
     nd = iso(parse_date(book.get("novel_date")))
     ad = iso(parse_date(book.get("audiobook_date")))
     cover = (book.get("cover") or "").strip() or None
+    # Backfill reads exist to collect aux data (cover/narrator) from old pages —
+    # they FILL missing dates but never overwrite existing ones, so a hand-fixed
+    # date on a settled book can't be reverted by the daily backfill pass.
+    backfill = bool(body.get("_backfill"))
+    # network check happens here, BEFORE the state lock (cached per URL)
+    cover_is_ph = _cover_is_placeholder(cover) if cover else False
     if not series or n is None or (not nd and not ad):
         return jsonify({"ok": False, "message": "Need a series, a book number, and a date."})
     with _lock:
@@ -1269,6 +2093,11 @@ def api_ingest():
             tl.append(ent)
         old_novel = ent.get("novel")
         old_audio = ent.get("audiobook")
+        before = (json.dumps(ent, sort_keys=True), s.get("cover_url"), s.get("novel_title"),
+                  s.get("novel_date"), s.get("audiobook_date"), s.get("audiobook_status"),
+                  json.dumps(s.get("asins") or {}, sort_keys=True),
+                  json.dumps(s.get("asins_novel") or {}, sort_keys=True),
+                  json.dumps(s.get("asins_audio") or {}, sort_keys=True))
         if nd and title:
             ent["title"] = title              # per-book novel title (attribution anchor)
         # Guard against Amazon cross-linking one audiobook edition onto multiple books
@@ -1297,6 +2126,7 @@ def api_ingest():
         # pre-order state so the moment it flips to buyable we can say "out now".
         pre = body.get("_preorder", None)          # true / false / null(unknown)
         released_msgs = []
+        narrator_msgs = []
         if pre is not None:
             kind_key = "audio_pre" if ad else "novel_pre"
             kind = "audiobook" if ad else "novel"
@@ -1318,10 +2148,37 @@ def api_ingest():
                     notified.add(key)
                     _state["discord_notified"] = list(notified)[-500:]
                     released_msgs.append(_release_live_message(s.get("name", ""), n, kind))
-        if nd:
+        if nd and not (backfill and ent.get("novel")):
             ent["novel"] = nd                 # Amazon is authoritative for this field
-        if ad:
+        if ad and not (backfill and ent.get("audiobook")):
             ent["audiobook"] = ad
+        narr = clean_narrator(book.get("narrator"))
+        if ad and narr:
+            # A narrator swap is news to an audiobook listener — compare against
+            # the nearest EARLIER book that names one, ping once per book+narrator.
+            prev = None
+            for e2 in tl:
+                n2 = _entry_n(e2)
+                if (n2 is not None and n is not None and n2 < n
+                        and (e2.get("narrator") or "").strip()):
+                    if prev is None or n2 > prev[0]:
+                        prev = (n2, e2["narrator"].strip())
+            was_new = (ent.get("narrator") or "").strip() != narr
+            ent["narrator"] = narr
+            adt_n = parse_date(ent.get("audiobook"))
+            # today-or-later only — backfilling an old catalogue must not spam a
+            # ping per historical swap (same guard as _new_date_messages)
+            if was_new and prev and _norm(prev[1]) != _norm(narr) and adt_n and adt_n >= today():
+                key = f"narrator:{s['id']}:{n}:{_norm(narr)}"
+                notified = set(_state.get("discord_notified", []))
+                if key not in notified and get_settings().get("discord_on_new", True):
+                    notified.add(key)
+                    _state["discord_notified"] = list(notified)[-500:]
+                    narrator_msgs.append(_fmt_line("narrator", icon="\U0001f399️",
+                                                   series=s.get("name", ""), n=n,
+                                                   narrator=narr, was=prev[1]))
+        if cover and (nd or not ent.get("cover")):
+            ent["cover"] = cover              # per-book art for the timeline hover card
         tl.sort(key=lambda e: (e.get("novel") or e.get("audiobook") or "", _entry_n(e) or 0))
         s["history"] = _history_from_timeline(tl)
         if author and not s.get("author"):
@@ -1330,27 +2187,50 @@ def api_ingest():
             s["cover_url"] = cover           # first cover we see for a new series
         if book.get("asin"):
             s.setdefault("asins", {})[str(n)] = book["asin"]
+            if nd:
+                s.setdefault("asins_novel", {})[str(n)] = book["asin"]
+        page_url = (body.get("_url") or "").strip()
+        if page_url:
+            h = urlparse(page_url).netloc.lower()
+            if "amazon." in h or "audible." in h:
+                s["store_host"] = h
         # If this is the latest book in the series, reflect it on the card headline.
         maxn = max((_entry_n(e) for e in tl if _entry_n(e) is not None), default=None)
         if n == maxn:
+            s["novel_n"] = n
             if book.get("title"):
                 s["novel_title"] = book["title"]
-            if cover:
-                s["cover_url"] = cover        # keep the card cover on the newest book
+            if cover and (nd or not s.get("cover_url")):
+                # newest book's NOVEL art; an audio read must not swap in Audible
+                # art, and a "cover to be revealed" placeholder must not replace
+                # real art already on the card (it takes over automatically once
+                # Amazon serves the real image, because that one passes the check)
+                if not s.get("cover_url") or not cover_is_ph:
+                    s["cover_url"] = cover
             if ent.get("novel"):
                 s["novel_date"] = ent["novel"]
             s["audiobook_date"] = ent.get("audiobook")
             adt = parse_date(ent.get("audiobook"))
             s["audiobook_status"] = ("released" if (adt and adt <= today())
                                      else ("announced" if adt else "none"))
-        s["edited"] = True
-        s["last_change"] = f"Updated from Amazon: book {n}"
-        s["last_change_at"] = datetime.now().isoformat(timespec="seconds")
-        _state["last_ingest"] = s["last_change_at"]
+        after = (json.dumps(ent, sort_keys=True), s.get("cover_url"), s.get("novel_title"),
+                 s.get("novel_date"), s.get("audiobook_date"), s.get("audiobook_status"),
+                 json.dumps(s.get("asins") or {}, sort_keys=True),
+                 json.dumps(s.get("asins_novel") or {}, sort_keys=True),
+                 json.dumps(s.get("asins_audio") or {}, sort_keys=True))
+        if created or before != after:
+            # only a real change earns the "Updated from Amazon" line — routine
+            # re-reads (release-day polls, backfill passes) must not churn it
+            s["edited"] = True
+            s["last_change"] = f"Updated from Amazon: book {n}"
+            s["last_change_at"] = datetime.now().isoformat(timespec="seconds")
+            _state["last_ingest"] = s["last_change_at"]
         new_date_msgs = _new_date_messages(s, n, old_novel, ent.get("novel"), old_audio, ent.get("audiobook"))
+        cover_for_ping = ent.get("cover") or s.get("cover_url") or None
+        series_name = s.get("name", "")
         save_state()
-    for m in new_date_msgs + released_msgs:
-        _discord_notify(m)
+    for m in new_date_msgs + released_msgs + narrator_msgs:
+        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping)])
     bits = " ".join(filter(None, [f"novel {nd}" if nd else "", f"audiobook {ad}" if ad else ""]))
     add_log(f"Ingested from Amazon: {series} book {n} ({bits})")
     return jsonify({"ok": True, "created": created, "series": s["name"], "n": n,
@@ -1437,15 +2317,6 @@ def api_series_clear():
     return jsonify({"ok": True, "removed": removed})
 
 
-@app.after_request
-def _ingest_cors(resp):
-    if request.path in ("/api/ingest", "/api/series/clear"):
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    return resp
-
-
 @app.post("/api/quit")
 def api_quit():
     add_log("Quit requested.")
@@ -1490,7 +2361,8 @@ def api_get_settings():
                     "discord_on_new": s.get("discord_on_new", True),
                     "discord_on_release": s.get("discord_on_release", True),
                     "discord_daily": s.get("discord_daily", False),
-                    "discord_daily_hour": s.get("discord_daily_hour", 9)})
+                    "discord_daily_hour": s.get("discord_daily_hour", 9),
+                    "discord_digest_days": s.get("discord_digest_days", 1)})
 
 
 @app.post("/api/settings")
@@ -1521,6 +2393,13 @@ def api_set_settings():
                     s["discord_daily_hour"] = h
             except (TypeError, ValueError):
                 pass
+        if "discord_digest_days" in body:
+            try:
+                dd = int(body.get("discord_digest_days"))
+                if dd in (1, 2, 3, 7):
+                    s["discord_digest_days"] = dd
+            except (TypeError, ValueError):
+                pass
     save_state()
     return jsonify({"ok": True})
 
@@ -1533,7 +2412,7 @@ def api_discord_test():
     wh = (body.get("discord_webhook") or get_settings().get("discord_webhook") or "").strip()
     if not wh:
         return jsonify({"ok": False, "message": "No webhook URL set."})
-    ok, err = _discord_post(wh, f"✅ **{APP_NAME}** test message — notifications are wired up.")
+    ok, err = _discord_post(wh, _fmt_line("test"))
     return jsonify({"ok": ok, "message": "Sent! Check your Discord channel." if ok else f"Failed: {err}"})
 
 
@@ -1544,7 +2423,7 @@ def api_discord_digest_now():
     wh = (get_settings().get("discord_webhook") or "").strip()
     if not wh:
         return jsonify({"ok": False, "message": "No webhook URL set."})
-    ok, err = _discord_post(wh, _daily_digest_text())
+    ok, err = _send_digest(wh)
     if ok:
         add_log("Sent a forecast digest to Discord (manual)")
     return jsonify({"ok": ok, "message": "Sent! Go see what she has to say." if ok else f"Failed: {err}"})
@@ -1553,7 +2432,17 @@ def api_discord_digest_now():
 @app.get("/feed.xml")
 def feed():
     base = request.host_url.rstrip("/")
-    return Response(build_rss(base), mimetype="application/rss+xml")
+    return Response(build_rss(base), mimetype="application/rss+xml",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
+@app.get("/calendar.ics")
+def calendar_ics():
+    # no-cache matters: Cloudflare's edge caches .ics by default (4h TTL), so
+    # without this, calendar apps fetching through the tunnel get stale feeds
+    return Response(build_ics(), mimetype="text/calendar",
+                    headers={"Content-Disposition": "inline; filename=release-radar.ics",
+                             "Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 BOARD_CSS = """
@@ -1601,16 +2490,19 @@ def build_board_html():
         cd = it["countdown_days"]
         cd_word = "today" if cd == 0 else ("day" if cd == 1 else "days")
         cd_num = "" if cd == 0 else str(cd)
+        kind_lbl = "Audiobook" if it["kind"] == "audiobook" else "Novel"
+        kind_cls = "" if it["kind"] == "audiobook" else " novel"
         rows.append(
             f'<div class="row{" soon" if i == 0 else ""}">'
             f'<div class="cd">{cd_num}<small>{cd_word}</small></div>'
             f'<div class="info"><div class="title">{html.escape(it["title"])}</div>'
             f'<div class="meta">{html.escape(nice)}'
-            f'<span class="tag">Audiobook</span>{est}'
+            f'<span class="tag{kind_cls}">{kind_lbl}</span>{est}'
             + (f' &middot; {html.escape(it["series"])}' if it["series"] and it["series"] != it["title"] else "")
             + "</div></div></div>"
         )
-    body = "".join(rows) if rows else '<div class="empty">No audiobooks upcoming. Turn on estimates in Release Radar, or check back later.</div>'
+    kind_word = "novels" if _mode == "novel" else "audiobooks"
+    body = "".join(rows) if rows else f'<div class="empty">No {kind_word} upcoming. Turn on estimates in Release Radar, or check back later.</div>'
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1651,9 +2543,28 @@ def _clean_history(raw):
     return out
 
 
-def _clean_timeline(raw):
-    """Clean editor rows into timeline entries, preserving the book number (n)."""
-    out = []
+def _clean_timeline(raw, existing=None):
+    """Clean editor rows into timeline entries, preserving the book number (n).
+    The editor only shows n/novel/audiobook, but entries carry more (title,
+    narrator, cover, pre-order flags) — merge those back in so a hand edit
+    doesn't silently wipe them. The novel DATE is the primary identity (it
+    follows the row when the user renumbers books to fix an off-by-one); the
+    book number is only the fallback. Output is sorted chronologically, the
+    same order ingest keeps, so gap recency-weighting stays correct."""
+    by_novel, by_n = {}, {}
+    for e in (existing or []):
+        aux = {k: v for k, v in e.items()
+               if k not in ("n", "novel", "audiobook") and v is not None}
+        if not aux:
+            continue
+        nov = iso(parse_date(e.get("novel")))
+        if nov:
+            # two existing books on one novel date would be ambiguous — disable
+            by_novel[nov] = None if nov in by_novel else aux
+        n = _entry_n(e)
+        if n is not None:
+            by_n[n] = aux
+    rows = []
     if isinstance(raw, list):
         for e in raw:
             if not isinstance(e, dict):
@@ -1665,7 +2576,28 @@ def _clean_timeline(raw):
             nov = iso(parse_date(e.get("novel")))
             aud = iso(parse_date(e.get("audiobook")))
             if nov or aud or num is not None:
-                out.append({"n": num, "novel": nov, "audiobook": aud})
+                rows.append((num, nov, aud))
+    # Two passes: date identity first, then number fallback — and aux claimed by
+    # a date match can't ALSO be handed to another row via its old number.
+    assigned, used = {}, set()
+    for i, (num, nov, aud) in enumerate(rows):
+        aux = by_novel.get(nov) if nov else None
+        if aux:
+            assigned[i] = aux
+            used.add(id(aux))
+    for i, (num, nov, aud) in enumerate(rows):
+        if i in assigned or num is None:
+            continue
+        aux = by_n.get(num)
+        if aux and id(aux) not in used:
+            assigned[i] = aux
+            used.add(id(aux))
+    out = []
+    for i, (num, nov, aud) in enumerate(rows):
+        row = dict(assigned.get(i, {}))
+        row.update({"n": num, "novel": nov, "audiobook": aud})
+        out.append(row)
+    out.sort(key=lambda e: (e.get("novel") or e.get("audiobook") or "", _entry_n(e) or 0))
     return out
 
 
@@ -1735,6 +2667,30 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 .kind.novel{color:var(--violet);border-color:#3a3360;background:var(--violet-dim)}
 .kind.est{color:var(--faint)}
 
+/* top row: header + meta on the left, the overdue panel filling the space right */
+.topgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,380px);
+  gap:20px;align-items:start}
+@media(max-width:900px){.topgrid{grid-template-columns:1fr}}
+
+/* overdue panel */
+.overdue{display:flex;flex-direction:column;gap:5px;max-height:196px;overflow-y:auto;
+  padding-right:4px;scrollbar-width:thin;scrollbar-color:#4a4067 transparent}
+.overdue::-webkit-scrollbar{width:8px}
+.overdue::-webkit-scrollbar-thumb{background:#4a4067;border-radius:4px}
+.overdue::-webkit-scrollbar-track{background:transparent}
+.od{display:flex;align-items:center;gap:9px;padding:6px 9px;border:1px solid #5a3540;
+  border-radius:10px;background:linear-gradient(180deg,#2b1d24,var(--card))}
+.od .late{font-family:var(--mono);font-size:17px;font-weight:600;line-height:1;
+  color:var(--rose);min-width:40px;text-align:center;flex:0 0 auto}
+.od .late small{display:block;font-size:9px;color:var(--muted);font-weight:400;
+  margin-top:2px;font-family:var(--sans);letter-spacing:.02em}
+.od .cov{width:24px;height:36px;object-fit:cover;border-radius:3px;border:1px solid var(--line);flex:0 0 auto}
+.od .info{flex:1;min-width:0}
+.od .t{font-family:var(--serif);font-size:12.5px;line-height:1.25;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.od .d{color:var(--faint);font-size:10px;font-family:var(--mono);margin-top:2px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
 /* series cards */
 .sortbar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 10px}
 .sortbar .left{display:flex;align-items:center;gap:8px}
@@ -1755,6 +2711,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 .facts{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:7px}
 .fact .k{font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--faint)}
 .fact .v{font-family:var(--mono);font-size:12px;margin-top:1px}
+/* which volume this column is about — often not the one on the Novel line */
+.fact .bk{color:var(--faint);font-size:11px}
 .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;border:1px solid}
 .pill.released{color:var(--teal);border-color:#2c5147;background:var(--teal-dim)}
 .pill.announced{color:var(--amber);border-color:#5a4a25;background:var(--amber-dim)}
@@ -1765,24 +2723,38 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 .changed{margin-top:6px;font-size:11.5px;color:var(--teal)}
 .chg-time{color:var(--faint)}
 .right{display:flex;flex-direction:column;align-items:flex-end;gap:5px;flex:0 0 auto;margin-left:auto}
-.checked{font-size:10px;color:var(--faint);font-family:var(--mono);white-space:nowrap}
 .rowbtns{display:flex;gap:5px}
 .rowbtns button{padding:5px 9px;font-size:12px}
 
 /* gap timeline signature */
 .timeline{margin-top:7px;padding-top:7px;border-top:1px dashed var(--line)}
 .tl-row{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:10.5px;color:var(--muted);margin:3px 0}
-.track{position:relative;flex:1;height:2px;background:var(--line);border-radius:2px;min-width:80px}
+.track{position:relative;flex:1;height:2px;background:var(--line);border-radius:2px;min-width:80px;margin-right:40px}
+.tl-end{position:absolute;top:7px;font:500 10px/1 var(--mono,monospace);color:var(--faint);white-space:nowrap;letter-spacing:.02em}
+.tl-row{padding-bottom:12px}
 .tl-today{position:absolute;top:-4px;bottom:-4px;width:1px;background:var(--faint);opacity:.7;transform:translateX(-50%)}
 .tl-today::after{content:'';position:absolute;top:-2px;left:-2px;width:5px;height:5px;border-radius:50%;background:var(--faint);opacity:.9}
+a.plain{color:inherit;text-decoration:none}a.plain:hover h3,a.plain:hover{text-decoration:underline;text-decoration-color:var(--faint)}
+a.mark{text-decoration:none}
 .mark{position:absolute;top:50%;transform:translate(-50%,-50%);width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 1.5px var(--card)}
 .mark.novel{color:var(--violet)}
 .mark.audio{color:var(--amber)}
 .mark.both{width:11px;height:11px;color:var(--amber);background:linear-gradient(135deg,var(--violet) 0 50%,var(--amber) 50% 100%)}
 .mark.est{color:var(--amber);background:transparent;border:1.5px dashed currentColor;box-shadow:none}
 .mark.future{background:transparent;border:2px solid currentColor;box-shadow:none}
-.mark.future.both{background:transparent;border:2px solid var(--amber)}
+/* hollow = upcoming, but a same-day novel+audiobook must stay half violet /
+   half amber: the transparent background drops the gradient, so the split is
+   carried by the border instead (violet top-left, amber bottom-right) */
+.mark.future.both{background:transparent;border:2px solid;
+  border-color:var(--violet) var(--amber) var(--amber) var(--violet)}
 .gaplabel{flex:0 0 auto;color:var(--ink)}
+.hovercard{position:fixed;z-index:70;display:flex;gap:10px;align-items:flex-start;background:var(--card2);
+  border:1px solid #4a4067;border-radius:10px;padding:9px 11px;max-width:270px;
+  box-shadow:0 10px 30px rgba(0,0,0,.5);pointer-events:none}
+.hovercard img{width:44px;height:66px;object-fit:cover;border-radius:5px;border:1px solid var(--line);flex:0 0 auto}
+.hovercard .hc-t{font-family:var(--serif);font-size:13px;line-height:1.25;margin-bottom:3px}
+.hovercard .hc-d{font-family:var(--mono);font-size:10.5px;color:var(--muted);line-height:1.4}
+.hovercard .hc-n{font-size:10.5px;color:var(--faint);margin-top:3px}
 .legend{display:flex;gap:14px;margin:-2px 0 10px;font-size:10.5px;color:var(--faint);font-family:var(--mono);flex-wrap:wrap}
 .legend span{display:inline-flex;align-items:center;gap:5px}
 .legend .sw{width:9px;height:9px;border-radius:50%;display:inline-block}
@@ -1791,6 +2763,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 .legend .sw.both{width:11px;height:11px;background:linear-gradient(135deg,var(--violet) 0 50%,var(--amber) 50% 100%)}
 .legend .sw.est{background:transparent;border:1.5px dashed var(--amber)}
 .legend .sw.upc{background:transparent;border:2px solid var(--muted)}
+.legend .sw.bothupc{width:11px;height:11px;background:transparent;border:2px solid;
+  border-color:var(--violet) var(--amber) var(--amber) var(--violet)}
 .legend .sw.today{width:1px;height:11px;border-radius:0;background:var(--faint)}
 
 /* empty */
@@ -1832,6 +2806,8 @@ textarea{resize:vertical;min-height:54px}
 </head>
 <body>
 <div class="wrap">
+ <div class="topgrid">
+  <div>
   <header>
     <div class="brand">
       <svg class="logo" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -1847,6 +2823,7 @@ textarea{resize:vertical;min-height:54px}
     </div>
     <div class="toolbar">
       <a class="ghost" id="feedLink" href="/feed.xml" target="_blank"><button class="ghost small">RSS feed</button></a>
+      <a class="ghost" id="calLink" href="/calendar.ics" target="_blank" title="iCalendar feed — subscribe from Google/Outlook/your phone's calendar app using this URL. Confirmed releases only, as all-day events."><button class="ghost small">&#128197; Calendar</button></a>
       <button class="ghost small" id="settingsBtn">&#9881; Settings</button>
       <button class="ghost small" id="quitBtn">&#11096; Quit</button>
       <button class="ghost small" id="extRefreshBtn" title="Ask the browser extension to re-check pending pages (pre-orders / missing audiobooks) for new dates. Takes a few seconds to start.">&#8635; Refresh dates</button>
@@ -1858,6 +2835,13 @@ textarea{resize:vertical;min-height:54px}
     <span><span class="dot pulse"></span> <span id="lastCheck">waiting for the extension…</span></span>
     <span id="countLine" class="mono"></span>
   </div>
+  </div>
+
+  <div id="overdueWrap" style="display:none">
+    <div class="section-eyebrow" style="margin:2px 0 8px" title="Audiobooks whose expected window has passed with no announcement. They're kept out of the upcoming schedule — a date that already failed isn't a forecast — and nothing behind them can be predicted until they land.">Overdue audiobooks <span id="overdueCount"></span></div>
+    <div class="overdue" id="overdue"></div>
+  </div>
+ </div>
 
   <div id="heroWrap" style="display:none">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px">
@@ -1886,6 +2870,7 @@ textarea{resize:vertical;min-height:54px}
     <span><i class="sw novel"></i>novel</span>
     <span><i class="sw audio"></i>audiobook</span>
     <span><i class="sw both"></i>same day</span>
+    <span><i class="sw bothupc"></i>same day, upcoming</span>
     <span><i class="sw upc"></i>upcoming (hollow)</span>
     <span><i class="sw est"></i>estimated</span>
     <span><i class="sw today"></i>today</span>
@@ -1894,7 +2879,7 @@ textarea{resize:vertical;min-height:54px}
 
   <div id="empty" class="empty" style="display:none">
     <h2>Nothing on the radar yet</h2>
-    <p>Open an Amazon or Audible page for any book in a series (with the Release Radar extension installed) and it'll be collected automatically. Or hit <b>Crawl all</b> once you've opened a few.</p>
+    <p>Open an Amazon page for any book in a series (with the Release Radar extension installed) and it'll be collected automatically. Or hit <b>Crawl all</b> once you've opened a few.</p>
   </div>
 
   <div class="activity" id="activity"></div>
@@ -1906,12 +2891,12 @@ textarea{resize:vertical;min-height:54px}
     <h2 id="mTitle">Add series</h2>
     <input type="hidden" id="f_id">
 
-    <label>Amazon / Audible link</label>
+    <label>Amazon link</label>
     <div class="linkrow">
-      <input id="f_url" placeholder="https://www.audible.com/pd/..." >
+      <input id="f_url" placeholder="https://www.amazon.com.au/dp/..." >
       <button class="small" id="autofillBtn" type="button">Auto-fill</button>
     </div>
-    <div class="hint">Auto-fill now cross-checks Apple Books and Audnexus too, so it often works even when the page itself can't be read. Anything it misses, type by hand.</div>
+    <div class="hint">Auto-fill reads the page itself. Anything it misses, type by hand.</div>
 
     <div class="two">
       <div><label>Series / book name</label><input id="f_name" placeholder="The Stormlight Archive"></div>
@@ -1975,7 +2960,11 @@ textarea{resize:vertical;min-height:54px}
       <input type="checkbox" id="discOnRelease" style="width:auto;margin:0"> Ping when a release goes live (the store page flips from pre-order to buyable)
     </label>
     <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin:8px 0 0;font-size:13px;flex-wrap:wrap">
-      <input type="checkbox" id="discDaily" style="width:auto;margin:0"> Daily forecast digest at
+      <input type="checkbox" id="discDaily" style="width:auto;margin:0"> Forecast digest
+      <select id="discDigestDays" style="width:auto;margin:0;padding:4px 6px">
+        <option value="1">every day</option><option value="2">every 2 days</option>
+        <option value="3">every 3 days</option><option value="7">weekly</option>
+      </select> at
       <input type="number" id="discDailyHour" min="0" max="23" style="width:54px;margin:0;padding:4px 6px"> <span style="color:var(--faint)">:00 — upcoming novels &amp; audiobooks, estimates included. Delivered by a very reluctant, very bratty assistant. Her lines live in <b>digest_lines</b> next to your data.json — edit or replace them freely.</span>
     </label>
     <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
@@ -1989,7 +2978,7 @@ textarea{resize:vertical;min-height:54px}
       <button class="small ghost" type="button" id="clearAllBtn" style="border-color:#5a3157;color:#ffb0b0">Clear all tracked series</button>
       <span class="hint" style="margin:0">Wipes every series so you can rebuild from Amazon only.</span>
     </div>
-    <div class="hint">Your <code>data.json</code> is backed up first (recoverable by renaming <code>data.json.bak</code>), and settings are kept. After clearing, open one Amazon/Audible page per series (or hit "Crawl all now" in the extension) and the crawl repopulates everything.</div>
+    <div class="hint">Your <code>data.json</code> is backed up first (recoverable by renaming <code>data.json.bak</code>), and settings are kept. After clearing, open one Amazon page per series (or hit "Crawl all now" in the extension) and the crawl repopulates everything.</div>
 
     <div class="modal-actions">
       <button class="del-link" style="visibility:hidden">.</button>
@@ -2010,7 +2999,55 @@ function fmtDate(s){if(!s)return '--';const d=new Date(s+'T00:00:00');if(isNaN(d
   return d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});}
 function isReleased(s){if(!s)return null;const d=new Date(s+'T00:00:00');if(isNaN(d))return null;const t=new Date();t.setHours(0,0,0,0);return d<t;}
 function isTodayStr(sd){if(!sd)return false;const d=new Date(sd+'T00:00:00');if(isNaN(d))return false;const t=new Date();t.setHours(0,0,0,0);return d.getTime()===t.getTime();}
+function storeLink(s,n,kind){                     // page URL for book n's edition, or null
+  if(n==null) return null;
+  const host=s.store_host; if(!host) return (s.url||null);
+  const key=String(n);
+  const asin=(kind==='audio'?(s.asins_audio||{})[key]:(s.asins_novel||{})[key])||(s.asins||{})[key];
+  return asin?('https://'+host+'/dp/'+asin):(s.url||null);
+}
+function authorLink(s){
+  if(!s.store_host||!s.author) return null;
+  return 'https://'+s.store_host+'/s?k='+encodeURIComponent(s.author);
+}
+function wrapLink(html,url,title){ return url?`<a class="plain" href="${esc(url)}" target="_blank" rel="noopener" ${title?`title="${esc(title)}"`:''}>${html}</a>`:html; }
 function latestEntry(s){let best=null,bn=-1;(s.timeline||[]).forEach(e=>{const n=(e&&e.n!=null)?+e.n:NaN;if(!isNaN(n)&&n>bn){bn=n;best=e;}});return best;}
+function daysLate(iso){      // whole days since a date that has already passed
+  const dt=new Date(iso+'T00:00:00');if(isNaN(dt))return 0;
+  const t=new Date();t.setHours(0,0,0,0);
+  return Math.max(0,Math.round((t-dt)/86400000));
+}
+function bkTag(n){ return n!=null?`<span class="bk">Book ${n}</span> `:''; }
+function audioFact(s){
+  // The Audiobook column tracks whatever we actually know, in order of strength:
+  // the tracked book's own date, then a confirmed pre-order for an earlier book
+  // (the series-level field only ever mirrors the LATEST book, which is why this
+  // read blank), then how far past due an overdue one is, as a red count. Each
+  // names its book, because it often isn't the one on the Novel line.
+  if(s.audiobook_date)
+    return bkTag(s.novel_n)+fmtDate(s.audiobook_date)+dateTag(s.audiobook_date,(latestEntry(s)||{}).audio_pre===false);
+  const ra=nextRealAudio(s);
+  if(ra){
+    const val=bkTag(ra.n)+fmtDate(ra.date)+dateTag(ra.date,ra.live);
+    const t=ra.n!=null?`Book ${ra.n}'s audiobook`:'The next audiobook';
+    return wrapLink(val,storeLink(s,ra.n,'audio'),t+' — open on Amazon');
+  }
+  if(s.predicted_date&&isReleased(s.predicted_date)===true){
+    const n=daysLate(s.predicted_date);
+    const who=s.predicted_book_n!=null?`Book ${s.predicted_book_n}'s audiobook is `:'Overdue by ';
+    return bkTag(s.predicted_book_n)
+      +`<span style="color:var(--rose)" title="${attrEsc(who+n+' day'+(n===1?'':'s')+' past its expected window (expected ~ '+fmtDate(s.predicted_date)+'). Later books cannot be predicted until it lands.')}">−${n}d</span>`;
+  }
+  return '—';
+}
+function nextRealAudio(s){   // soonest still-upcoming REAL audiobook date in the timeline, or null
+  let best=null;
+  (s.timeline||[]).forEach(e=>{
+    if(!e||!e.audiobook||isReleased(e.audiobook)!==false) return;
+    if(!best||e.audiobook<best.date) best={date:e.audiobook,n:e.n!=null?+e.n:null,live:e.audio_pre===false};
+  });
+  return best;
+}
 function dateTag(d,live){const past=isReleased(d);if(past===null)return '';
   const out=past||(live===true&&isTodayStr(d));   // confirmed buyable on release day counts as out
   const label=past?'out':(out?'out now':'pre-order');
@@ -2021,12 +3058,37 @@ function confChip(c){
   const M={high:['high','#56d18a','#16271d','#2c5a3f'],medium:['med','#f0a500','#262017','#5a4a25'],low:['low','#b9a6d6','#221d3a','#3a3360']};
   const m=M[c.level]||M.low;
   const pm=(c.spread_days!=null)?` ±${c.spread_days}d`:'';
+  const drop=c.outliers?`, ignoring ${c.outliers} freak gap${c.outliers===1?'':'s'}`:'';
   const basis=(c.spread_days!=null)
-    ? `${c.level} confidence — based on ${c.n} past gap${c.n===1?'':'s'} that varied by about ±${c.spread_days} days`
-    : `${c.level} confidence — only ${c.n} past release to go on, so the spread is unknown`;
+    ? `${c.level} confidence — based on ${c.n} past gap${c.n===1?'':'s'} that varied by about ±${c.spread_days} days${drop}`
+    : `${c.level} confidence — only ${c.n} past release to go on, so the spread is unknown${drop}`;
   return ` <span title="${esc(basis)}" style="font:600 9px/1 var(--mono,monospace);letter-spacing:.04em;text-transform:uppercase;padding:1px 5px;border:1px solid ${m[3]};background:${m[2]};color:${m[1]};border-radius:6px;vertical-align:middle">${m[0]}${pm}</span>`;}
 function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML;}
-function countWord(n){if(n===0)return 'today';if(n===1)return 'in 1 day';return 'in '+n+' days';}
+function attrEsc(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
+
+/* ---- timeline hover card: cover art + details for a release dot ---- */
+let HOVERCARD=null;
+function hideHover(){if(HOVERCARD)HOVERCARD.style.display='none';}
+function showHover(mark){
+  let tip;try{tip=JSON.parse(mark.dataset.tip||'null');}catch(_){tip=null;}
+  if(!tip)return;
+  if(!HOVERCARD){HOVERCARD=document.createElement('div');HOVERCARD.className='hovercard';document.body.appendChild(HOVERCARD);}
+  const name=tip.est?('Estimated audiobook'+(tip.estN!=null?` · book ${tip.estN}`:''))
+    :(tip.t||((tip.sn||'')+(tip.nN!=null?' '+tip.nN:(tip.aN!=null?' '+tip.aN:''))));
+  // a broken per-book cover URL degrades to the series cover, then to no image
+  const img=(tip.cover&&!tip.est)?`<img src="${attrEsc(tip.cover)}" alt="" data-fb="${attrEsc(tip.cover2||'')}" onerror="if(this.dataset.fb){this.src=this.dataset.fb;this.dataset.fb='';}else{this.remove();}">`:'';
+  const narr=tip.narr?`<div class="hc-n">Narrated by ${esc(tip.narr)}</div>`:'';
+  const hint=(tip.est&&tip.estWhy)?`<div class="hc-n">${esc(tip.estWhy)}</div>`:'';
+  HOVERCARD.innerHTML=`${img}<div><div class="hc-t">${esc(name)}</div><div class="hc-d">${esc(tip.label)}</div>${narr}${hint}</div>`;
+  HOVERCARD.style.display='flex';HOVERCARD.style.visibility='hidden';HOVERCARD.style.left='0px';HOVERCARD.style.top='0px';
+  const r=mark.getBoundingClientRect(),hw=HOVERCARD.offsetWidth,hh=HOVERCARD.offsetHeight;
+  let x=Math.min(Math.max(8,r.left+r.width/2-hw/2),window.innerWidth-hw-8);
+  let y=r.top-hh-10; if(y<8)y=r.bottom+10;
+  HOVERCARD.style.left=x+'px';HOVERCARD.style.top=y+'px';HOVERCARD.style.visibility='visible';
+}
+document.addEventListener('mouseover',e=>{const m=e.target.closest&&e.target.closest('.mark[data-tip]');if(m)showHover(m);});
+document.addEventListener('mouseout',e=>{const m=e.target.closest&&e.target.closest('.mark[data-tip]');if(m)hideHover();});
+window.addEventListener('scroll',hideHover,true);
 
 let LAST_CHANGES=null;   // map id -> last_change, to spot new updates
 function checkForNotifications(){
@@ -2050,8 +3112,31 @@ async function refresh(){
       : 'No data yet · open a series page in your browser (with the extension installed) to collect it';
   const c=STATE.counts;
   $('#countLine').textContent=`${c.total} tracked · ${c.out} out · ${c.announced} announced · ${c.waiting} waiting`;
-  renderHero();renderGrid();renderActivity();
+  renderHero();renderOverdue();renderGrid();renderActivity();
   checkForNotifications();
+}
+
+function renderOverdue(){
+  const list=STATE.overdue||[];
+  const wrap=$('#overdueWrap'),box=$('#overdue');
+  if(!wrap||!box) return;
+  if(!list.length){wrap.style.display='none';box.innerHTML='';return;}
+  wrap.style.display='block';
+  const cnt=$('#overdueCount'); if(cnt) cnt.textContent='('+list.length+')';
+  box.innerHTML=list.map(o=>{
+    // count the days here rather than trusting the payload, so the number stays
+    // right on a dashboard left open across midnight
+    const exp=new Date(o.expected+'T00:00:00');
+    const t=new Date();t.setHours(0,0,0,0);
+    const days=isNaN(exp)?(o.days_late||0):Math.max(0,Math.round((t-exp)/86400000));
+    const cov=o.cover?`<img class="cov" src="${attrEsc(o.cover)}" alt="" onerror="this.remove()">`:'';
+    const bk=o.book_n!=null?` · book ${o.book_n}`:'';
+    const s=STATE.series.find(x=>x.id===o.series_id)||{};
+    const title=wrapLink(esc(o.title),storeLink(s,o.book_n,'novel'),'Open on Amazon');
+    return `<div class="od"><div class="late">${days}<small>${days===1?'day':'days'} late</small></div>${cov}
+      <div class="info"><div class="t">${title}</div>
+      <div class="d">expected ~ ${esc(fmtDate(o.expected))}${bk} · ${esc(o.series)}</div></div></div>`;
+  }).join('');
 }
 
 function renderHero(){
@@ -2093,18 +3178,24 @@ function renderHero(){
 }
 
 function timelineHtml(s){
-  // one entry per unique date, tracking the book number(s) on that date
+  // one entry per unique date, tracking the book number(s) on that date plus
+  // whatever the entry knows for the hover card (title, cover, narrator)
   const ev={};
-  const add=(d,k,num)=>{if(!d)return;const e=(ev[d]=ev[d]||{});e[k]=true;if(num!=null){if(k==='novel')e.nN=num;else if(k==='audio')e.aN=num;}};
+  const add=(d,k,num,meta)=>{if(!d)return;const e=(ev[d]=ev[d]||{});e[k]=true;
+    if(num!=null){if(k==='novel')e.nN=num;else if(k==='audio')e.aN=num;}
+    if(meta){if(meta.title&&!e.title)e.title=meta.title;if(meta.cover&&!e.cover)e.cover=meta.cover;
+      if(k==='audio'&&meta.narrator)e.narr=meta.narrator;}};
   const tl=(s.timeline&&s.timeline.length)?s.timeline:null;
   const live={};                                                 // date -> {n:true,a:true} = confirmed buyable
   const mklive=(d,k)=>{if(d)(live[d]=live[d]||{})[k]=true;};
-  if(tl){tl.forEach(t=>{add(t.novel,'novel',t.n);add(t.audiobook,'audio',t.n);
+  if(tl){tl.forEach(t=>{add(t.novel,'novel',t.n,t);add(t.audiobook,'audio',t.n,t);
     if(t.novel_pre===false)mklive(t.novel,'n');if(t.audio_pre===false)mklive(t.audiobook,'a');});}
   else{(s.history||[]).forEach(h=>{add(h.novel,'novel',h.n);add(h.audiobook,'audio',h.n);});}
   add(s.novel_date,'novel',s.novel_n);                          // always include the tracked book
   if(s.audiobook_status!=='none') add(s.audiobook_date,'audio',s.novel_n);
-  if((s.audiobook_status==='none'||s.audiobook_status==='unknown')&&s.predicted_date) add(s.predicted_date,'est',null);
+  // dashed ring only for a still-future estimate; a lapsed one is reported as
+  // "overdue" in the predict line, not drawn as if it were ahead of us
+  if((s.audiobook_status==='none'||s.audiobook_status==='unknown')&&s.predicted_date&&isReleased(s.predicted_date)===false) add(s.predicted_date,'est',null);
 
   const dates=Object.keys(ev).filter(d=>!isNaN(+new Date(d+'T00:00:00')));
   if(!dates.length) return '';
@@ -2122,15 +3213,36 @@ function timelineHtml(s){
     else if(e.audio){cls='audio';title=`Audiobook${an} · ${fmtDate(d)}${rel(d,e)}`;}
     else{cls='est';title=`Estimated audiobook · likely ~${fmtDate(d)}`;}
     if(cls!=='est'&&isReleased(d)===false&&!(isTodayStr(d)&&isLive(d,e))) cls+=' future';   // hollow = still upcoming; confirmed-live today renders solid
-    return `<span class="mark ${cls}" style="left:${left.toFixed(1)}%" title="${esc(title)}"></span>`;
+    const mUrl=e.novel?storeLink(s,e.nN,'novel'):(e.audio?storeLink(s,e.aN,'audio'):null);
+    const isEst=cls==='est';
+    const tip={sn:s.name||'',label:title,t:e.title||null,cover:e.cover||s.cover_url||null,
+      cover2:(e.cover&&s.cover_url&&e.cover!==s.cover_url)?s.cover_url:null,
+      narr:e.narr||null,nN:e.nN??null,aN:e.aN??null,est:isEst,
+      estN:isEst?(s.predicted_book_n??null):null,
+      estWhy:isEst?(s.predicted_queued
+        ? (s.predicted_after_n!=null?`queued behind book ${s.predicted_after_n}'s audiobook, at this series' usual pace`:'next in this series’ audio queue')
+        : 'projected from this series’ past novel→audio gaps'):null};
+    const attrs=`class="mark ${cls}" style="left:${left.toFixed(1)}%" aria-label="${esc(title)}" data-tip="${attrEsc(JSON.stringify(tip))}"`;
+    return mUrl?`<a ${attrs} href="${esc(mUrl)}" target="_blank" rel="noopener"></a>`:`<span ${attrs}></span>`;
   }).join('');
   // "today" line: only when it falls within the span, so past sits left / upcoming right
   const now=Date.now();let today='';
   if(dates.length>1&&now>=min&&now<=max){const tl=((now-min)/span*100);today=`<span class="tl-today" style="left:${tl.toFixed(1)}%" title="today"></span>`;}
   const lbl=s.avg_gap_label?`avg gap ${s.avg_gap_label}`:(dates.length>1?'releases':'release');
+  // pin the latest (rightmost) date under its mark, always visible
+  let endLbl='';
+  {
+    const lastD=dates.find(d=>(+new Date(d+'T00:00:00'))===max);
+    if(lastD){
+      const e=ev[lastD]||{};
+      const isEst=!e.novel&&!e.audio;
+      const left=dates.length===1?50:100;
+      endLbl=`<span class="tl-end" style="left:${left}%;transform:translateX(-50%)">${isEst?'~':''}${esc(fmtDate(lastD))}</span>`;
+    }
+  }
   return `<div class="timeline"><div class="tl-row">
       <span class="gaplabel">${lbl}</span>
-      <span class="track">${today}${marks}</span>
+      <span class="track">${today}${marks}${endLbl}</span>
     </div></div>`;
 }
 
@@ -2152,7 +3264,7 @@ function sortedSeries(){
   else if(mode==='next') arr.sort((a,b)=>{
     const x=a.next_date||'9999',y=b.next_date||'9999';return x<y?-1:x>y?1:0;});
   else if(mode==='status'){const rank={announced:0,none:1,unknown:1,released:2};
-    arr.sort((a,b)=>(rank[a.audiobook_status]??1)-(rank[b.audiobook_status]??1));}
+    arr.sort((a,b)=>(rank[a.status_class||a.audiobook_status]??1)-(rank[b.status_class||b.audiobook_status]??1));}
   return arr; // 'manual' keeps stored order
 }
 
@@ -2176,8 +3288,20 @@ function renderGrid(){
         predict=`<div class="predict">Likely next novel <span class="mono">~ ${fmtDate(s.predicted_novel_date)}</span> · ${s.novel_history_count} past gap${s.novel_history_count===1?'':'s'} (${s.avg_novel_gap_label})${confChip(s.predicted_novel_confidence)}</div>`;
       }
     }else{
-      if((st==='none'||st==='unknown')&&s.predicted_date){
-        predict=`<div class="predict">Likely audiobook <span class="mono">~ ${fmtDate(s.predicted_date)}</span> · ${s.history_count} past gap${s.history_count===1?'':'s'} (${s.avg_gap_label})${confChip(s.predicted_confidence)}</div>`;
+      if(st==='none'||st==='unknown'){
+        // Confirmed dates and overdue counts both live in the Audiobook column
+        // now, so this line carries only a genuine forward-looking forecast. A
+        // lapsed projection says nothing here — it's the column's red count and
+        // the Overdue panel that report it.
+        if(s.predicted_date&&isReleased(s.predicted_date)===false){
+          const bk=s.predicted_book_n!=null?` book ${s.predicted_book_n}`:'';
+          // say what the guess is built on: the audio queue when a confirmed date
+          // ahead of it sets the pace, the novel→audio gap history otherwise
+          const basis=s.predicted_queued
+            ? (s.predicted_after_n!=null?`queued after book ${s.predicted_after_n}'s audio`:'next in the audio queue')
+            : `${s.history_count} past gap${s.history_count===1?'':'s'} (${s.avg_gap_label})`;
+          predict=`<div class="predict">Likely audiobook${bk} <span class="mono">~ ${fmtDate(s.predicted_date)}</span> · ${basis}${confChip(s.predicted_confidence)}</div>`;
+        }
       }
     }
     const err=s.fetch_error?`<div class="err">⚠ ${esc(s.fetch_error)}</div>`:'';
@@ -2186,18 +3310,20 @@ function renderGrid(){
     const cover=s.cover_url
       ? `<img class="cover" src="${esc(s.cover_url)}" alt="" onerror="this.outerHTML='<div class=&quot;cover ph&quot;>${esc(initials(s.name))}</div>'">`
       : `<div class="cover ph">${esc(initials(s.name))}</div>`;
+    const bookUrl=storeLink(s,(latestEntry(s)||{}).n!=null?(latestEntry(s)||{}).n:s.novel_n,'novel');
     card.innerHTML=`
       ${manual?'<div class="grip" title="Drag to reorder">⋮⋮</div>':''}
-      ${cover}
+      ${wrapLink(cover,bookUrl,'Open on Amazon')}
       <div class="cmain">
-        <h3>${esc(s.name)}</h3>
-        <div class="byline">${s.author?esc(s.author):'<span style="color:var(--faint)">unknown author</span>'}${s.novel_title?' · '+esc(s.novel_title):''}</div>
+        ${wrapLink(`<h3>${esc(s.name)}</h3>`,bookUrl,'Open the latest book on Amazon')}
+        <div class="byline">${s.author?wrapLink(esc(s.author),authorLink(s),'Search this author on Amazon'):'<span style="color:var(--faint)">unknown author</span>'}${s.novel_title?' · '+wrapLink(esc(s.novel_title),bookUrl):''}</div>
         <div class="facts">
-          <div class="fact"><div class="k">Novel</div><div class="v">${fmtDate(s.novel_date)}${dateTag(s.novel_date,(latestEntry(s)||{}).novel_pre===false)}</div></div>
-          <div class="fact"><div class="k">Audiobook</div><div class="v">${st==='none'?'—':(fmtDate(s.audiobook_date)+dateTag(s.audiobook_date,(latestEntry(s)||{}).audio_pre===false))}</div></div>
+          <div class="fact"><div class="k">Novel</div><div class="v">${bkTag(s.novel_n)}${fmtDate(s.novel_date)}${dateTag(s.novel_date,(latestEntry(s)||{}).novel_pre===false)}</div></div>
+          <div class="fact"><div class="k">Audiobook</div><div class="v">${audioFact(s)}</div></div>
           <div class="fact"><div class="k">Avg gap</div><div class="v">${s.avg_gap_label||'—'}</div></div>
+          ${s.narrator?`<div class="fact"><div class="k">Narrator</div><div class="v">${esc(s.narrator)}</div></div>`:''}
         </div>
-        <span class="pill ${st}">${esc(s.status_label)}</span>
+        <span class="pill ${s.status_class||st}">${esc(s.status_label)}</span>
         ${predict}${chg}${err}
         ${timelineHtml(s)}
       </div>
@@ -2214,15 +3340,6 @@ function renderGrid(){
   grid.querySelectorAll('[data-check]').forEach(b=>b.onclick=()=>{
     const nm=(STATE.series.find(x=>x.id===b.dataset.check)||{}).name||'this series';
     askExtension('/api/ext/crawl-series','Checking \u201c'+nm+'\u201d',{id:b.dataset.check});
-  });
-  grid.querySelectorAll('[data-fetch]').forEach(b=>b.onclick=async()=>{
-    const before=(STATE.series.find(x=>x.id===b.dataset.fetch)||{}).last_change||null;
-    b.textContent='…';
-    const v=await api('/api/series/'+b.dataset.fetch+'/fetch',{method:'POST'});
-    if(v.fetch_error) toast('Couldn\'t reach a source — see the card');
-    else if(v.last_change && v.last_change!==before) toast('Update: '+v.last_change);
-    else toast('Checked — nothing new');
-    refresh();
   });
 }
 
@@ -2353,6 +3470,7 @@ async function loadDiscordSettings(){
     $('#discOnRelease').checked=!!s.discord_on_release;
     $('#discDaily').checked=!!s.discord_daily;
     $('#discDailyHour').value=(s.discord_daily_hour!=null?s.discord_daily_hour:9);
+    $('#discDigestDays').value=String(s.discord_digest_days||1);
   }catch(_){}
 }
 async function saveDiscord(){
@@ -2361,11 +3479,12 @@ async function saveDiscord(){
     discord_on_new:$('#discOnNew').checked,
     discord_on_release:$('#discOnRelease').checked,
     discord_daily:$('#discDaily').checked,
-    discord_daily_hour:parseInt($('#discDailyHour').value,10)
+    discord_daily_hour:parseInt($('#discDailyHour').value,10),
+    discord_digest_days:parseInt($('#discDigestDays').value,10)
   };
   try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch(_){}
 }
-['#discWebhook','#discOnNew','#discOnRelease','#discDaily','#discDailyHour'].forEach(sel=>{
+['#discWebhook','#discOnNew','#discOnRelease','#discDaily','#discDailyHour','#discDigestDays'].forEach(sel=>{
   const el=$(sel); if(el) el.addEventListener('change',saveDiscord);
 });
 const _discTest=$('#discTestBtn');

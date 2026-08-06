@@ -16,7 +16,7 @@ function send(type, extra) { return browser.runtime.sendMessage(Object.assign({ 
 function renderSeries(urls) {
   var box = $("series");
   var keys = Object.keys(urls || {});
-  if (!keys.length) { box.innerHTML = '<div class="empty">No pages registered yet. Open one Amazon/Audible page per series once — it crawls the rest.</div>'; return; }
+  if (!keys.length) { box.innerHTML = '<div class="empty">No pages registered yet. Open one Amazon page per series once — it crawls the rest.</div>'; return; }
   var by = {};
   keys.forEach(function (k) {
     var u = urls[k]; var name = u.series || "(unknown)";

@@ -3,12 +3,16 @@ Release Radar — Firefox extension
 
 What it does
 ------------
-- When you open an Amazon/Audible book or audiobook page, it reads the release
+- When you open an Amazon book or audiobook page, it reads the release
   date and sends it to your Release Radar app (a small panel confirms it).
-- In the background, on a schedule (about twice a day), it re-checks every page
-  you've opened at least once — with NO tabs open and nothing for you to do. It
-  fetches those pages using your own logged-in Firefox session, so it sees the
-  same real page you would.
+- In the background, on a schedule, it re-checks pages using your own logged-in
+  Firefox session — NO tabs open, nothing for you to do:
+    * once a day it re-reads every book that hasn't fully released yet
+    * a book whose novel AND audiobook are both out is never read again
+    * the ONLY thing that runs more often than daily is the release-day watcher,
+      and it is deliberately narrow: on the day a book is due it re-checks that
+      one page hourly until the page reads as buyable, then stops for the rest of
+      the day. No book due today means it makes no requests at all.
 - You "register" a page just by visiting it once. After that it's automatic.
 - Click the toolbar button any time to force a check of everything now.
 
@@ -39,7 +43,7 @@ B) Temporary (works on any Firefox, but is removed when you restart the browser)
 After installing
 ----------------
 1. Make sure the Release Radar app is running.
-2. Open the Amazon/Audible pages for the books you track (your tab folder is
+2. Open the Amazon pages for the books you track (your tab folder is
    perfect). Each shows a confirmation panel and is now registered.
 3. You can close the tabs. The extension will re-check those pages on its own
    from then on.
