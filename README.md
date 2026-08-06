@@ -16,8 +16,10 @@ Everything comes from **the actual Amazon product pages**, read by the
 included Firefox extension through your own logged-in browser session. There is
 no external book database, no API key, and nothing to sign up for.
 
-1. Run the app (below).
-2. Install the extension (`release-radar-firefox/`, see INSTALL.txt).
+1. Run the app — download it from
+   [Releases](https://github.com/CosmicElectron/Audiobook-Radar/releases/latest).
+2. Install the extension (the `.xpi` from the same release; details in
+   `release-radar-firefox/INSTALL.txt`).
 3. Open one Amazon page for a series you follow.
 
 That's the whole setup. The extension reads the page, sends the series name, book
@@ -29,7 +31,24 @@ field is editable, including each row of the release timeline. Your edits are
 kept: later reads fill in blanks and add new books, but never overwrite a value
 you typed.
 
-## Quick start
+## Download
+
+Grab the latest build from the
+**[Releases page](https://github.com/CosmicElectron/Audiobook-Radar/releases/latest)**.
+Each release ships two files:
+
+| File | What it is |
+| --- | --- |
+| `ReleaseRadar.exe` | The app itself. No installer, no Python needed — double-click it and it runs from the system tray. |
+| `release-radar-firefox.xpi` | The Firefox extension that reads the Amazon pages. Install it via `about:addons` → gear icon → **Install Add-on From File**. |
+
+Already have it? Install the new `.xpi` straight over the top — your registered
+pages and settings are kept. Don't remove the old one first, or the extension
+forgets which pages it was watching.
+
+## Running from source instead
+
+If you'd rather not use the prebuilt exe:
 
 1. Install Python 3.9+ from https://www.python.org/downloads/ (tick *"Add
    Python to PATH"*).
@@ -38,12 +57,10 @@ you typed.
 It installs the dependencies the first time, then serves
 `http://127.0.0.1:8765/`. Close the console window to stop it.
 
-### Build a standalone .exe
-
-Double-click **build.bat**; the result is **dist\ReleaseRadar.exe**, a single
-double-clickable program with no console window that sits in the system tray.
-(It has to be built on Windows, which is why this ships as source plus a build
-script rather than a prebuilt binary.)
+To build your own exe, double-click **build.bat**; the result is
+**dist\ReleaseRadar.exe**. It has to be built on Windows, which is why the
+repository holds source plus a build script and the binaries live on the
+Releases page.
 
 ## Quitting
 
@@ -144,9 +161,13 @@ For Firefox and its forks (LibreWolf, Waterfox, Mullvad). It does two things:
   re-reads that one page hourly until the page reads as buyable, then stops.
   With nothing due today it makes no requests at all.
 
-Install steps are in `release-radar-firefox/INSTALL.txt`. Forks generally allow
-the unsigned `.xpi`; otherwise load it temporarily from `about:debugging`. After
-editing the extension, repackage it with `python pack_extension.py`.
+Download the `.xpi` from
+[Releases](https://github.com/CosmicElectron/Audiobook-Radar/releases/latest)
+and install it via `about:addons` → gear → **Install Add-on From File**. Full
+steps are in `release-radar-firefox/INSTALL.txt`. Forks generally allow the
+unsigned `.xpi`; otherwise load it temporarily from `about:debugging`. If you
+edit the extension source yourself, repackage it with
+`python pack_extension.py`.
 
 Because it uses your own session at a low frequency, background reads look like
 normal browsing rather than scraping. If Amazon returns a sign-in or robot page
