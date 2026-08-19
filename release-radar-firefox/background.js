@@ -61,16 +61,31 @@ var _pending = { refresh: false, release: false, crawl: false };
 // bail out, so freeing the lock cannot leave two unpaced loops fetching at once.
 var _gen = 0;
 function acquire() { if (_busy) return false; _busy = true; return true; }
-function release() {
+// Pass the generation captured at acquire() time. A loop cancelled by Reset must
+// NOT clear _busy on its way out: Reset already freed the lock, so a new job may
+// legitimately hold it and releasing here would let a second loop start.
+function release(gen) {
+  if (gen !== undefined && gen !== _gen) return;
   _busy = false;
   setTimeout(drainPending, 0);      // async so it never re-enters a finally block
 }
-function drainPending() {
-  if (_busy) return;
-  if (_seedQueue.length) { runSeedWorker(); return; }
-  if (_pending.release) { _pending.release = false; checkReleasingToday(); return; }
-  if (_pending.refresh) { _pending.refresh = false; refreshKnown(true); return; }
-  if (_pending.crawl) { _pending.crawl = false; recrawlAll(false); return; }
+// Drain everything that queued up while the lock was held. This must keep going
+// rather than dispatch one item: a deferred job can decline to run (the release
+// watch returns early when nothing is due), and stopping there would strand the
+// rest — a deferred "Crawl all" would simply never happen.
+var _draining = false;
+async function drainPending() {
+  if (_draining) return;
+  _draining = true;
+  try {
+    for (var guard = 0; guard < 8 && !_busy; guard++) {
+      if (_seedQueue.length) { await runSeedWorker(); continue; }
+      if (_pending.release) { _pending.release = false; await checkReleasingToday(); continue; }
+      if (_pending.refresh) { _pending.refresh = false; await refreshKnown(true); continue; }
+      if (_pending.crawl) { _pending.crawl = false; await recrawlAll(false); continue; }
+      break;
+    }
+  } finally { _draining = false; }
 }
 
 // ---- log ----
@@ -241,10 +256,11 @@ async function readPage(url, force, seriesHint, opts) {
 }
 
 async function crawlSeries(seedUrl, visited, urls, idx, force, bad) {
+  var gen = _gen;
   visited = visited || {}; urls = urls || {}; idx = idx || {}; bad = bad || {};
   var origin = originOf(seedUrl), queue = [seedUrl], local = 0, first = true, skippedBad = 0, skippedToday = 0;
   var seriesHint = (urls[seedUrl] && urls[seedUrl].series) || "";
-  while (queue.length && local < CRAWL_CAP) {
+  while (queue.length && local < CRAWL_CAP && gen === _gen) {
     var url = queue.shift(), a = asinOf(url);
     if (a) { if (visited[a]) continue; visited[a] = 1; }
     if (!first && !force && nodeSettled(url, urls, idx)) { logLine("SKIP settled  " + shortUrl(url)); continue; }
@@ -288,7 +304,7 @@ async function runSeedWorker() {
       var o = await browser.storage.local.get("urls"); var urls = o.urls || {}; var idx = settledIndex(urls);
       await crawlSeries(url, visited, urls, idx, false, bad);
     }
-  } finally { endP(); release(); }
+  } finally { endP(); release(gen); }
   logLine("crawl worker finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   try { await browser.storage.local.set({ lastCrawl: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
   // no self-restart here: release() already scheduled drainPending(), which picks
@@ -312,7 +328,7 @@ async function refreshKnown(force) {
       // honour the same cooldowns the other paths do — this is the highest
       // frequency path, so it must not be the one that hammers a dead page
       if (u.asin && isBad(u.asin, bad)) { skippedBad++; return false; }
-      if (readToday(u)) { skippedToday++; return false; }
+      if (!force && readToday(u)) { skippedToday++; return false; }
       return true;
     });
     P.total = list.length; saveP();
@@ -320,7 +336,7 @@ async function refreshKnown(force) {
             (skippedToday ? (", " + skippedToday + " already read today") : "") +
             (skippedBad ? (", " + skippedBad + " on the needs-a-check list") : ""));
     for (var i = 0; i < list.length && gen === _gen; i++) { await readPage(list[i], false, (urls[list[i]] || {}).series || ""); await sleep(MIN_GAP + Math.random() * JITTER); }
-  } finally { endP(); release(); }
+  } finally { endP(); release(gen); }
   logLine("refresh finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   try { await browser.storage.local.set({ lastRefresh: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
   return { checked: P.checked, sent: P.sent, failed: P.failed };
@@ -328,13 +344,14 @@ async function refreshKnown(force) {
 
 // inner re-crawl (assumes lock held + startP already called)
 async function _recrawlInner(force) {
+  var gen = _gen;
   var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
   var idx = settledIndex(urls);
   var seeds = {};
   Object.keys(urls).forEach(function (k) { var u = urls[k], s = u.series || ""; if (!seeds[s] || (u.n || 0) > (seeds[s].n || 0)) seeds[s] = { url: k, n: u.n || 0 }; });
   var visited = {}, names = Object.keys(seeds), bad = await loadBad();
   logLine((force ? "re-acquire (full): " : "re-crawl: ") + names.length + " series, " + Object.keys(urls).length + " known pages");
-  for (var i = 0; i < names.length; i++) {
+  for (var i = 0; i < names.length && gen === _gen; i++) {
     var su = seeds[names[i]].url, a = asinOf(su);
     if (a && visited[a]) continue;
     logLine("series seed [" + (i + 1) + "/" + names.length + "] " + (names[i] || "?") + "  " + shortUrl(su));
@@ -347,7 +364,7 @@ async function _recrawlInner(force) {
   });
   if (leftover.length) {
     logLine("safety net: " + leftover.length + " known page(s) not reached via carousels; fetching directly");
-    for (var j = 0; j < leftover.length; j++) { var lu = leftover[j]; await readPage(lu, force); var la = asinOf(lu); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
+    for (var j = 0; j < leftover.length && gen === _gen; j++) { var lu = leftover[j]; await readPage(lu, force); var la = asinOf(lu); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
   }
 }
 
@@ -382,7 +399,7 @@ async function checkReleasingToday() {
       await readPage(k, true, (u && u.series) || "");
       await sleep(MIN_GAP + Math.random() * JITTER);
     }
-  } finally { endP(); release(); }
+  } finally { endP(); release(gen); }
   logLine("release watch done: fetched " + P.checked + ", sent " + P.sent);
 }
 
@@ -392,7 +409,7 @@ async function recrawlAll(force, auto) {
   }
   if (!acquire()) { _pending.crawl = true; logLine("re-crawl deferred (worker busy)"); return { busy: true }; }
   startP("crawl", 0);
-  try { await _recrawlInner(force); } finally { endP(); release(); }
+  try { await _recrawlInner(force); } finally { endP(); release(gen); }
   logLine("finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : "") + "  (" + Math.round((Date.now() - (P.startedAt || Date.now())) / 1000) + "s)");
   try { await browser.storage.local.set({ lastCrawl: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
   return { checked: P.checked, sent: P.sent, failed: P.failed };
@@ -424,7 +441,7 @@ async function crawlOneSeries(name, asins) {
       if (!mine) return false; var x = asinOf(k); if (!x || visited[x]) return false; return !pageIsSettled(u, idx);
     });
     for (var j = 0; j < leftover.length; j++) { await readPage(leftover[j], false, name || ""); var la = asinOf(leftover[j]); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
-  } finally { endP(); release(); }
+  } finally { endP(); release(gen); }
   logLine("check finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   return { checked: P.checked, sent: P.sent, failed: P.failed };
 }
@@ -436,17 +453,18 @@ async function coverFill(list) {
   list = list || [];
   if (!list.length) return { ok: true, checked: 0 };
   if (!acquire()) { logLine("cover backfill skipped (worker busy, will retry on next poll)"); return { busy: true }; }
+  var gen = _gen;
   startP("refresh", list.length);
   try {
     logLine("cover/narrator backfill: " + list.length + " page(s)");
     var bad = await loadBad();
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < list.length && gen === _gen; i++) {
       var a = asinOf(list[i]);
       if (a && isBad(a, bad)) { logLine("  skip (known-bad) " + shortUrl(list[i])); continue; }
       await readPage(list[i], true, "", { backfill: true });
       await sleep(MIN_GAP + Math.random() * JITTER);
     }
-  } finally { endP(); release(); }
+  } finally { endP(); release(gen); }
   logLine("backfill finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   return { checked: P.checked, sent: P.sent, failed: P.failed };
 }

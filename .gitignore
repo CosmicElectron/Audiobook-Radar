@@ -28,3 +28,6 @@ package-lock.json
 # --- OS cruft ---
 .DS_Store
 Thumbs.db
+
+# extension test: html5lib parse cache of the fixture pages
+release-radar-firefox/test/.fixture-cache/

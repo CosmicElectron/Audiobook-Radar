@@ -5,8 +5,12 @@ series you follow. It runs locally, shows a dashboard in your browser, predicts
 when an unannounced audiobook is likely to land, and publishes an RSS feed and a
 calendar feed of what's coming.
 
-There is **no cloud, no account, nothing leaves your machine** — the app itself
-makes no outbound calls except to Discord, if you set up a webhook.
+There is **no cloud and no account**. Your library, dates and settings live in
+a JSON file on your machine and are never uploaded. The app itself reaches the
+network in only two places: it fetches book cover images (to show them, and to
+spot publishers' "cover to be revealed" placeholders), and it posts to your
+Discord webhook if you set one up. Everything else — reading Amazon pages —
+happens in your own browser, through the extension.
 
 ---
 
@@ -157,9 +161,10 @@ For Firefox and its forks (LibreWolf, Waterfox, Mullvad). It does two things:
 - **On a schedule, with no tabs open**, it re-reads pages through your own
   logged-in session: once a day for every book that hasn't fully released, and
   never again once a book's novel and audiobook are both out. The only thing
-  that runs more often is the release-day watcher — on the day a book is due it
-  re-reads that one page hourly until the page reads as buyable, then stops.
-  With nothing due today it makes no requests at all.
+  that runs more often is the release-day watcher — from the day a book is due
+  until 2 days after, it re-reads that one page hourly until the page reads as
+  buyable, then stops for good. With nothing outstanding it makes no requests
+  at all.
 
 Download the `.xpi` from
 [Releases](https://github.com/CosmicElectron/Audiobook-Radar/releases/latest)

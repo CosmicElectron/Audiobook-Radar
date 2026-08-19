@@ -10,9 +10,9 @@ What it does
     * once a day it re-reads every book that hasn't fully released yet
     * a book whose novel AND audiobook are both out is never read again
     * the ONLY thing that runs more often than daily is the release-day watcher,
-      and it is deliberately narrow: on the day a book is due it re-checks that
-      one page hourly until the page reads as buyable, then stops for the rest of
-      the day. No book due today means it makes no requests at all.
+      and it is deliberately narrow: from the day a book is due until 2 days
+      after, it re-checks that one page hourly until the page reads as buyable,
+      then stops for good. Nothing outstanding means no requests at all.
 - You "register" a page just by visiting it once. After that it's automatic.
 - Click the toolbar button any time to force a check of everything now.
 

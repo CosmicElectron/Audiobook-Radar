@@ -797,9 +797,23 @@ def series_view(s):
     # card should wear — pill + counts say "Audio pre-order" instead of "No
     # audiobook yet". The raw status is kept untouched (edit modal, ingest).
     t = today()
-    has_future_audio = any(
-        (lambda d: d and d >= t)(parse_date(e.get("audiobook")))
-        for e in s.get("timeline", []))
+    # An audiobook for ANY book is "pre-order" only while it is genuinely ahead of
+    # us. A date that is today-or-earlier is out — and on release day itself the
+    # store's own confirmation (audio_pre == False, set when the page reads as
+    # buyable) must win over the calendar, otherwise the pill still says
+    # "pre-order" on a book the Audiobook column is already calling OUT NOW.
+    def _pending(e):
+        d = parse_date(e.get("audiobook"))
+        if not d:
+            return False
+        if e.get("audio_pre") is False:      # confirmed buyable by the store
+            return False
+        if d > t:
+            return True                      # strictly ahead of today
+        # dated today and not yet confirmed: still a pre-order until the store
+        # says otherwise (US-midnight releases land mid-afternoon here)
+        return d == t and e.get("audio_pre") is True
+    has_future_audio = any(_pending(e) for e in s.get("timeline", []))
     if status in ("none", "unknown") and has_future_audio:
         status_class, status_label = "announced", "Audio pre-order"
     else:
@@ -978,6 +992,12 @@ def upcoming_of_kind(kind, include_estimates):
                     "confidence": None,
                     "countdown_days": (d - t).days,
                     "cover": e.get("cover") or s.get("cover_url") or None,
+                    # release-day support: is it confirmed live, and at what
+                    # local hour is it expected to go live if not yet
+                    "live": (e.get("audio_pre" if kind == "audiobook" else "novel_pre") is False),
+                    "live_at": e.get("audio_live_at" if kind == "audiobook" else "novel_live_at"),
+                    "expected_hour": expected_release_hour(s, kind)[0],
+                    "expected_hour_basis": expected_release_hour(s, kind)[1],
                 })
             if not include_estimates:
                 continue
@@ -1037,6 +1057,56 @@ def upcoming_of_kind(kind, include_estimates):
             })
     rows.sort(key=lambda r: (r["date"], r["estimate"]))
     return rows
+
+
+DEFAULT_RELEASE_HOUR = 14.0    # Amazon US midnight Eastern == 2pm AWST; the
+                               # global fallback until a series has its own data
+
+
+def _flip_hours(series_list, kind=None):
+    """Local clock hours (float) at which releases were first seen buyable."""
+    out = []
+    for s in series_list:
+        for e in s.get("timeline", []):
+            for key in (("audio_live_at",) if kind == "audiobook" else
+                        ("novel_live_at",) if kind == "novel" else
+                        ("audio_live_at", "novel_live_at")):
+                v = e.get(key)
+                if not v:
+                    continue
+                try:
+                    t = datetime.fromisoformat(v)
+                    out.append(t.hour + t.minute / 60.0)
+                except ValueError:
+                    pass
+    return out
+
+
+def _circular_mean_hour(hours):
+    """Average of clock hours that wraps correctly at midnight."""
+    import math
+    if not hours:
+        return None
+    x = sum(math.cos(h / 24.0 * 2 * math.pi) for h in hours)
+    y = sum(math.sin(h / 24.0 * 2 * math.pi) for h in hours)
+    ang = math.atan2(y, x)
+    if ang < 0:
+        ang += 2 * math.pi
+    return round(ang / (2 * math.pi) * 24.0, 2)
+
+
+def expected_release_hour(series, kind=None):
+    """(hour, basis): the local hour a release is expected to go live.
+    basis = 'series' (this series' own confirmed flips), 'global' (every
+    series' flips), or 'default' (nothing learned yet)."""
+    own = _flip_hours([series], kind)
+    if own:
+        return _circular_mean_hour(own), "series"
+    with _lock:
+        everyone = _flip_hours(_state.get("series", []), kind)
+    if everyone:
+        return _circular_mean_hour(everyone), "global"
+    return DEFAULT_RELEASE_HOUR, "default"
 
 
 def overdue_audiobooks():
@@ -1575,6 +1645,7 @@ def _cover_is_placeholder(url):
     return verdict
 
 
+RELEASE_PING_GRACE_DAYS = 3   # 'out now' may fire this many days after the date
 COVERFILL_CAP = 20        # backfill page-reads per round; the extension paces them
 COVERFILL_EVERY_HOURS = 24  # cover art is cosmetic — trickle it, don't hammer
 COVERFILL_MAX_TRIES = 3   # after this many reads with no yield, the page simply
@@ -1893,14 +1964,64 @@ def build_ics():
 
 app = Flask(__name__)
 
+# Read-only surfaces intended to be embedded elsewhere (a new-tab widget, a feed
+# reader, a calendar app). None of them expose a credential.
+PUBLIC_READ_PATHS = {"/api/state", "/feed.xml", "/calendar.ics", "/board"}
+
+
+def _origin_kind(origin):
+    """Classify a request's Origin: none | local | extension | web."""
+    if not origin:
+        return "none"                      # direct fetch, the extension, curl
+    try:
+        u = urlparse(origin)
+    except Exception:
+        return "web"
+    if u.scheme in ("moz-extension", "chrome-extension", "safari-web-extension"):
+        return "extension"
+    if u.hostname in ("127.0.0.1", "localhost", "::1"):
+        return "local"
+    return "web"                           # a real website — treat as hostile
+
+
+@app.before_request
+def _refuse_cross_site_writes():
+    """A foreign page must not be able to change anything here. Reads are handled
+    by the CORS rules; this closes the write side, which CORS alone does not
+    (a cross-site POST is sent and executed even when the reply is unreadable)."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if _origin_kind(request.headers.get("Origin")) == "web":
+        add_log(f"refused a cross-site {request.method} to {request.path}")
+        return jsonify({"error": "cross-site request refused"}), 403
+    return None
+
 
 @app.after_request
 def allow_cors(resp):
-    # This is a personal, localhost-only app. Allow any local page (e.g. a
-    # custom new-tab extension) to read the feed and state.
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    """Cross-origin rules.
+
+    This used to answer every request with `Access-Control-Allow-Origin: *`,
+    which meant ANY page you happened to visit could read http://127.0.0.1:8477
+    — including /api/settings, which hands back the Discord webhook — and could
+    POST to /api/series/clear or /api/quit to wipe the library or kill the app.
+    Firefox does not block private-network requests, so that was live.
+
+    Now: the browser extension and pages served from this app get full access;
+    the handful of read-only surfaces meant for embedding stay public because
+    they carry no credentials; everything else answers with no CORS header at
+    all, so a foreign page cannot read the response."""
+    origin = request.headers.get("Origin")
+    kind = _origin_kind(origin)
+    if kind in ("extension", "local"):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    elif request.path in PUBLIC_READ_PATHS:
+        # the new-tab widget may run from an opaque origin; none of these
+        # responses contain a secret
+        resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
 
@@ -1917,6 +2038,12 @@ FAVICON_SVG = (
     "<circle cx='32' cy='32' r='4.5' fill='#e7b14c'/>"
     "</svg>"
 )
+
+
+@app.get("/api/instance")
+def api_instance():
+    """Identity marker so a second launch can tell this port is already us."""
+    return jsonify({"app": "release-radar", "pid": os.getpid()})
 
 
 @app.get("/favicon.svg")
@@ -2125,6 +2252,14 @@ def api_ingest():
         # Pre-order → live tracking. The page reports one kind per read; remember its
         # pre-order state so the moment it flips to buyable we can say "out now".
         pre = body.get("_preorder", None)          # true / false / null(unknown)
+        # A null pre-order reading on a page dated today or later means the
+        # extension could not classify the buy box — the one thing the release
+        # watcher depends on. Log what it saw so this is diagnosable from the
+        # app's activity log without opening the browser.
+        if pre is None and body.get("_diag") and (ad or nd):
+            _dd = parse_date(ad or nd)
+            if _dd and _dd >= today() - timedelta(days=3):
+                add_log(f"buy box unreadable for {series} book {n}: {json.dumps(body.get('_diag'))[:400]}")
         released_msgs = []
         narrator_msgs = []
         if pre is not None:
@@ -2132,15 +2267,29 @@ def api_ingest():
             kind = "audiobook" if ad else "novel"
             old_pre = ent.get(kind_key)
             ent[kind_key] = bool(pre)
+            # Remember WHEN the store first showed it buyable. Publishers release
+            # at a consistent local hour (Amazon US = 2pm here), and that hour is
+            # what a release-day countdown should aim at — learned per series.
+            live_key = "audio_live_at" if ad else "novel_live_at"
+            if pre is False and old_pre is not False and not ent.get(live_key):
+                ent[live_key] = datetime.now().isoformat(timespec="seconds")
             d_now = ad if ad else nd
             dd = parse_date(d_now) if d_now else None
             fire = False
             if pre is False and dd:
                 if old_pre is True and dd <= today():
                     fire = True          # we watched it flip from pre-order to buyable
-                elif dd == today():
-                    fire = True          # buyable on its release day IS the release,
-                                         # even if we never saw its pre-order state
+                elif 0 <= (today() - dd).days <= RELEASE_PING_GRACE_DAYS:
+                    # Buyable on (or just after) its release day IS the release, even
+                    # if we never saw its pre-order state. The grace window matters:
+                    # the extension's release watch keeps reading a page for a few
+                    # days after its date precisely because a page can go buyable
+                    # after local midnight, or the first successful read can land a
+                    # day late (browser closed, a detector fix installed the next
+                    # morning). A same-day-only test would confirm the release and
+                    # then say nothing about it. Backfill of old catalogue stays
+                    # silent: anything older than the window never fires.
+                    fire = True
             if fire:
                 key = f"release:{s['id']}:{n}:{kind}:{d_now}"
                 notified = set(_state.get("discord_notified", []))
@@ -2659,6 +2808,15 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 .up .count{font-family:var(--mono);font-size:30px;font-weight:600;line-height:1}
 .up.soonest .count{color:var(--amber)}
 .up .count small{font-size:13px;color:var(--muted);font-weight:400;margin-left:6px;font-family:var(--sans)}
+/* release day: a ticking timer replaces the day count */
+.up .count.tick{font-size:22px;letter-spacing:.01em}
+.up .count.tick.countdown{color:var(--amber)}
+.up .count.tick.late{color:var(--rose)}
+.up.late{border-color:#5a3540;background:linear-gradient(180deg,#2b1d24,var(--card))}
+/* confirmed out: green */
+.up .count.rel{font-size:18px;letter-spacing:.08em;color:#56d18a}
+.up.released{border-color:#2c5a3f;background:linear-gradient(180deg,#16271d,var(--card))}
+.up.released .count small{color:#56d18a;opacity:.8}
 .up .t{font-family:var(--serif);font-size:17px;margin-top:10px;line-height:1.25}
 .up .d{color:var(--muted);font-size:12.5px;margin-top:4px}
 .kind{display:inline-block;font-size:10.5px;font-family:var(--mono);letter-spacing:.06em;text-transform:uppercase;
@@ -3010,7 +3168,7 @@ function authorLink(s){
   if(!s.store_host||!s.author) return null;
   return 'https://'+s.store_host+'/s?k='+encodeURIComponent(s.author);
 }
-function wrapLink(html,url,title){ return url?`<a class="plain" href="${esc(url)}" target="_blank" rel="noopener" ${title?`title="${esc(title)}"`:''}>${html}</a>`:html; }
+function wrapLink(html,url,title){ return url?`<a class="plain" href="${attrEsc(url)}" target="_blank" rel="noopener" ${title?`title="${attrEsc(title)}"`:''}>${html}</a>`:html; }
 function latestEntry(s){let best=null,bn=-1;(s.timeline||[]).forEach(e=>{const n=(e&&e.n!=null)?+e.n:NaN;if(!isNaN(n)&&n>bn){bn=n;best=e;}});return best;}
 function daysLate(iso){      // whole days since a date that has already passed
   const dt=new Date(iso+'T00:00:00');if(isNaN(dt))return 0;
@@ -3018,6 +3176,12 @@ function daysLate(iso){      // whole days since a date that has already passed
   return Math.max(0,Math.round((t-dt)/86400000));
 }
 function bkTag(n){ return n!=null?`<span class="bk">Book ${n}</span> `:''; }
+// novel_n tracks the highest book number, which can come from an audio-only
+// entry; the Novel column must name whichever book actually has this date.
+function novelBookN(s){
+  const hit=(s.timeline||[]).find(e=>e&&e.novel===s.novel_date&&e.n!=null);
+  return hit?hit.n:(s.novel_n??null);
+}
 function audioFact(s){
   // The Audiobook column tracks whatever we actually know, in order of strength:
   // the tracked book's own date, then a confirmed pre-order for an earlier book
@@ -3139,6 +3303,49 @@ function renderOverdue(){
   }).join('');
 }
 
+// ---- release-day timer ----
+// Target instant = release date at the hour this series usually goes live
+// (learned from past confirmed releases: its own, then everyone's, then 2pm).
+function releaseTarget(u){
+  const h=Number(u.expected_hour==null?14:u.expected_hour);
+  const d=new Date(u.date+'T00:00:00'); if(isNaN(d)) return null;
+  d.setHours(Math.floor(h),Math.round((h%1)*60),0,0);
+  return d.getTime();
+}
+function fmtDur(ms){
+  ms=Math.abs(ms); const s=Math.floor(ms/1000);
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
+  if(h>=48) return Math.floor(h/24)+'d '+(h%24)+'h';
+  return (h>0?h+'h ':'')+String(m).padStart(2,'0')+'m '+String(sec).padStart(2,'0')+'s';
+}
+function releaseState(u){
+  if(u.estimate) return {state:'plain'};
+  if(u.live){
+    let when='out now';
+    if(u.live_at){const t=new Date(u.live_at); if(!isNaN(t)) when='live since '+t.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});}
+    return {state:'released', when};
+  }
+  const target=releaseTarget(u); if(target==null) return {state:'plain'};
+  const now=Date.now();
+  if(u.countdown_days!==0 && now<target-36*3600*1000) return {state:'plain'};   // not release day yet
+  const basisWord={series:'this series usually goes live',global:'your series usually go live',default:'typical US release time'}[u.expected_hour_basis]||'expected';
+  const hh=new Date(target).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  if(now<target) return {state:'countdown', target, text:fmtDur(target-now), sub:'until ~'+hh, basis:basisWord};
+  return {state:'late', target, text:'−'+fmtDur(now-target), sub:'past ~'+hh+' · not yet seen live', basis:basisWord};
+}
+// keep every visible timer moving without re-rendering the whole hero
+setInterval(()=>{
+  document.querySelectorAll('.count.tick').forEach(el=>{
+    const target=+el.dataset.target; if(!target) return;
+    const now=Date.now(); const late=now>=target;
+    el.classList.toggle('countdown',!late); el.classList.toggle('late',late);
+    el.closest('.up')?.classList.toggle('late',late);
+    const small=el.querySelector('small'); const subTxt=small?small.textContent:'';
+    el.firstChild.nodeValue=(late?'−':'')+fmtDur(target-now);
+    if(late && small && !/past/.test(subTxt)) small.textContent=subTxt.replace(/^until/,'past')+' · not yet seen live';
+  });
+},1000);
+
 function renderHero(){
   const up=STATE.upcoming||[];
   const wrap=$('#heroWrap');const hero=$('#hero');
@@ -3170,7 +3377,19 @@ function renderHero(){
     const conf=u.estimate?confChip(u.confidence):'';
     const kindCls=u.kind==='novel'?'novel':'audio';
     const kindLbl=u.kind==='novel'?'Novel':'Audiobook';
-    el.innerHTML=`<div><div class="count">${u.countdown_days}<small>${u.countdown_days===1?'day':'days'}</small></div></div>
+    // Release day gets three states instead of a useless "0 days":
+    //   released  -> green RELEASED (the store confirmed it buyable)
+    //   before    -> live countdown to the hour this series usually goes live
+    //   after     -> red negative timer: it's late against that expected hour
+    const st=releaseState(u);
+    if(st.state==='released') el.classList.add('released');
+    else if(st.state==='late') el.classList.add('late');
+    let countHtml;
+    if(st.state==='released') countHtml=`<div class="count rel">RELEASED<small>${esc(st.when)}</small></div>`;
+    else if(st.state==='countdown'||st.state==='late')
+      countHtml=`<div class="count tick ${st.state}" data-target="${st.target}" data-basis="${esc(st.basis)}">${st.text}<small>${esc(st.sub)}</small></div>`;
+    else countHtml=`<div class="count">${u.countdown_days}<small>${u.countdown_days===1?'day':'days'}</small></div>`;
+    el.innerHTML=`<div>${countHtml}</div>
       <div><div class="t">${esc(u.title)}</div>
       <div class="d">${fmtDate(u.date)} · <span class="kind ${kindCls} ${u.estimate?'est':''}">${kindLbl}${u.estimate?' · est':''}</span>${conf}${note}</div></div>`;
     hero.appendChild(el);
@@ -3308,7 +3527,7 @@ function renderGrid(){
     const chgTime=s.last_change_at?` <span class="chg-time" title="${esc(new Date(s.last_change_at).toLocaleString())}">· ${timeAgo(s.last_change_at)}</span>`:'';
     const chg=s.last_change?`<div class="changed">● ${esc(s.last_change)}${chgTime}</div>`:'';
     const cover=s.cover_url
-      ? `<img class="cover" src="${esc(s.cover_url)}" alt="" onerror="this.outerHTML='<div class=&quot;cover ph&quot;>${esc(initials(s.name))}</div>'">`
+      ? `<img class="cover" src="${attrEsc(s.cover_url)}" alt="" onerror="this.outerHTML='<div class=&quot;cover ph&quot;>${esc(initials(s.name))}</div>'">`
       : `<div class="cover ph">${esc(initials(s.name))}</div>`;
     const bookUrl=storeLink(s,(latestEntry(s)||{}).n!=null?(latestEntry(s)||{}).n:s.novel_n,'novel');
     card.innerHTML=`
@@ -3318,7 +3537,7 @@ function renderGrid(){
         ${wrapLink(`<h3>${esc(s.name)}</h3>`,bookUrl,'Open the latest book on Amazon')}
         <div class="byline">${s.author?wrapLink(esc(s.author),authorLink(s),'Search this author on Amazon'):'<span style="color:var(--faint)">unknown author</span>'}${s.novel_title?' · '+wrapLink(esc(s.novel_title),bookUrl):''}</div>
         <div class="facts">
-          <div class="fact"><div class="k">Novel</div><div class="v">${bkTag(s.novel_n)}${fmtDate(s.novel_date)}${dateTag(s.novel_date,(latestEntry(s)||{}).novel_pre===false)}</div></div>
+          <div class="fact"><div class="k">Novel</div><div class="v">${bkTag(novelBookN(s))}${fmtDate(s.novel_date)}${dateTag(s.novel_date,(latestEntry(s)||{}).novel_pre===false)}</div></div>
           <div class="fact"><div class="k">Audiobook</div><div class="v">${audioFact(s)}</div></div>
           <div class="fact"><div class="k">Avg gap</div><div class="v">${s.avg_gap_label||'—'}</div></div>
           ${s.narrator?`<div class="fact"><div class="k">Narrator</div><div class="v">${esc(s.narrator)}</div></div>`:''}
@@ -3637,11 +3856,36 @@ def run_in_tray(port, url):
         return False
 
 
+def _radar_already_on(port):
+    """True when another Release Radar instance already answers on this port."""
+    try:
+        req = Request(f"http://127.0.0.1:{port}/api/instance",
+                      headers={"User-Agent": APP_NAME})
+        with urlopen(req, timeout=2) as r:
+            return json.loads(r.read().decode("utf-8", "replace") or "{}").get("app") == "release-radar"
+    except Exception:
+        return False
+
+
 def main():
+    # SINGLE INSTANCE. Two copies sharing one data.json is corruption waiting to
+    # happen (each holds its own in-memory state and saves over the other's) and
+    # every timed job — the Discord digest included — fires once per copy. This
+    # happened: an instance from 11 Aug sat on port 8766 next to the real one and
+    # duplicated the digest daily. A second launch now just fronts the first.
+    preferred = int(os.environ.get("RADAR_PORT", DEFAULT_PORT))
+    if _radar_already_on(preferred):
+        print(f"{APP_NAME} is already running at http://127.0.0.1:{preferred}/ — opening it.")
+        try:
+            webbrowser.open(f"http://127.0.0.1:{preferred}/")
+        except Exception:
+            pass
+        return
+
     load_state()
     _ensure_line_files()
     _start_daily_digest()
-    port = pick_port(int(os.environ.get("RADAR_PORT", DEFAULT_PORT)))
+    port = pick_port(preferred)
     url = f"http://127.0.0.1:{port}/"
     add_log(f"{APP_NAME} started on {url}")
 

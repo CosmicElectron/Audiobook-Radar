@@ -21,6 +21,21 @@ _spec.loader.exec_module(radar)
 TODAY = date.today()
 
 
+@pytest.fixture(autouse=True)
+def never_touch_the_real_data_file(tmp_path, monkeypatch):
+    """Hard guarantee that no test can write the user's live library.
+
+    A test that exercises a persisting endpoint (/api/ingest, /api/settings, …)
+    calls save_state(), which writes DATA_FILE — the real
+    %APPDATA%\\ReleaseRadar\\data.json. One test that forgot to stub it
+    overwrote a 20-series library with its own fixture. Point every file path at
+    a temp directory for the whole suite; individual tests may still stub
+    save_state, but they no longer have to remember."""
+    monkeypatch.setattr(radar, "DATA_FILE", str(tmp_path / "data.json"))
+    monkeypatch.setattr(radar, "BACKUP_DIR", str(tmp_path / "backups"))
+    monkeypatch.setattr(radar, "_LINES_DIR", str(tmp_path / "digest_lines"))
+
+
 def d(days_from_today):
     return (TODAY + timedelta(days=days_from_today)).isoformat()
 
@@ -379,6 +394,25 @@ def test_status_class_reflects_earlier_preorder():
     assert v["audiobook_status"] == "none"          # raw stays raw
     assert v["status_class"] == "announced"
     assert v["status_label"] == "Audio pre-order"
+
+
+def test_pill_is_not_preorder_on_release_day_once_confirmed():
+    """Primal Hunter 19 Aug: book 15's audio dated TODAY and read as buyable,
+    tracked book 17 is a novel pre-order. The pill said 'Audio pre-order' while
+    the Audiobook column said OUT NOW. Today-and-confirmed is released."""
+    s = series([{"n": 15, "novel": d(-140), "audiobook": d(0), "audio_pre": False},
+                {"n": 17, "novel": d(+90), "audiobook": None, "novel_pre": True}])
+    v = radar.series_view(s)
+    assert v["status_label"] != "Audio pre-order"
+    assert v["status_class"] != "announced"
+    # ...but while the store still calls it a pre-order today, it IS one
+    s2 = series([{"n": 15, "novel": d(-140), "audiobook": d(0), "audio_pre": True},
+                 {"n": 17, "novel": d(+90), "audiobook": None}])
+    assert radar.series_view(s2)["status_label"] == "Audio pre-order"
+    # and a genuinely future date is a pre-order regardless
+    s3 = series([{"n": 15, "novel": d(-140), "audiobook": d(+6)},
+                 {"n": 17, "novel": d(+90), "audiobook": None}])
+    assert radar.series_view(s3)["status_label"] == "Audio pre-order"
 
 
 def test_status_class_plain_waiting():
@@ -766,6 +800,93 @@ def test_dashboard_script_parses():
         finally:
             if os.path.exists(p):
                 os.remove(p)
+
+
+def test_a_foreign_website_cannot_read_secrets_or_change_anything(monkeypatch):
+    """A page you happen to visit must not be able to read the Discord webhook
+    or wipe/kill the app. Firefox does not block private-network requests, so
+    blanket `Access-Control-Allow-Origin: *` made this live."""
+    # This test drives /api/ingest, which persists. Without these stubs it writes
+    # its synthetic state straight over the real %APPDATA% data.json — which is
+    # exactly what happened once. Never let a test touch the live data file.
+    monkeypatch.setattr(radar, "save_state", lambda: None)
+    monkeypatch.setattr(radar, "_backup_state", lambda: None)
+    monkeypatch.setattr(radar, "_discord_notify", lambda *a, **k: None)
+    radar._state = {"series": [], "log": [], "ext_commands": [], "cmd_seq": 0,
+                    "settings": {"discord_webhook": "https://discord.com/api/webhooks/SECRET"}}
+    c = radar.app.test_client()
+    evil = {"Origin": "https://evil.example"}
+
+    r = c.get("/api/settings", headers=evil)
+    assert r.headers.get("Access-Control-Allow-Origin") is None      # unreadable
+    for path in ("/api/series/clear", "/api/quit", "/api/settings"):
+        assert c.post(path, headers=evil, json={}).status_code == 403
+
+    # ...while the extension, the dashboard and embeddable read-only surfaces work
+    ext = {"Origin": "moz-extension://abc"}
+    assert c.get("/api/ext-commands", headers=ext).headers["Access-Control-Allow-Origin"] == "moz-extension://abc"
+    local = {"Origin": "http://127.0.0.1:8765"}
+    assert c.post("/api/settings", headers=local, json={"discord_daily": True}).status_code == 200
+    for path in ("/api/state", "/feed.xml", "/calendar.ics", "/board"):
+        assert c.get(path, headers=evil).headers.get("Access-Control-Allow-Origin") == "*"
+    # and a request with no Origin at all (the extension's background fetch)
+    assert c.post("/api/ingest", json={"series": "S", "book": {"n": 1, "novel_date": d(+5)}}).status_code == 200
+
+
+def test_instance_endpoint_identifies_the_app():
+    """A second launch decides whether to exit by asking /api/instance — the
+    marker must be present and unmistakable."""
+    radar._state = {"series": [], "log": [], "settings": {}, "ext_commands": [], "cmd_seq": 0}
+    r = radar.app.test_client().get("/api/instance")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["app"] == "release-radar" and isinstance(body["pid"], int)
+
+
+def _ingest_client(monkeypatch, series_list):
+    monkeypatch.setattr(radar, "save_state", lambda: None)
+    monkeypatch.setattr(radar, "add_log", lambda m: None)
+    sent = []
+    monkeypatch.setattr(radar, "_discord_notify", lambda text, *a, **k: sent.append(text))
+    radar._state = {"series": series_list, "log": [], "settings": {"discord_on_release": True},
+                    "ext_commands": [], "cmd_seq": 0, "discord_notified": []}
+    return radar.app.test_client(), sent
+
+
+def test_release_ping_fires_when_first_buyable_read_lands_a_day_late(monkeypatch):
+    """The Primal Hunter case: an audiobook dated yesterday whose pre-order state
+    was never captured (detector couldn't read audio buy boxes), first read as
+    buyable the day AFTER release. Same-day-only logic confirmed the release
+    and said nothing. It must ping."""
+    s = series([{"n": 15, "novel": d(-140), "audiobook": d(-1), "audio_pre": None}])
+    s["asins_audio"] = {"15": "B0AUDIO015"}
+    c, sent = _ingest_client(monkeypatch, [s])
+    r = c.post("/api/ingest", json={
+        "series": "Test", "book": {"n": 15, "title": "Test 15", "asin": "B0AUDIO015",
+                                   "audiobook_date": d(-1)},
+        "_preorder": False, "_asin": "B0AUDIO015", "_url": "https://www.amazon.com.au/dp/B0AUDIO015"})
+    assert r.get_json()["ok"]
+    assert len(sent) == 1 and "book 15" in sent[0].lower()   # wording is random; the ping is what matters
+    assert any("release:t1:15:audiobook" in k for k in radar._state["discord_notified"])
+    # and only once — a second identical read must not repeat it
+    c.post("/api/ingest", json={
+        "series": "Test", "book": {"n": 15, "title": "Test 15", "asin": "B0AUDIO015",
+                                   "audiobook_date": d(-1)},
+        "_preorder": False, "_asin": "B0AUDIO015", "_url": "https://www.amazon.com.au/dp/B0AUDIO015"})
+    assert len(sent) == 1
+
+
+def test_release_ping_stays_silent_for_old_catalogue(monkeypatch):
+    """Backfilling a book released months ago reads as buyable too — that must
+    NOT produce an 'out now' ping. The grace window is a few days, not forever."""
+    s = series([{"n": 3, "novel": d(-400), "audiobook": d(-200), "audio_pre": None}])
+    s["asins_audio"] = {"3": "B0AUDIO003"}
+    c, sent = _ingest_client(monkeypatch, [s])
+    c.post("/api/ingest", json={
+        "series": "Test", "book": {"n": 3, "title": "Test 3", "asin": "B0AUDIO003",
+                                   "audiobook_date": d(-200)},
+        "_preorder": False, "_asin": "B0AUDIO003", "_url": "https://www.amazon.com.au/dp/B0AUDIO003"})
+    assert sent == []
 
 
 # ------------------------------------------------------------------ backups

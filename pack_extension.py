@@ -18,12 +18,13 @@ OUT = os.path.join(HERE, "release-radar-firefox.xpi")
 # manifest.json first: Firefox reads it before anything else in the archive
 ORDER_FIRST = ["manifest.json"]
 SKIP = {".DS_Store", "Thumbs.db"}
+SKIP_DIRS = {"test"}          # dev-only; never shipped
 
 
 def files():
     found = []
     for root, dirs, names in os.walk(SRC):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
         for n in sorted(names):
             if n in SKIP:
                 continue
@@ -35,6 +36,20 @@ def files():
 
 
 def main():
+    # Refuse to package a detector that fails its own fixtures — a bad
+    # pre-order detector ships silently and only shows up as a missed release.
+    import shutil
+    import subprocess
+    # Two suites: synthetic shapes, and the REAL saved Amazon pages (the latter
+    # is what caught a hidden pre-order alert flipping every released novel).
+    for tname in ("test_extract.js", "test_fixtures.js"):
+        test = os.path.join(SRC, "test", tname)
+        if shutil.which("node") and os.path.exists(test):
+            r = subprocess.run(["node", test], capture_output=True, text=True)
+            if r.returncode != 0:
+                print(r.stdout)
+                raise SystemExit(f"{tname} FAILED — not packaging")
+            print(f"{tname}: pass")
     entries = files()
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
         for rel, full in entries:
