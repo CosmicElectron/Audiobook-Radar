@@ -1984,16 +1984,41 @@ def _origin_kind(origin):
     return "web"                           # a real website — treat as hostile
 
 
+def _is_remote():
+    """True when the request did NOT come from this machine - i.e. it arrived
+    through the Cloudflare tunnel (Cf-* headers) or was addressed to any host
+    other than loopback. The phone view is served this way."""
+    h = request.headers
+    if h.get("Cf-Connecting-Ip") or h.get("Cf-Ray") or h.get("X-Forwarded-For"):
+        return True
+    host = (request.host or "").strip().lower()
+    if host.startswith("["):                       # [::1]:8765
+        host = host[1:host.find("]")] if "]" in host else host
+    else:
+        host = host.split(":")[0]
+    return host not in ("127.0.0.1", "localhost", "::1", "")
+
+
 @app.before_request
 def _refuse_cross_site_writes():
-    """A foreign page must not be able to change anything here. Reads are handled
-    by the CORS rules; this closes the write side, which CORS alone does not
-    (a cross-site POST is sent and executed even when the reply is unreadable)."""
+    """Two gates.
+
+    1. A foreign web page must not be able to change anything here (cross-site
+       POSTs are sent and executed even when the reply is unreadable).
+    2. Anything reaching the app from OFF this machine - the Cloudflare tunnel
+       that serves the phone - is read-only. The tunnel hostname has no login
+       in front of it, so without this, anyone who learned the hostname could
+       post to /api/quit or /api/series/clear, and GET /api/settings handed out
+       the Discord webhook (it is masked for remote readers below)."""
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     if _origin_kind(request.headers.get("Origin")) == "web":
         add_log(f"refused a cross-site {request.method} to {request.path}")
         return jsonify({"error": "cross-site request refused"}), 403
+    if _is_remote():
+        add_log(f"refused a remote {request.method} to {request.path} "
+                f"(from {request.headers.get('Cf-Connecting-Ip') or request.remote_addr})")
+        return jsonify({"error": "read-only over the tunnel - make changes on the PC"}), 403
     return None
 
 
@@ -2022,6 +2047,10 @@ def allow_cors(resp):
         # the new-tab widget may run from an opaque origin; none of these
         # responses contain a secret
         resp.headers["Access-Control-Allow-Origin"] = "*"
+    # Never let Cloudflare (or a browser) cache API answers or the dashboard:
+    # the tunnel was found serving a 4-hour-old /api/settings from its edge.
+    if request.path == "/" or request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store, private"
     return resp
 
 
@@ -2503,10 +2532,15 @@ def api_fetch_url():
 @app.get("/api/settings")
 def api_get_settings():
     s = get_settings()
+    remote = _is_remote()
+    wh = s.get("discord_webhook", "")
     return jsonify({"show_estimates": s.get("show_estimates", True),
                     "show_estimates_novel": s.get("show_estimates_novel", True),
                     "upcoming_mode": s.get("upcoming_mode", "audiobook"),
-                    "discord_webhook": s.get("discord_webhook", ""),
+                    # the webhook is a credential: never hand it out over the tunnel
+                    "discord_webhook": ("" if remote else wh),
+                    "discord_webhook_set": bool(wh),
+                    "remote_readonly": remote,
                     "discord_on_new": s.get("discord_on_new", True),
                     "discord_on_release": s.get("discord_on_release", True),
                     "discord_daily": s.get("discord_daily", False),
@@ -2817,6 +2851,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 .up .count.rel{font-size:18px;letter-spacing:.08em;color:#56d18a}
 .up.released{border-color:#2c5a3f;background:linear-gradient(180deg,#16271d,var(--card))}
 .up.released .count small{color:#56d18a;opacity:.8}
+.remote-ro{position:sticky;top:0;z-index:50;padding:7px 14px;font-size:12.5px;text-align:center;
+  background:#3a2a12;color:#f0c97a;border-bottom:1px solid #6b4d1e}
 .up .t{font-family:var(--serif);font-size:17px;margin-top:10px;line-height:1.25}
 .up .d{color:var(--muted);font-size:12.5px;margin-top:4px}
 .kind{display:inline-block;font-size:10.5px;font-family:var(--mono);letter-spacing:.06em;text-transform:uppercase;
@@ -3681,10 +3717,17 @@ $('#deleteBtn').onclick=async()=>{
 $('#scrim').onclick=e=>{if(e.target===$('#scrim'))closeModal();};
 
 /* ---- settings ---- */
+let REMOTE_RO=false;
 async function loadDiscordSettings(){
   try{
     const s=await api('/api/settings');
-    $('#discWebhook').value=s.discord_webhook||'';
+    if(s.remote_readonly && !REMOTE_RO){
+      REMOTE_RO=true;
+      document.body.insertAdjacentHTML('afterbegin',
+        '<div class="remote-ro">Viewing over the tunnel — read-only. Edits, crawls and settings only work on the PC.</div>');
+    }
+    $('#discWebhook').value=s.discord_webhook||(s.discord_webhook_set?'(set — hidden on this device)':'');
+    $('#discWebhook').disabled=!!s.remote_readonly;
     $('#discOnNew').checked=!!s.discord_on_new;
     $('#discOnRelease').checked=!!s.discord_on_release;
     $('#discDaily').checked=!!s.discord_daily;
@@ -3693,6 +3736,7 @@ async function loadDiscordSettings(){
   }catch(_){}
 }
 async function saveDiscord(){
+  if(REMOTE_RO) return;                      // never post the masked value back
   const body={
     discord_webhook:$('#discWebhook').value.trim(),
     discord_on_new:$('#discOnNew').checked,

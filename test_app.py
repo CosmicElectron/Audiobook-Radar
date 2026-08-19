@@ -833,6 +833,40 @@ def test_a_foreign_website_cannot_read_secrets_or_change_anything(monkeypatch):
     assert c.post("/api/ingest", json={"series": "S", "book": {"n": 1, "novel_date": d(+5)}}).status_code == 200
 
 
+def test_tunnel_requests_are_read_only_and_never_see_the_webhook(monkeypatch):
+    """The Cloudflare tunnel that serves the phone has no login in front of it.
+    Found live: GET /api/settings over the hostname returned the Discord webhook
+    (and Cloudflare cached it for 4 h); POST /api/quit etc. were reachable.
+    Remote = Cf-* headers present, or a Host that isn't loopback."""
+    monkeypatch.setattr(radar, "save_state", lambda: None)
+    monkeypatch.setattr(radar, "add_log", lambda m: None)
+    radar._state = {"series": [], "log": [], "ext_commands": [], "cmd_seq": 0,
+                    "settings": {"discord_webhook": "https://discord.com/api/webhooks/SECRET"}}
+    c = radar.app.test_client()
+    via_cf = {"Cf-Connecting-Ip": "203.0.113.9", "Cf-Ray": "abc"}
+    # reads still work but the credential is masked and nothing is cacheable
+    r = c.get("/api/settings", headers=via_cf)
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["discord_webhook"] == "" and j["discord_webhook_set"] is True and j["remote_readonly"] is True
+    assert "no-store" in r.headers.get("Cache-Control", "")
+    assert "no-store" in c.get("/", headers=via_cf).headers.get("Cache-Control", "")
+    assert c.get("/api/state", headers=via_cf).status_code == 200
+    # every write is refused over the tunnel
+    for path in ("/api/series/clear", "/api/quit", "/api/settings", "/api/ext/crawl",
+                 "/api/fetch-url", "/api/discord/digest-now"):
+        assert c.post(path, headers=via_cf, json={}).status_code == 403, path
+    # a non-loopback Host with no Cf headers counts as remote too
+    r = c.get("/api/settings", headers={"Host": "radar.example.org"})
+    assert r.get_json()["discord_webhook"] == ""
+    assert c.post("/api/settings", headers={"Host": "radar.example.org"}, json={}).status_code == 403
+    # ...while the machine itself is unaffected
+    r = c.get("/api/settings", headers={"Host": "127.0.0.1:8765"})
+    assert r.get_json()["discord_webhook"].endswith("/SECRET") and r.get_json()["remote_readonly"] is False
+    assert c.post("/api/settings", headers={"Host": "127.0.0.1:8765"}, json={"discord_daily": True}).status_code == 200
+    assert c.post("/api/settings", headers={"Host": "localhost:8765"}, json={}).status_code == 200
+
+
 def test_instance_endpoint_identifies_the_app():
     """A second launch decides whether to exit by asking /api/instance — the
     marker must be present and unmistakable."""
