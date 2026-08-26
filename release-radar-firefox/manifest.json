@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Release Radar — Amazon reader",
-  "version": "1.11",
-  "description": "Reads book and audiobook release dates from Amazon pages — live when you visit, and on a background schedule with no tabs open — and sends them to your local Release Radar app.",
+  "version": "1.25",
+  "description": "Reads book and audiobook release dates from Amazon pages — live when you visit, and on a background schedule with no tabs open — and sends them to your local Release Radar app. Can buy the companion audiobook of a Kindle Unlimited title when you tell the app to.",
   "browser_specific_settings": {
     "gecko": {
       "id": "release-radar@local",
@@ -17,14 +17,21 @@
   "permissions": [
     "alarms",
     "storage",
+    "tabs",
     "clipboardWrite",
     "https://www.amazon.com.au/*",
     "https://www.amazon.com/*",
     "https://www.amazon.co.uk/*",
-    "http://127.0.0.1/*"
+    "http://127.0.0.1/*",
+    "https://discord.com/*",
+    "http://localhost/*"
   ],
   "background": {
-    "scripts": ["extract.js", "background.js"],
+    "scripts": [
+      "extract.js",
+      "buy.js",
+      "background.js"
+    ],
     "persistent": true
   },
   "content_scripts": [
@@ -34,7 +41,19 @@
         "https://www.amazon.com/*",
         "https://www.amazon.co.uk/*"
       ],
-      "js": ["extract.js", "content.js"],
+      "js": [
+        "extract.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://localhost/*"
+      ],
+      "js": [
+        "abs.js"
+      ],
       "run_at": "document_idle"
     }
   ],

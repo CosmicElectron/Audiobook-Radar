@@ -6,11 +6,35 @@ when an unannounced audiobook is likely to land, and publishes an RSS feed and a
 calendar feed of what's coming.
 
 There is **no cloud and no account**. Your library, dates and settings live in
-a JSON file on your machine and are never uploaded. The app itself reaches the
-network in only two places: it fetches book cover images (to show them, and to
-spot publishers' "cover to be revealed" placeholders), and it posts to your
-Discord webhook if you set one up. Everything else — reading Amazon pages —
-happens in your own browser, through the extension.
+a JSON file on your machine and are never uploaded. The app reaches the network
+only where you point it: cover images, your Discord webhook/bot if you set one
+up, your own Audiobookshelf server, and an AI provider only if you paste a key.
+Everything else — reading Amazon pages — happens in your own browser, through
+the extension.
+
+**Since 1.3.0** it can also do things, all opt-in and off by default:
+
+- **Auto-buy** the audiobook of a Kindle Unlimited book on release day — borrow
+  the Kindle edition on KU, buy the audiobook at the Whispersync companion
+  price, return the borrow. Per-series *off / ask-me-first / automatic under a
+  price cap*, a master switch, a dry-run mode, an approval link on Discord/
+  email, a never-buy-twice ledger, and hard stops on any page surprise.
+- **Discord both ways**: webhook pings with a live-updating progress bar for
+  downloads, plus an optional **bot** (`!status`, `!buy`, `!approve`, `!download`,
+  `!research`, `!help`) so you can drive it from your phone.
+- **Library tooling**: `file_audiobooks.py` files freshly downloaded books into
+  your existing author/series folders (fuzzy-matched, never overwrites, holds
+  anything ambiguous and can be *taught* corrections); `tidy_library.py`
+  plans/applies/undoes a one-off cleanup of an existing library.
+- **Audiobookshelf**: shows what you're currently listening to on each series
+  card, triggers an ABS library scan when new books are filed, and the
+  extension overlays release info inside the ABS web UI.
+- **AI series research** (bring your own key — OpenRouter/Anthropic/OpenAI/Grok):
+  when a series looks stalled, ask an AI with web search what's actually known
+  about the next book, shown on the card.
+- **Self-watching**: the app and extension watch each other and post to Discord
+  if either goes quiet, and releases that pass without ever being seen buyable
+  get flagged instead of slipping by silently.
 
 ---
 
@@ -57,6 +81,9 @@ If you'd rather not use the prebuilt exe:
 1. Install Python 3.9+ from https://www.python.org/downloads/ (tick *"Add
    Python to PATH"*).
 2. Double-click **run.bat**.
+
+Building your own exe: **build.bat** (note the dashboard now lives in
+`static/` and is bundled with `--add-data "static;static"`).
 
 It installs the dependencies the first time, then serves
 `http://127.0.0.1:8765/`. Close the console window to stop it.

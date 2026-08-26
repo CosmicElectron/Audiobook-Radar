@@ -516,11 +516,61 @@ async function forgetSeries(c) {
   logLine("app deleted \"" + (c.series || "?") + "\" \u2014 forgot " + removed + " registered page(s)");
 }
 
+// ---- app watchdog: the app watches this extension; this is the mirror.
+// If ReleaseRadar.exe stops answering for hours, nothing else can say so -
+// so the extension posts to the Discord webhook itself (cached daily from
+// the app's settings while it is healthy).
+var APP_QUIET_ALERT_MS = 6 * 3600 * 1000;
+var _appLastOk = Date.now();
+var _appAlerted = false;
+var _webhookCachedAt = 0;
+
+async function _cacheWebhook() {
+  if (Date.now() - _webhookCachedAt < 20 * 3600 * 1000) return;
+  try {
+    var r = await fetchTimeout(RADAR_BASE + "/api/settings", { method: "GET" }, APP_TIMEOUT);
+    var j = await r.json();
+    if (j && j.discord_webhook) { await browser.storage.local.set({ cachedWebhook: j.discord_webhook }); _webhookCachedAt = Date.now(); }
+  } catch (e) {}
+}
+
+async function _discordDirect(text) {
+  try {
+    var o = await browser.storage.local.get("cachedWebhook");
+    if (!o.cachedWebhook) return false;
+    await fetch(o.cachedWebhook, { method: "POST", headers: { "Content-Type": "application/json" },
+                                   body: JSON.stringify({ content: text }) });
+    return true;
+  } catch (e) { return false; }
+}
+
+async function _appSeen() {
+  if (_appAlerted) {
+    _appAlerted = false;
+    logLine("app is answering again");
+    await _discordDirect("✅ ReleaseRadar app is answering again.");
+  }
+  _appLastOk = Date.now();
+  _cacheWebhook();
+}
+
+async function _appMissing() {
+  if (!_appAlerted && Date.now() - _appLastOk > APP_QUIET_ALERT_MS) {
+    _appAlerted = true;
+    var h = Math.round((Date.now() - _appLastOk) / 3600000);
+    logLine("app unreachable for " + h + "h - telling Discord directly");
+    await _discordDirect("⚠️ The ReleaseRadar app hasn't answered the extension for " + h +
+                         " hours - release dates are still being read, but nothing is being recorded. " +
+                         "Is ReleaseRadar.exe running on the PC?");
+  }
+}
+
 async function pollCommands() {
   if (_polling) return;
   _polling = true;
   try {
     var r = await fetchTimeout(RADAR_BASE + "/api/ext-commands", { method: "GET" }, APP_TIMEOUT);
+    if (r.ok) _appSeen(); else _appMissing();
     var j = await r.json();
     var cmds = j && j.commands;
     if (!cmds || !cmds.length) return;
@@ -535,8 +585,9 @@ async function pollCommands() {
         else if (c.type === "recrawl") { if (_busy) { logLine("app asked to crawl \u2014 waiting, worker busy"); } else { logLine("app requested: crawl all"); done.push(c.id); markHandled(c.id); recrawlAll(false); } }
         else if (c.type === "crawlSeries") { if (_busy) { logLine("app asked to check a series \u2014 waiting, worker busy"); } else { logLine("app requested: check series \"" + (c.series || "?") + "\""); done.push(c.id); markHandled(c.id); crawlOneSeries(c.series, c.asins); } }
         else if (c.type === "coverfill") { if (_busy) { logLine("app asked for cover backfill \u2014 waiting, worker busy"); } else { done.push(c.id); markHandled(c.id); coverFill(c.urls); } }
+        else if (c.type === "buy") { done.push(c.id); markHandled(c.id); RR_buyEnqueue(c); }   // serialised in buy.js; reports back itself
         else { done.push(c.id); }   // unknown type: drop it
-      } catch (e) { /* leave unacked; retry next poll */ }
+      } catch (e) { _appMissing(); /* leave unacked; retry next poll */ }
     }
     if (done.length) {
       try { await fetchTimeout(RADAR_BASE + "/api/ext-commands/ack", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: done }) }, APP_TIMEOUT); } catch (e) {}

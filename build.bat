@@ -16,7 +16,7 @@ echo Building ReleaseRadar.exe ...
 REM --onefile   = single .exe
 REM --noconsole = no terminal window (it runs in the background and opens your browser)
 REM Remove --noconsole if you want to see logs in a console window for troubleshooting.
-pyinstaller --onefile --noconsole --name ReleaseRadar app.py
+pyinstaller --onefile --noconsole --name ReleaseRadar --add-data "static;static" app.py
 if errorlevel 1 goto :err
 
 echo.

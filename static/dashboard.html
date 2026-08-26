@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Release Radar</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>__RR_CSS__</style>
+</head>
+<body>
+<div class="wrap">
+ <div class="topgrid">
+  <div>
+  <header>
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <circle cx="20" cy="20" r="18.5" stroke="#332c47"/>
+        <circle cx="20" cy="20" r="12" stroke="#4a4067"/>
+        <path d="M8 20a12 12 0 0 1 12-12" stroke="#e7b14c" stroke-width="2.4" stroke-linecap="round"/>
+        <circle cx="20" cy="20" r="3.2" fill="#e7b14c"/>
+      </svg>
+      <div>
+        <h1>Release Radar</h1>
+        <div class="sub">Your audiobook &amp; novel release shelf — collected automatically by the Release Radar browser extension.</div>
+      </div>
+    </div>
+    <div class="toolbar">
+      <a class="ghost" id="feedLink" href="/feed.xml" target="_blank"><button class="ghost small">RSS feed</button></a>
+      <a class="ghost" id="calLink" href="/calendar.ics" target="_blank" title="iCalendar feed — subscribe from Google/Outlook/your phone's calendar app using this URL. Confirmed releases only, as all-day events."><button class="ghost small">&#128197; Calendar</button></a>
+      <button class="ghost small" id="settingsBtn">&#9881; Settings</button>
+      <button class="ghost small" id="quitBtn">&#11096; Quit</button>
+      <button class="ghost small" id="extRefreshBtn" title="Ask the browser extension to re-check pending pages (pre-orders / missing audiobooks) for new dates. Takes a few seconds to start.">&#8635; Refresh dates</button>
+      <button class="btn-primary" id="extCrawlBtn" title="Ask the browser extension to re-crawl every series and find newly-released books. Slower; takes a few seconds to start.">Crawl all</button>
+    </div>
+  </header>
+
+  <div class="meta-line">
+    <span><span id="extDot" class="extdot ok" title="Extension status"></span> <span id="lastCheck">waiting for the extension…</span></span>
+    <span id="countLine" class="mono"></span>
+  </div>
+  </div>
+
+  <div id="overdueWrap" style="display:none">
+    <div class="section-eyebrow" style="margin:2px 0 8px" title="Audiobooks whose expected window has passed with no announcement. They're kept out of the upcoming schedule — a date that already failed isn't a forecast — and nothing behind them can be predicted until they land.">Overdue audiobooks <span id="overdueCount"></span></div>
+    <div class="overdue" id="overdue"></div>
+  </div>
+ </div>
+
+  <div id="heroWrap" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px">
+      <div class="section-eyebrow" id="heroTitle" style="margin:0">Next audiobook releases</div>
+      <div style="display:flex;gap:8px">
+        <button id="modeToggle" type="button" title="Switch the upcoming list between novels and audiobooks" style="font:inherit;cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:4px 11px;font-size:12px">⇄ Show novels</button>
+        <button id="estToggle" type="button" style="font:inherit;cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:4px 11px;font-size:12px">Estimates</button>
+      </div>
+    </div>
+    <div class="hero" id="hero"></div>
+  </div>
+
+  <div class="section-eyebrow" id="seriesEyebrow" style="display:none">Tracked series</div>
+  <div class="sortbar" id="sortbar" style="display:none">
+    <div class="left">
+      <span class="lbl">Sort</span>
+      <select id="sortSel">
+        <option value="manual">Manual (drag to reorder)</option>
+        <option value="next">Next release</option>
+        <option value="title">Title A–Z</option>
+        <option value="status">Status</option>
+      </select>
+    </div>
+  </div>
+  <div class="legend" id="legend" style="display:none">
+    <span><i class="sw novel"></i>novel</span>
+    <span><i class="sw audio"></i>audiobook</span>
+    <span><i class="sw both"></i>same day</span>
+    <span><i class="sw bothupc"></i>same day, upcoming</span>
+    <span><i class="sw upc"></i>upcoming (hollow)</span>
+    <span><i class="sw est"></i>estimated</span>
+    <span><i class="sw today"></i>today</span>
+  </div>
+  <div class="grid" id="grid"></div>
+
+  <div id="empty" class="empty" style="display:none">
+    <h2>Nothing on the radar yet</h2>
+    <p>Open an Amazon page for any book in a series (with the Release Radar extension installed) and it'll be collected automatically. Or hit <b>Crawl all</b> once you've opened a few.</p>
+  </div>
+
+  <div class="activity" id="activity"></div>
+</div>
+
+<!-- modal -->
+<div class="scrim" id="scrim">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+    <h2 id="mTitle">Add series</h2>
+    <input type="hidden" id="f_id">
+
+    <label>Amazon link</label>
+    <div class="linkrow">
+      <input id="f_url" placeholder="https://www.amazon.com.au/dp/..." >
+      <button class="small" id="autofillBtn" type="button">Auto-fill</button>
+    </div>
+    <div class="hint">Auto-fill reads the page itself. Anything it misses, type by hand.</div>
+
+    <div class="two">
+      <div><label>Series / book name</label><input id="f_name" placeholder="The Stormlight Archive"></div>
+      <div><label>Author</label><input id="f_author" placeholder="Brandon Sanderson"></div>
+    </div>
+
+    <label>Latest novel title</label>
+    <input id="f_novel_title" placeholder="Wind and Truth">
+
+    <div class="two">
+      <div><label>Novel release date</label><input id="f_novel_date" placeholder="2024-12-06" type="text"></div>
+      <div><label>Audiobook status</label>
+        <select id="f_status">
+          <option value="unknown">Unknown</option>
+          <option value="none">No audiobook yet</option>
+          <option value="announced">Announced / preorder</option>
+          <option value="released">Released</option>
+        </select>
+      </div>
+    </div>
+
+    <label>Audiobook date (if announced or released)</label>
+    <input id="f_audio_date" placeholder="2024-12-06" type="text">
+
+    <div class="two">
+      <div><label>Auto-buy the audiobook</label>
+        <select id="f_buy_mode">
+          <option value="off">Off</option>
+          <option value="verify">Ask me first (email + Discord link)</option>
+          <option value="auto">Automatic when under the price cap</option>
+        </select>
+      </div>
+      <div><label>Price cap ($)</label><input id="f_buy_cap" type="number" step="0.01" min="0" placeholder="10"></div>
+    </div>
+    <div class="hint">On release day: borrow the Kindle edition on Kindle Unlimited, buy the audiobook at the companion price, return the borrow, run <b>Update Audiobooks</b>. Above the cap, "Automatic" asks instead. Needs the master switch in Settings; dry-run stays on until you switch it off there.</div>
+
+    <label>Release timeline — every book's dates</label>
+    <div id="histRows"></div>
+    <button class="small ghost" type="button" id="addHistBtn">+ Add a release</button>
+    <div class="hint">One row per book. <b>#</b> is the book's number in the series — it's how new info is matched to the right book, so fixes stick while new releases still fill in. Leave the audiobook blank if there isn't one yet. Rows with both dates also feed the gap average.</div>
+
+    <label>Notes</label>
+    <textarea id="f_notes" placeholder="Anything you want to remember"></textarea>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+      <button class="small ghost" type="button" id="researchBtn" style="width:auto">🔎 Research this series</button>
+      <span id="researchMsg" class="hint" style="margin:0">Asks the AI (with web search) what's known about the next book. Needs a key in Settings → Integrations.</span>
+    </div>
+
+    <div class="modal-actions">
+      <button class="del-link" id="deleteBtn" type="button" style="visibility:hidden">Delete</button>
+      <div style="display:flex;gap:10px">
+        <button class="ghost" type="button" onclick="closeModal()">Cancel</button>
+        <button class="btn-primary" id="saveBtn" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- settings modal -->
+<div class="scrim" id="settingsScrim">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+    <h2 id="setTitle">Settings</h2>
+
+    <label>Discord notifications</label>
+    <div class="hint" style="margin:0 0 6px">Paste a channel <b>webhook URL</b> (in Discord: channel → Edit Channel → Integrations → Webhooks → New Webhook → Copy URL). Messages post into that channel.</div>
+    <input id="discWebhook" type="text" placeholder="https://discord.com/api/webhooks/…" autocomplete="off" spellcheck="false">
+    <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+      <button class="small ghost" type="button" id="discTestBtn" style="width:auto">Send test</button>
+      <span id="discTestMsg" class="hint" style="margin:0"></span>
+    </div>
+    <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px">
+      <input type="checkbox" id="discOnNew" style="width:auto;margin:0"> Ping when a new or changed release date arrives
+    </label>
+    <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin:8px 0 0;font-size:13px">
+      <input type="checkbox" id="discOnRelease" style="width:auto;margin:0"> Ping when a release goes live (the store page flips from pre-order to buyable)
+    </label>
+    <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin:8px 0 0;font-size:13px;flex-wrap:wrap">
+      <input type="checkbox" id="discDaily" style="width:auto;margin:0"> Forecast digest
+      <select id="discDigestDays" style="width:auto;margin:0;padding:4px 6px">
+        <option value="1">every day</option><option value="2">every 2 days</option>
+        <option value="3">every 3 days</option><option value="7">weekly</option>
+      </select> at
+      <input type="number" id="discDailyHour" min="0" max="23" style="width:54px;margin:0;padding:4px 6px"> <span style="color:var(--faint)">:00 — upcoming novels &amp; audiobooks, estimates included. Delivered by a very reluctant, very bratty assistant. Her lines live in <b>digest_lines</b> next to your data.json — edit or replace them freely.</span>
+    </label>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+      <button class="small ghost" type="button" id="digNowBtn" style="width:auto">Send one now</button>
+      <span id="digNowMsg" class="hint" style="margin:0"></span>
+    </div>
+    <div style="border-bottom:1px solid var(--line);margin:16px 0"></div>
+
+    <label>Auto-buy audiobooks</label>
+    <div class="hint" style="margin:0 0 6px">Per series, in its Edit dialog: <b>Off</b> / <b>Ask me first</b> / <b>Automatic under the cap</b>. On release day the extension borrows the Kindle edition on Kindle Unlimited, buys the audiobook at the companion price, returns the borrow, and <b>Update Audiobooks</b> runs. A book is never bought twice (ledger + Libation's library).</div>
+    <label class="chk"><input type="checkbox" id="buyMaster" style="width:auto;margin:0"> <b>Master switch</b> — nothing is queued or bought while this is off</label>
+    <label class="chk"><input type="checkbox" id="buyDry" style="width:auto;margin:0"> <b>Dry run</b> — walk the pages and report what would be clicked, buy nothing (leave on for the first release)</label>
+    <div class="two" style="margin-top:8px">
+      <div><label>Default price cap ($)</label><input id="buyCapDefault" type="number" step="0.01" min="0"></div>
+      <div><label>Max automatic buys per week</label><input id="buyWeeklyMax" type="number" min="0" max="50"></div>
+    </div>
+    <label style="margin-top:10px">Approval emails</label>
+    <div class="two">
+      <div><label>Send approvals to</label><input id="buyEmailTo" type="email" placeholder="you@example.com" autocomplete="off"></div>
+      <div><label>Sending Gmail address</label><input id="buySmtpUser" type="email" placeholder="you@gmail.com" autocomplete="off"></div>
+    </div>
+    <div class="two">
+      <div><label>Gmail app password</label><input id="buySmtpPass" type="password" placeholder="16-character app password" autocomplete="new-password"><div class="hint" id="buySmtpPassHint" style="margin:2px 0 0"></div></div>
+      <div><label>Public link base (for the phone)</label><input id="buyPublicBase" type="text" placeholder="https://radar.your-tunnel.example" autocomplete="off" spellcheck="false"></div>
+    </div>
+    <div class="hint">Gmail: turn on 2-Step Verification, then create an <b>App password</b> (Google Account → Security → App passwords). It is stored only on this PC and never shown again. Approval links open a page where you tap Approve or Deny — the link itself does nothing.</div>
+    <label style="margin-top:10px">Update Audiobooks.bat</label>
+    <input id="buyBat" type="text" placeholder="auto-detected next to the app" autocomplete="off" spellcheck="false">
+    <div class="hint" id="buyBatHint" style="margin:2px 0 0"></div>
+    <label style="margin-top:12px">Tools</label>
+    <div style="display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center">
+      <button class="small ghost" type="button" id="buyTestEmailBtn" style="width:auto;white-space:nowrap">Send test email</button>
+      <span class="hint" style="margin:0">Sends one message to the approval address above, so you know approval emails will arrive.</span>
+      <button class="small ghost" type="button" id="buyRunBatBtn" style="width:auto;white-space:nowrap">Download new audiobooks now</button>
+      <span class="hint" style="margin:0">Runs <b>Update Audiobooks.bat</b> in the background (Libation scan → download → file into your library). Result goes to Discord. Same as double-clicking the bat.</span>
+      <span style="display:flex;gap:6px;align-items:center;white-space:nowrap"><input id="buyProbeAsin" type="text" placeholder="audiobook ASIN" style="width:140px;margin:0;padding:6px 8px" autocomplete="off" spellcheck="false"><button class="small ghost" type="button" id="buyProbeBtn" style="width:auto">Check this book</button></span>
+      <span class="hint" style="margin:0">Paste an audiobook's ASIN (from its Amazon link, e.g. <code>B0H8ZN7RB8</code>). The extension reads its Amazon pages <b>signed in</b> and shows below what it can see: Kindle Unlimited? companion price? already owned? <b>Buys nothing.</b></span>
+    </div>
+    <div id="buyMsg" class="hint" style="margin:6px 0 0"></div>
+    <label style="margin-top:12px">Purchase jobs</label>
+    <div id="buyJobs" class="hint" style="margin:0">No jobs yet.</div>
+    <label style="margin-top:12px">Held books</label>
+    <div class="hint" style="margin:0 0 4px">Books the filer wasn't sure about. Pick where each belongs — the correction is remembered, so the same spelling never asks twice.</div>
+    <div id="heldBooks" class="hint" style="margin:0">None.</div>
+    <div style="border-bottom:1px solid var(--line);margin:16px 0"></div>
+
+    <label>Integrations</label>
+    <div class="hint" style="margin:0 0 6px">Keys are stored only in this PC's data.json, never shown again, and never served over the tunnel. Leave a field blank to keep what's saved. Features light up as they're built.</div>
+    <div class="two">
+      <div><label>Discord bot token</label><input id="intBotToken" type="password" placeholder="for two-way Discord control" autocomplete="new-password"><div class="hint" id="intBotHint" style="margin:2px 0 0">Discord → Developer Portal → New Application → Bot → Reset Token.</div></div>
+      <div><label>AI provider</label>
+        <select id="intAiProvider"><option value="openrouter">OpenRouter</option><option value="anthropic">Anthropic (Claude)</option><option value="openai">OpenAI</option><option value="grok">xAI (Grok)</option></select>
+      </div>
+    </div>
+    <div class="two">
+      <div><label>AI API key</label><input id="intAiKey" type="password" placeholder="for series research" autocomplete="new-password"><div class="hint" id="intAiHint" style="margin:2px 0 0"></div></div>
+      <div><label>AI model (optional)</label><input id="intAiModel" type="text" placeholder="blank = provider default" autocomplete="off" spellcheck="false"></div>
+    </div>
+    <div class="two">
+      <div><label>Audiobookshelf URL</label><input id="intAbsUrl" type="text" placeholder="http://your-server:13378" autocomplete="off" spellcheck="false"></div>
+      <div><label>Audiobookshelf API token</label><input id="intAbsToken" type="password" placeholder="ABS → Settings → Users → API token" autocomplete="new-password"><div class="hint" id="intAbsHint" style="margin:2px 0 0"></div></div>
+    </div>
+    <div style="border-bottom:1px solid var(--line);margin:16px 0"></div>
+
+    <label style="color:#ff9b9b">Danger zone</label>
+    <div style="display:flex;align-items:center;gap:10px">
+      <button class="small ghost" type="button" id="clearAllBtn" style="border-color:#5a3157;color:#ffb0b0">Clear all tracked series</button>
+      <span class="hint" style="margin:0">Wipes every series so you can rebuild from Amazon only.</span>
+    </div>
+    <div class="hint">Your <code>data.json</code> is backed up first (recoverable by renaming <code>data.json.bak</code>), and settings are kept. After clearing, open one Amazon page per series (or hit "Crawl all now" in the extension) and the crawl repopulates everything.</div>
+
+    <div class="modal-actions">
+      <button class="del-link" style="visibility:hidden">.</button>
+      <div style="display:flex;gap:10px">
+        <button class="btn-primary" type="button" onclick="closeSettings()">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>__RR_JS__</script>
+</body>
+</html>

@@ -272,12 +272,23 @@ function RR_extract(doc, url) {
     } catch (e2) { _diag = { err: String(e2) }; }
   }
 
+  // Kindle Unlimited? (kindle pages only; the markers render logged-out too)
+  var _ku = null;
+  if (!isAudio) {
+    try {
+      var kuEl = doc.querySelector('.a-icon-kindle-unlimited, #kuUpsell_desktop_feature_div, ' +
+                                   '#Kibbo-KINDLE_UNLIMITED_UPSELL-Desktop, #kuBorrow_desktop_feature_div');
+      var kuSw = doc.querySelector('#tmm-grid-swatch-KINDLE');
+      _ku = !!(kuEl || (kuSw && /kindle unlimited/i.test(kuSw.textContent || "")));
+    } catch (eKu) { _ku = null; }
+  }
+
   return {
     series: series, author: author, series_total: total,
     book: { n: n, title: title, asin: asin, cover: coverUrl(),
             narrator: isAudio ? narrator : null,
             novel_date: isAudio ? null : dt, audiobook_date: isAudio ? dt : null },
-    _isAudio: isAudio, _date: dt, _url: canonical, _asin: asin, _preorder: preorder, _diag: _diag
+    _isAudio: isAudio, _date: dt, _url: canonical, _asin: asin, _preorder: preorder, _ku: _ku, _diag: _diag
   };
 }
 

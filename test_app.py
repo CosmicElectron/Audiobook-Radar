@@ -6,34 +6,15 @@ Run:  python -m pytest test_app.py -q     (from this folder)
 No test touches the real %APPDATA% data.json — everything runs on synthetic
 series dicts, and the backup test is pointed at a temp directory.
 """
-import importlib.util
 import json
 import os
 from datetime import date, timedelta
 
 import pytest
 
-_spec = importlib.util.spec_from_file_location(
-    "radar", os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"))
-radar = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(radar)
+from conftest import radar   # one loaded app module for every test file; conftest guards DATA_FILE
 
 TODAY = date.today()
-
-
-@pytest.fixture(autouse=True)
-def never_touch_the_real_data_file(tmp_path, monkeypatch):
-    """Hard guarantee that no test can write the user's live library.
-
-    A test that exercises a persisting endpoint (/api/ingest, /api/settings, …)
-    calls save_state(), which writes DATA_FILE — the real
-    %APPDATA%\\ReleaseRadar\\data.json. One test that forgot to stub it
-    overwrote a 20-series library with its own fixture. Point every file path at
-    a temp directory for the whole suite; individual tests may still stub
-    save_state, but they no longer have to remember."""
-    monkeypatch.setattr(radar, "DATA_FILE", str(tmp_path / "data.json"))
-    monkeypatch.setattr(radar, "BACKUP_DIR", str(tmp_path / "backups"))
-    monkeypatch.setattr(radar, "_LINES_DIR", str(tmp_path / "digest_lines"))
 
 
 def d(days_from_today):
@@ -887,6 +868,31 @@ def _ingest_client(monkeypatch, series_list):
     return radar.app.test_client(), sent
 
 
+def test_stale_preorder_correction_is_not_a_release(monkeypatch):
+    """The pre-v1.11 detector marked every released Kindle page as a pre-order.
+    The first full crawl with the fixed detector flipped those stale states all
+    at once and pinged 'out now' for novels released months ago (20 Aug 2026,
+    ~15 bogus Discord messages). A flip only counts as a release when it happens
+    around the release date — and a stale correction must not record a bogus
+    release-hour flip time either."""
+    s = series([{"n": 4, "novel": d(-186), "novel_pre": True}])   # released in February, stale pre=True
+    c, sent = _ingest_client(monkeypatch, [s])
+    r = c.post("/api/ingest", json={
+        "series": "Test", "book": {"n": 4, "title": "Test 4", "novel_date": d(-186)},
+        "_preorder": False, "_url": "https://www.amazon.com.au/dp/B0OLDBOOK04"})
+    assert r.get_json()["ok"]
+    ent = s["timeline"][0]
+    assert sent == []                              # no 'out now' for a months-old book
+    assert ent.get("novel_pre") is False           # ...but the state is corrected
+    assert "novel_live_at" not in ent              # ...and no fake flip time is learned
+    # a genuine flip on release day still pings and still records the hour
+    s2 = series([{"n": 5, "novel": d(0), "novel_pre": True}])
+    c2, sent2 = _ingest_client(monkeypatch, [s2])
+    c2.post("/api/ingest", json={"series": "Test", "book": {"n": 5, "title": "Test 5", "novel_date": d(0)},
+                                 "_preorder": False, "_url": "https://www.amazon.com.au/dp/B0NEWBOOK05"})
+    assert len(sent2) == 1 and s2["timeline"][0].get("novel_live_at")
+
+
 def test_release_ping_fires_when_first_buyable_read_lands_a_day_late(monkeypatch):
     """The Primal Hunter case: an audiobook dated yesterday whose pre-order state
     was never captured (detector couldn't read audio buy boxes), first read as
@@ -940,3 +946,14 @@ def test_daily_backup_snapshot_and_prune(tmp_path, monkeypatch):
     assert len(files) == radar.BACKUP_KEEP
     radar._daily_backup()             # second call same day: no-op
     assert len(os.listdir(bdir)) == radar.BACKUP_KEEP
+
+
+def test_dashboard_is_composed_from_static_files():
+    """Phase-1 split: the served page is composed from static/dashboard.* and
+    must contain no leftover markers; the sources must exist next to app.py
+    (and inside the exe via --add-data \"static;static\")."""
+    assert "__RR_CSS__" not in radar.PAGE_HTML and "__RR_JS__" not in radar.PAGE_HTML
+    assert "<style>" in radar.PAGE_HTML and "<script>" in radar.PAGE_HTML
+    for name in ("dashboard.html", "dashboard.css", "dashboard.js"):
+        assert os.path.isfile(os.path.join(radar._STATIC_DIR, name)), name
+    assert radar.PAGE_HTML == radar._load_page_html()

@@ -15,6 +15,7 @@ The RSS feed lives at:     http://127.0.0.1:8765/feed.xml
 
 import os
 import re
+import sys
 import json
 import time
 import uuid
@@ -22,6 +23,12 @@ import random
 import html
 import statistics
 import threading
+import subprocess
+import sqlite3
+import smtplib
+import hashlib
+import secrets
+from email.message import EmailMessage
 import logging
 import webbrowser
 from datetime import datetime, date, timedelta
@@ -97,6 +104,8 @@ def load_state():
                 _state.setdefault("ext_commands", [])
                 _state.setdefault("cmd_seq", 0)
                 _state.setdefault("settings", {})
+                _state.setdefault("buy_jobs", [])
+                _state.setdefault("buy_ledger", {})
             except Exception as e:
                 log.exception("Could not read data file: %s", e)
                 _state = default_state()
@@ -117,8 +126,42 @@ def get_settings():
         s.setdefault("discord_daily", False)              # daily forecast digest
         s.setdefault("discord_daily_hour", 9)             # 24h local hour to send it
         s.setdefault("discord_digest_days", 1)            # 1=daily, 2/3, 7=weekly
+        # auto-buy (KU borrow -> companion audiobook -> return borrow)
+        s.setdefault("buy_master", False)        # master switch: nothing buys while off
+        s.setdefault("buy_dry_run", True)        # walk the page, click nothing, report
+        s.setdefault("buy_cap_default", BUY_DEFAULT_CAP)
+        s.setdefault("buy_weekly_max", BUY_WEEKLY_MAX)
+        s.setdefault("buy_email_to", "")         # where approval requests go
+        s.setdefault("buy_smtp_user", "")        # Gmail address that sends them
+        s.setdefault("buy_smtp_pass", "")        # its App Password (not the login password)
+        s.setdefault("buy_smtp_host", "smtp.gmail.com")
+        s.setdefault("buy_public_base", "")      # https://your-tunnel-host — for approve links on the phone
+        s.setdefault("buy_bat", "")              # Update Audiobooks.bat (auto-found when blank)
+        s.setdefault("buy_libation_files", "")   # Libation files dir (auto-found when blank)
+        s.setdefault("buy_tab_mode", "foreground")  # foreground | window (unfocused) | background
+        # integrations (secrets are write-only: stored here, never echoed back)
+        s.setdefault("bot_token", "")            # Discord bot - two-way control
+        s.setdefault("ai_provider", "openrouter")  # openrouter | anthropic | openai | grok
+        s.setdefault("ai_api_key", "")           # AI series research (web search)
+        s.setdefault("ai_model", "")             # blank = provider default
+        s.setdefault("abs_url", "")              # Audiobookshelf server, e.g. http://nas:13378
+        s.setdefault("abs_token", "")            # ABS API token
         return dict(s)
 
+
+# auto-buy tunables
+BUY_MODES = ("off", "verify", "auto")
+BUY_DEFAULT_CAP = 10.0          # above this price, "auto" behaves like "verify"
+BUY_TOKEN_TTL_H = 48            # an approval link is good for two days
+BUY_PROBE_MAX = 12              # re-check a release-day page this many times...
+BUY_PROBE_DAYS = 4              # ...over this many days, waiting for the offer to appear
+BUY_PROBE_GAP_H = 3             # ...at most once every few hours
+BUY_WEEKLY_MAX = 3              # hard ceiling on AUTOMATIC purchases per 7 days
+BUY_BAT_DELAY_S = 150           # give Audible's library a moment to list the title
+BUY_BAT_RETRIES = 3             # re-run the bat if Libation didn't see it yet
+BUY_BAT_RETRY_GAP_S = 600
+BUY_STORE_RETRY_H = 3           # Amazon refused the checkout (title not live on Audible AU yet): try again in...
+BUY_STORE_RETRY_MAX = 16        # ...at most this many times (~2 days)
 
 BACKUP_DIR = os.path.join(data_dir(), "backups")
 BACKUP_KEEP = 14           # rolling daily snapshots — two weeks of undo
@@ -846,6 +889,11 @@ def series_view(s):
         "asins": s.get("asins", {}) or {},
         "asins_novel": s.get("asins_novel", {}) or {},
         "asins_audio": s.get("asins_audio", {}) or {},
+        "buy_mode": s.get("buy_mode") or "off",
+        "buy_cap": s.get("buy_cap"),
+        "audio_own": _ownership_for(s.get("id")),
+        "listening": _abs_listening_for(s.get("name", "")),
+        "intel": s.get("intel"),
         "edited": bool(s.get("edited")),
         "notes": s.get("notes", ""),
         "last_fetched": s.get("last_fetched"),
@@ -1346,6 +1394,32 @@ _TSUN_CHANGED = [
     "{icon} New date alert: **{series}** Book {n} {kind} is {when} now (was {was}). Adjust your little plans.",
 ]
 
+_TSUN_BOUGHT = [
+    "🛒 Fine. I bought **{series}** Book {n} for {price}. With YOUR money. You're welcome, obviously.",
+    "🛒 **{series}** Book {n}: purchased for {price}. I haggled it down from full price. (The Kindle trick. My trick.)",
+    "🛒 Bought **{series}** Book {n} ({price}). Try to act surprised when it shows up in your library.",
+    "🛒 {price} for **{series}** Book {n}. Handled. Quietly. Like a professional. Unlike some people.",
+    "🛒 **{series}** Book {n} is yours now — {price}. Yes I checked the price twice. Who do you take me for?",
+]
+_TSUN_ASK_BUY = [
+    "💳 Oi. **{series}** Book {n} is sitting there at {price}. Want it or not? Approve: {link}",
+    "💳 {price} for **{series}** Book {n}. I'm not spending your money without a nod. Well? {link}",
+    "💳 **{series}** Book {n}, {price}. One tap and it's done. Or ignore me. See if I care. {link}",
+]
+_TSUN_FILED = [
+    "🗂 Downloaded and filed. **{series}** Book {n} is on the shelf where it belongs. Everything in its place.",
+    "🗂 **{series}** Book {n}: in your library, named properly, filed properly. I even lined up the folder name.",
+    "🗂 Done — **{series}** Book {n} is downloaded, sorted, and shelved. Enjoy. Or whatever.",
+]
+_TSUN_WATCHDOG = [
+    "⚠️ HEY. {what} I can't do my job like this. Fix it. ({detail})",
+    "⚠️ Something's wrong: {what} I've been shouting into the void. {detail}",
+    "⚠️ {what} Not to alarm you but I'm COMPLETELY BLIND right now. {detail}",
+]
+_TSUN_RECOVERED = [
+    "✅ {what} We're back. I'll pretend that never happened if you do.",
+    "✅ {what} Panic over. I had it under control the entire time. Obviously.",
+]
 _TSUN_OUTNOW = [
     "🎉 {icon} IT'S OUT. **{series}** Book {n} {kind} is live RIGHT NOW. Why are you still reading this?!",
     "🎉 {icon} **{series}** Book {n} {kind} just went live! Go! GO! You can thank me later. (Do thank me.)",
@@ -1384,8 +1458,15 @@ _LINE_FILES = {
     "new_date": "_TSUN_NEWDATE", "date_changed": "_TSUN_CHANGED",
     "out_now": "_TSUN_OUTNOW", "test": "_TSUN_TEST", "more": "_TSUN_MORE",
     "narrator": "_TSUN_NARRATOR",
+    "bought": "_TSUN_BOUGHT", "ask_buy": "_TSUN_ASK_BUY", "filed": "_TSUN_FILED",
+    "watchdog": "_TSUN_WATCHDOG", "recovered": "_TSUN_RECOVERED",
 }
 _LINE_PLACEHOLDERS = {
+    "bought": "{series} {n} {price}",
+    "ask_buy": "{series} {n} {price} {link}",
+    "filed": "{series} {n}",
+    "watchdog": "{what} {detail}",
+    "recovered": "{what}",
     "new_date": "{icon} {series} {n} {kind} {when}",
     "date_changed": "{icon} {series} {n} {kind} {when} {was}",
     "out_now": "{icon} {series} {n} {kind}",
@@ -1394,6 +1475,11 @@ _LINE_PLACEHOLDERS = {
 }
 # used verbatim if a user-edited template has a typo'd placeholder
 _LINE_SAFE = {
+    "bought": "🛒 Bought **{series}** — Book {n} for {price}.",
+    "ask_buy": "💳 **{series}** — Book {n} at {price}. Approve or deny: {link}",
+    "filed": "🗂 **{series}** — Book {n} downloaded and filed into the library.",
+    "watchdog": "⚠️ {what} {detail}",
+    "recovered": "✅ {what}",
     "new_date": "{icon} **{series}** — Book {n} {kind} now dated {when}",
     "date_changed": "{icon} **{series}** — Book {n} {kind} date changed to {when} (was {was})",
     "out_now": "🎉 {icon} **{series}** — Book {n} {kind} is **out now**!",
@@ -1646,6 +1732,78 @@ def _cover_is_placeholder(url):
 
 
 RELEASE_PING_GRACE_DAYS = 3   # 'out now' may fire this many days after the date
+EXT_QUIET_ALERT_H = 6         # extension silent this long -> one Discord warning
+UNCONFIRMED_MIN_DAYS = 3      # after the ping grace expires...
+UNCONFIRMED_MAX_DAYS = 7      # ...but before it's old news: flag silent releases
+
+# A healthy extension polls /api/ext-commands every ~20 s. If those polls stop,
+# nothing reads Amazon any more and every feature silently starves (this went
+# unnoticed for two days in Aug 2026). In-memory only: an app restart resets
+# the clock, which is correct - the app can't know how long it was down.
+_ext_last_poll = datetime.now()
+_ext_alerted = False
+
+
+def _ext_seen():
+    global _ext_last_poll, _ext_alerted
+    _ext_last_poll = datetime.now()
+    if _ext_alerted:
+        _ext_alerted = False
+        add_log("extension is back")
+        _discord_notify(_fmt_line("recovered", what="The browser extension is checking in again."))
+
+
+def _maybe_report_unconfirmed_releases():
+    """The 'out now' ping depends on the extension reading the page as buyable
+    around release day. When that read never happens (detector blind spot,
+    extension dead, browser closed), a release used to pass in permanent
+    silence — RE: Maelstrom 2 (10 Aug 2026) was only noticed two weeks late.
+    Once the grace window closes, say so ONCE per book: due, never confirmed.
+    The 7-day upper bound keeps back-catalogue and long outages quiet."""
+    lines = []
+    with _lock:
+        notified = set(_state.get("discord_notified", []))
+        for s2 in _state.get("series", []):
+            for e in s2.get("timeline", []):
+                n = _entry_n(e)
+                if n is None:
+                    continue
+                for dkey, pkey, kind in (("audiobook", "audio_pre", "audiobook"),
+                                          ("novel", "novel_pre", "novel")):
+                    dd = parse_date(e.get(dkey))
+                    if not dd:
+                        continue
+                    age = (today() - dd).days
+                    if not (UNCONFIRMED_MIN_DAYS < age <= UNCONFIRMED_MAX_DAYS):
+                        continue
+                    if e.get(pkey) is False:
+                        continue                     # confirmed buyable: the normal path owns it
+                    rel_key = f"release:{s2['id']}:{n}:{kind}:{e.get(dkey)}"
+                    key = f"unconfirmed:{s2['id']}:{n}:{kind}:{e.get(dkey)}"
+                    if rel_key in notified or key in notified:
+                        continue
+                    notified.add(key)
+                    lines.append(f"**{s2.get('name', '')}** book {n} {kind} — due {e.get(dkey)}, "
+                                 f"never seen buyable")
+        if lines:
+            _state["discord_notified"] = list(notified)[-500:]
+            save_state()
+    if lines and get_settings().get("discord_on_release", True):
+        _discord_notify("🔎 Due but never confirmed live — worth checking the store page"
+                        " (the page may be unreadable, or the extension was down):\n" +
+                        "\n".join(lines[:8]))
+
+
+def _ext_watchdog():
+    global _ext_alerted
+    quiet = datetime.now() - _ext_last_poll
+    if not _ext_alerted and quiet > timedelta(hours=EXT_QUIET_ALERT_H):
+        _ext_alerted = True
+        h = int(quiet.total_seconds() // 3600)
+        add_log(f"extension has been silent for {h} h")
+        _discord_notify(_fmt_line("watchdog",
+                                  what=f"The browser extension hasn't checked in for {h} hours — no release dates are being read.",
+                                  detail="Is Floorp open, and is the Release Radar add-on enabled? Reinstalling the .xpi over the top fixes a dead add-on."))
 COVERFILL_CAP = 20        # backfill page-reads per round; the extension paces them
 COVERFILL_EVERY_HOURS = 24  # cover art is cosmetic — trickle it, don't hammer
 COVERFILL_MAX_TRIES = 3   # after this many reads with no yield, the page simply
@@ -1809,6 +1967,34 @@ def _start_daily_digest():
                 _maybe_fix_placeholder_covers()
             except Exception as e:
                 add_log(f"placeholder cover fix error: {e}")
+            try:
+                _buy_tick()
+            except Exception as e:
+                add_log(f"auto-buy tick error: {e}")
+            try:
+                _ext_watchdog()
+            except Exception as e:
+                add_log(f"extension watchdog error: {e}")
+            try:
+                _maybe_report_unconfirmed_releases()
+            except Exception as e:
+                add_log(f"unconfirmed-release check error: {e}")
+            try:
+                _refresh_ownership()
+            except Exception as e:
+                add_log(f"ownership scan error: {e}")
+            try:
+                _release_card_prune()
+            except Exception:
+                pass
+            try:
+                _abs_refresh_progress()
+            except Exception as e:
+                add_log(f"Audiobookshelf progress error: {e}")
+            try:
+                _ai_tick()
+            except Exception as e:
+                add_log(f"AI research tick error: {e}")
             time.sleep(300)   # check every 5 minutes
 
     threading.Thread(target=_loop, daemon=True).start()
@@ -1964,6 +2150,10 @@ def build_ics():
 
 app = Flask(__name__)
 
+# Changes on every app start. Open dashboard tabs compare it each refresh and
+# reload themselves, so UI fixes reach the page instead of running stale JS.
+APP_BUILD = datetime.now().strftime("%Y%m%d%H%M%S")
+
 # Read-only surfaces intended to be embedded elsewhere (a new-tab widget, a feed
 # reader, a calendar app). None of them expose a credential.
 PUBLIC_READ_PATHS = {"/api/state", "/feed.xml", "/calendar.ics", "/board"}
@@ -2015,7 +2205,8 @@ def _refuse_cross_site_writes():
     if _origin_kind(request.headers.get("Origin")) == "web":
         add_log(f"refused a cross-site {request.method} to {request.path}")
         return jsonify({"error": "cross-site request refused"}), 403
-    if _is_remote():
+    if _is_remote() and not request.path.startswith("/buy/"):
+        # /buy/<token>/... is gated by its single-use token instead
         add_log(f"refused a remote {request.method} to {request.path} "
                 f"(from {request.headers.get('Cf-Connecting-Ip') or request.remote_addr})")
         return jsonify({"error": "read-only over the tunnel - make changes on the PC"}), 403
@@ -2049,7 +2240,7 @@ def allow_cors(resp):
         resp.headers["Access-Control-Allow-Origin"] = "*"
     # Never let Cloudflare (or a browser) cache API answers or the dashboard:
     # the tunnel was found serving a 4-hour-old /api/settings from its edge.
-    if request.path == "/" or request.path.startswith("/api/"):
+    if request.path == "/" or request.path.startswith("/api/") or request.path.startswith("/buy/"):
         resp.headers["Cache-Control"] = "no-store, private"
     return resp
 
@@ -2087,7 +2278,10 @@ def favicon_ico():
 
 @app.get("/api/state")
 def api_state():
-    return jsonify(build_state_payload())
+    p = build_state_payload()
+    p["app_build"] = APP_BUILD
+    p["ext_seen_s"] = int((datetime.now() - _ext_last_poll).total_seconds())
+    return jsonify(p)
 
 
 @app.post("/api/series")
@@ -2113,6 +2307,8 @@ def api_add():
         "last_fetched": None,
         "last_change": None,
         "fetch_error": None,
+        "buy_mode": _clean_buy_mode(body.get("buy_mode")),
+        "buy_cap": _clean_buy_cap(body.get("buy_cap")),
     }
     if not s["name"]:
         return jsonify({"error": "A series or book name is required."}), 400
@@ -2137,6 +2333,10 @@ def api_update(sid):
             s["novel_date"] = iso(parse_date(body.get("novel_date")))
         if "audiobook_date" in body:
             s["audiobook_date"] = iso(parse_date(body.get("audiobook_date")))
+        if "buy_mode" in body:
+            s["buy_mode"] = _clean_buy_mode(body.get("buy_mode"))
+        if "buy_cap" in body:
+            s["buy_cap"] = _clean_buy_cap(body.get("buy_cap"))
         if "timeline" in body:
             tl = _clean_timeline(body.get("timeline"), s.get("timeline"))   # rows of {n, novel, audiobook}
             s["timeline"] = tl
@@ -2256,6 +2456,8 @@ def api_ingest():
                   json.dumps(s.get("asins_audio") or {}, sort_keys=True))
         if nd and title:
             ent["title"] = title              # per-book novel title (attribution anchor)
+        if isinstance(body.get("_ku"), bool) and nd:
+            ent["ku"] = body["_ku"]           # Kindle Unlimited? gates the hover-card Buy
         # Guard against Amazon cross-linking one audiobook edition onto multiple books
         # (e.g. book 1's audio shown as a "format" of book 2). Each audio ASIN belongs
         # to exactly one row: the first book it was recorded under keeps it.
@@ -2300,13 +2502,19 @@ def api_ingest():
             # at a consistent local hour (Amazon US = 2pm here), and that hour is
             # what a release-day countdown should aim at — learned per series.
             live_key = "audio_live_at" if ad else "novel_live_at"
-            if pre is False and old_pre is not False and not ent.get(live_key):
-                ent[live_key] = datetime.now().isoformat(timespec="seconds")
             d_now = ad if ad else nd
             dd = parse_date(d_now) if d_now else None
+            # A flip only means "released right now" when it happens AROUND the
+            # release date. A months-old book flipping preorder->buyable is a
+            # stale wrong state being corrected (the pre-v1.11 detector marked
+            # every released Kindle page as a pre-order); correcting it is not
+            # news and its timestamp teaches the release-hour model nothing.
+            recent = dd is not None and 0 <= (today() - dd).days <= RELEASE_PING_GRACE_DAYS
+            if pre is False and old_pre is not False and recent and not ent.get(live_key):
+                ent[live_key] = datetime.now().isoformat(timespec="seconds")
             fire = False
             if pre is False and dd:
-                if old_pre is True and dd <= today():
+                if old_pre is True and recent:
                     fire = True          # we watched it flip from pre-order to buyable
                 elif 0 <= (today() - dd).days <= RELEASE_PING_GRACE_DAYS:
                     # Buyable on (or just after) its release day IS the release, even
@@ -2330,6 +2538,11 @@ def api_ingest():
             ent["novel"] = nd                 # Amazon is authoritative for this field
         if ad and not (backfill and ent.get("audiobook")):
             ent["audiobook"] = ad
+        if ad and pre is False and not backfill:
+            try:
+                _maybe_create_buy_job(s, n, ent, ad)
+            except Exception as e:            # never let auto-buy break an ingest
+                add_log(f"auto-buy: could not queue a job for {series} book {n}: {e}")
         narr = clean_narrator(book.get("narrator"))
         if ad and narr:
             # A narrator swap is news to an audiobook listener — compare against
@@ -2406,8 +2619,15 @@ def api_ingest():
         new_date_msgs = _new_date_messages(s, n, old_novel, ent.get("novel"), old_audio, ent.get("audiobook"))
         cover_for_ping = ent.get("cover") or s.get("cover_url") or None
         series_name = s.get("name", "")
+        sid_for_card = s.get("id")
         save_state()
-    for m in new_date_msgs + released_msgs + narrator_msgs:
+    for m in new_date_msgs + narrator_msgs:
+        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping)])
+    for m in released_msgs:
+        # audiobook releases get a LIVING card: later stages (approval, bought,
+        # downloaded, filed) edit this same message instead of new pings
+        if ad and _release_card_create(sid_for_card, n, m, _book_embed(series_name, n, cover_for_ping)):
+            continue
         _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping)])
     bits = " ".join(filter(None, [f"novel {nd}" if nd else "", f"audiobook {ad}" if ad else ""]))
     add_log(f"Ingested from Amazon: {series} book {n} ({bits})")
@@ -2431,6 +2651,7 @@ def _push_command(**cmd):
 
 @app.get("/api/ext-commands")
 def api_ext_commands_get():
+    _ext_seen()
     with _lock:
         cmds = list(_state.get("ext_commands", []))
     return jsonify({"commands": cmds})
@@ -2444,6 +2665,1839 @@ def api_ext_commands_ack():
         _state["ext_commands"] = [c for c in _state.get("ext_commands", []) if c.get("id") not in ids]
     save_state()
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Auto-buy: KU borrow -> buy the companion audiobook -> return the borrow
+#
+# The extension does the clicking (it is the logged-in browser); the server
+# owns the decision and the record:
+#   probing          asked the extension to read the Kindle page (signed in):
+#                    is it KU, is the audiobook already owned, what's the
+#                    companion price
+#   waiting_offer    page read fine but no companion offer yet -> re-probe later
+#   awaiting_approval  verify mode (or auto above the cap): email + Discord sent,
+#                    token link approves/denies; expires after BUY_TOKEN_TTL_H
+#   approved/running extension is borrowing + buying + returning, reporting
+#                    each step
+#   dry_done         dry-run walked the page and reported what it WOULD click
+#   done             audiobook confirmed bought (ledger written), borrow returned,
+#                    Update Audiobooks.bat ran
+#   done_unreturned  bought, but the KU return failed -> return it by hand
+#   uncertain        a buy click happened but no confirmation could be read.
+#                    Ledger-marked so it can never be retried automatically.
+#   owned/failed/denied/expired/cancelled/needs_signin   terminal, with a note
+# ---------------------------------------------------------------------------
+
+def _clean_buy_mode(v):
+    v = (v or "off") if isinstance(v, str) else "off"
+    v = v.strip().lower()
+    return v if v in BUY_MODES else "off"
+
+
+def _clean_buy_cap(v):
+    if v in (None, "", False):
+        return None
+    try:
+        f = float(str(v).replace("$", "").replace(",", "").strip())
+    except ValueError:
+        return None
+    return round(f, 2) if f >= 0 else None
+
+
+def _buy_now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _buy_job_for(sid, n):
+    return next((j for j in _state.get("buy_jobs", []) if j.get("series_id") == sid and j.get("n") == n), None)
+
+
+def _buy_job_by_id(jid):
+    return next((j for j in _state.get("buy_jobs", []) if j.get("id") == jid), None)
+
+
+BUY_PAGE_CFG = {
+    "borrow_label": r"add to library|read for free|^borrow",
+    "borrow_id": r"borrow|kindle-unlimited|ku-?borrow|kubuy",
+    "buy_label": r"^buy now with 1-click|^buy now$|^buy for|^pre-order",
+    "add_audio_label": r"add (?:the )?audiobook|add (?:audible )?narration|upgrade with audio|get the audiobook|add narration",
+    "narr_chk": "#narration-checkbox, input[type='checkbox'][id*='narration' i], input[type='checkbox'][name*='narration' i]",
+    "narr_block": "#audibleNarration, #audible-narration, [id*='narration' i]",
+    "expander": "",
+    "checkout_label": r"place (?:your )?order|complete (?:your )?purchase|^buy now$|confirm (?:your )?(?:purchase|order)|pay now",
+}
+BUY_TAB_MODES = ("foreground", "window", "background")
+
+
+def _job_cmd(job):
+    """The slice of a job the extension needs."""
+    return {"id": job["id"], "title": job.get("title", ""), "series": job.get("series", ""), "n": job.get("n"),
+            "audio_asin": job.get("audio_asin"), "kindle_asin": job.get("kindle_asin"),
+            "store_host": job.get("store_host") or "www.amazon.com.au",
+            "cap": _job_cap(job), "price": job.get("price"), "dry_run": bool(job.get("dry_run")),
+            "ku_borrowed_by_us": bool(job.get("ku_borrowed_by_us")),
+            "cfg": dict(BUY_PAGE_CFG, tab_mode=(get_settings().get("buy_tab_mode") or "foreground"))}
+
+
+def _buy_save_capture(name, html):
+    """Keep the raw buy-box markup the extension saw (signed in) under
+    %APPDATA%/ReleaseRadar/autobuy/ so the click rules can be tuned offline.
+    Local only - it can contain session tokens."""
+    if not html:
+        return None
+    try:
+        d = os.path.join(data_dir(), "autobuy")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, re.sub(r"[^A-Za-z0-9_.-]", "_", name) + ".html")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(html[:200000])
+        return p
+    except OSError:
+        return None
+
+
+def _job_cap(job):
+    """A job's price cap; a missing/zero cap means the default from Settings."""
+    try:
+        c = float(job.get("cap") or 0)
+    except (TypeError, ValueError):
+        c = 0
+    return c if c > 0 else (_clean_buy_cap(get_settings().get("buy_cap_default")) or BUY_DEFAULT_CAP)
+
+
+def _job_step(job, step, ok, detail=""):
+    job.setdefault("steps", []).append({"at": _buy_now(), "step": step, "ok": bool(ok), "detail": str(detail)[:400]})
+    job["steps"] = job["steps"][-40:]
+    job["updated"] = _buy_now()
+
+
+def _job_set(job, status, note=None):
+    job["status"] = status
+    job["updated"] = _buy_now()
+    if note is not None:
+        job["note"] = str(note)[:300]
+
+
+# ---- ownership: Libation's own library db is the truth for "already have it"
+def _libation_files_dir():
+    cands = [get_settings().get("buy_libation_files") or "",
+             os.path.join(os.path.expanduser("~"), "Libation"),
+             os.path.join(os.environ.get("APPDATA", ""), "Libation"),
+             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Libation")]
+    for c in cands:
+        if c and os.path.isfile(os.path.join(c, "LibationContext.db")):
+            return c
+    return None
+
+
+def _libation_owns(asin):
+    """True/False from Libation's library, None when it can't be checked."""
+    d = _libation_files_dir()
+    if not d or not asin:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{os.path.join(d, 'LibationContext.db')}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute("select 1 from Books where AudibleProductId = ? limit 1", (asin,)).fetchone()
+        finally:
+            con.close()
+        return bool(row)
+    except Exception:
+        return None
+
+
+# ---- creation (called from ingest, under the lock)
+def _maybe_create_buy_job(s, n, ent, audio_date):
+    mode = _clean_buy_mode(s.get("buy_mode"))
+    if mode == "off":
+        return None
+    st = get_settings()
+    if not st.get("buy_master"):
+        return None                              # master switch off: nothing is queued
+    if _buy_job_for(s["id"], n):
+        return None
+    audio_asin = (s.get("asins_audio") or {}).get(str(n))
+    if not audio_asin:
+        return None
+    if audio_asin in _state.get("buy_ledger", {}):
+        return None
+    dd = parse_date(audio_date)
+    if not dd or dd > today() or (today() - dd).days > BUY_PROBE_DAYS:
+        return None                              # only around release day, never back-catalogue
+    job = {"id": uuid.uuid4().hex[:10], "series_id": s["id"], "series": s.get("name", ""), "n": n,
+           "title": (ent.get("title") or f"{s.get('name', '')} {n}"),
+           "audio_asin": audio_asin, "kindle_asin": (s.get("asins_novel") or {}).get(str(n)),
+           "store_host": s.get("store_host") or "www.amazon.com.au",
+           "mode": mode, "cap": _clean_buy_cap(s.get("buy_cap")) or _clean_buy_cap(st.get("buy_cap_default")) or BUY_DEFAULT_CAP,
+           "dry_run": bool(st.get("buy_dry_run", True)), "status": "probing", "price": None,
+           "created": _buy_now(), "updated": _buy_now(), "probes": 0, "last_probe": None,
+           "steps": [], "note": ""}
+    owned = _libation_owns(audio_asin)
+    if owned:
+        _job_set(job, "owned", "Libation already has this audiobook")
+    _state.setdefault("buy_jobs", []).append(job)
+    _state["buy_jobs"] = _state["buy_jobs"][-100:]
+    if job["status"] == "probing":
+        _buy_push_probe(job)
+    add_log(f"auto-buy: {job['status']} — {job['series']} book {n} ({mode}, cap ${job['cap']:.2f}"
+            f"{', DRY RUN' if job['dry_run'] else ''})")
+    return job
+
+
+def _buy_push_probe(job):
+    job["probes"] = int(job.get("probes") or 0) + 1
+    job["last_probe"] = _buy_now()
+    _push_command(type="buy", phase="probe", job=_job_cmd(job))
+
+
+def _buy_week_count():
+    cutoff = datetime.now() - timedelta(days=7)
+    n = 0
+    for v in _state.get("buy_ledger", {}).values():
+        try:
+            if v.get("auto") and datetime.fromisoformat(v.get("at")) >= cutoff:
+                n += 1
+        except (TypeError, ValueError):
+            pass
+    return n
+
+
+# ---- decision after a successful probe
+def _buy_decide(job):
+    st = get_settings()
+    price = job.get("price")
+    if job.get("dry_run"):
+        _job_set(job, "running", "dry run: borrows on KU, finds the audiobook offer, returns the borrow - buys nothing")
+        _push_command(type="buy", phase="dry", job=_job_cmd(job))
+        return
+    if job.get("mode") == "auto" and price is not None and price <= _job_cap(job):
+        if _buy_week_count() >= int(st.get("buy_weekly_max", BUY_WEEKLY_MAX)):
+            _job_step(job, "decide", True, "weekly automatic limit reached — asking instead")
+            _buy_request_approval(job, why="weekly limit")
+            return
+        _buy_approve(job, who="auto")
+        return
+    why = "verify mode" if job.get("mode") == "verify" else f"price ${price:.2f} is above the cap ${float(job.get('cap') or 0):.2f}"
+    _buy_request_approval(job, why=why)
+
+
+def _buy_public_base():
+    b = (get_settings().get("buy_public_base") or "").strip().rstrip("/")
+    return b or "http://127.0.0.1:8765"
+
+
+def _buy_request_approval(job, why=""):
+    token = secrets.token_urlsafe(32)
+    job["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
+    job["expires"] = (datetime.now() + timedelta(hours=BUY_TOKEN_TTL_H)).isoformat(timespec="seconds")
+    _job_set(job, "awaiting_approval", why)
+    _release_card_line(job.get("series_id"), job.get("n"),
+                       f"💳 waiting for your OK" + (f" at ${job.get('price'):.2f}" if isinstance(job.get('price'), (int, float)) else ""))
+    link = f"{_buy_public_base()}/buy/{token}"
+    price = job.get("price")
+    ptxt = f"${price:.2f}" if isinstance(price, (int, float)) else "price unknown"
+    subject = f"Release Radar: buy the audiobook? {job.get('title', '')} — {ptxt}"
+    text = (f"{job.get('series', '')} — book {job.get('n')}\n{job.get('title', '')}\n\n"
+            f"Companion audiobook price: {ptxt}  (cap ${float(job.get('cap') or 0):.2f})\n"
+            f"Why you're being asked: {why}\n\n"
+            f"Approve or deny here (link works for {BUY_TOKEN_TTL_H} h, one decision only):\n{link}\n\n"
+            f"What approving does: borrows the Kindle edition on Kindle Unlimited, buys the audiobook at the "
+            f"companion price, returns the borrow, then runs Update Audiobooks.\n")
+    _send_email_async(job["id"], subject, text)
+    _discord_notify(_fmt_line("ask_buy", series=job.get("series", ""), n=job.get("n"),
+                              price=ptxt, link=link) + f" ({why})")
+
+
+def _buy_approve(job, who="link"):
+    _job_step(job, "approve", True, f"approved by {who}")
+    _release_card_line(job.get("series_id"), job.get("n"), "💳 approved — buying", replace_last=True)
+    _job_set(job, "approved", f"approved by {who}")
+    job["approved_at"] = _buy_now()
+    _push_command(type="buy", phase="execute", job=_job_cmd(job))
+    _job_set(job, "running", f"approved by {who}; extension is working")
+
+
+def _buy_deny(job, who="link"):
+    _job_step(job, "deny", True, f"denied by {who}")
+    _job_set(job, "denied", f"denied by {who}")
+
+
+_EMAIL_ASYNC = True       # tests flip this to run inline
+
+
+def _send_email_async(job_id, subject, text):
+    """SMTP can block for many seconds: never do it under the state lock or
+    inside a request. The outcome lands on the job as an 'email' step."""
+    def _go():
+        ok, msg = _send_email(subject, text)
+        with _lock:
+            job = _buy_job_by_id(job_id)
+            if job:
+                _job_step(job, "email", ok, msg)
+            save_state()
+    if _EMAIL_ASYNC:
+        threading.Thread(target=_go, daemon=True).start()
+    else:
+        _go()
+
+
+def _send_email(subject, text):
+    st = get_settings()
+    to, user, pw = st.get("buy_email_to"), st.get("buy_smtp_user"), st.get("buy_smtp_pass")
+    if not (to and user and pw):
+        return False, "email not configured (address, sender, app password)"
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = user
+    msg["To"] = to
+    msg.set_content(text)
+    try:
+        with smtplib.SMTP_SSL(st.get("buy_smtp_host") or "smtp.gmail.com", 465, timeout=25) as srv:
+            srv.login(user, pw)
+            srv.send_message(msg)
+        return True, "sent"
+    except Exception as e:        # noqa: BLE001
+        return False, f"email failed: {e}"
+
+
+# ---- reports from the extension
+def _buy_handle_report(job, phase, ok, detail):
+    """Apply one report from the extension to a job. Runs under the lock."""
+    detail = detail if isinstance(detail, dict) else {"info": str(detail)}
+    info = str(detail.get("info") or "")[:300]
+    if phase == "probe":
+        job["probes_ok"] = int(job.get("probes_ok") or 0) + (1 if ok else 0)
+        if detail.get("buybox_html"):
+            _buy_save_capture(f"probe-{detail.get('kindle_asin') or job.get('kindle_asin') or job.get('audio_asin')}",
+                              detail.pop("buybox_html"))
+        if detail.get("kindle_asin"):
+            job["kindle_asin"] = detail["kindle_asin"]
+        if detail.get("buttons") is not None:
+            job["buttons"] = detail.get("buttons")
+        _job_step(job, "probe", ok, info or json.dumps({k: v for k, v in detail.items() if k != "buttons"})[:300])
+        if detail.get("signed_in") is False:
+            _buy_needs_signin(job)
+            return
+        if not ok:
+            _job_set(job, "waiting_offer", info or "probe failed; will retry")
+            return
+        if detail.get("owned"):
+            _job_set(job, "owned", "the store says you already own this audiobook")
+            return
+        if isinstance(detail.get("ku"), bool):
+            srs = _find(job.get("series_id")) if job.get("series_id") else None
+            if srs:
+                row = next((e for e in srs.get("timeline", []) if _entry_n(e) == job.get("n")), None)
+                if row is not None:
+                    row["ku"] = detail["ku"]
+            if detail["ku"] is False:
+                _job_set(job, "failed", "not a Kindle Unlimited title - the discounted "
+                                        "companion price needs a KU borrow, so I won't buy this one")
+                return
+        price = detail.get("price")
+        try:
+            price = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price = None
+        if price is None:
+            _job_set(job, "waiting_offer", "no companion-audiobook offer on the page yet")
+            return
+        job["price"] = round(price, 2)
+        job["price_currency"] = detail.get("currency") or ""
+        _buy_decide(job)
+        return
+    if phase == "dry":
+        step = str(detail.get("step") or "dry")
+        if detail.get("borrowed_by_us"):
+            job["ku_borrowed_by_us"] = True
+        if detail.get("html"):
+            _buy_save_capture(f"dry-{re.sub(r'[^a-z0-9]+', '_', step.lower())}-{job.get('kindle_asin') or job.get('audio_asin')}", detail.pop("html"))
+        _job_step(job, step, ok, info)
+        if detail.get("final") or step == "dry":
+            _job_set(job, "dry_done" if ok else "failed", info)
+        return
+    if phase == "execute":
+        step = str(detail.get("step") or "step")
+        if detail.get("html"):
+            _buy_save_capture(f"exec-{re.sub(r'[^a-z0-9]+', '_', step.lower())}-{job.get('audio_asin')}", detail.pop("html"))
+        _job_step(job, step, ok, info)
+        if not ok:
+            if job.get("purchased"):
+                _job_set(job, "done_unreturned", f"{step} failed after the purchase: {info} — return the KU borrow by hand")
+                _buy_after_purchase(job)
+            elif step == "checkout" and "refused" in info.lower():
+                n = int(job.get("store_retries") or 0) + 1
+                job["store_retries"] = n
+                if n > BUY_STORE_RETRY_MAX:
+                    _job_set(job, "failed", f"Amazon kept refusing the checkout ({n - 1} tries): {info}")
+                else:
+                    job["retry_at"] = (datetime.now() + timedelta(hours=BUY_STORE_RETRY_H)).isoformat(timespec="seconds")
+                    _job_set(job, "retry_later", f"Amazon refused the checkout (try {n}); trying again in {BUY_STORE_RETRY_H} h — "
+                                                 f"usually the audiobook isn't on Audible AU yet")
+                    _release_card_line(job.get("series_id"), job.get("n"),
+                                       f"⏳ store refused (not on Audible AU yet) — retrying every {BUY_STORE_RETRY_H} h", replace_last=True)
+                    if n == 1:
+                        _discord_notify(f"\u23f3 Amazon couldn't process {job.get('series', '')} — book {job.get('n')} yet "
+                                        f"('{info[:120]}'). Usually it's not on Audible AU yet; I'll retry every {BUY_STORE_RETRY_H} h.")
+            elif detail.get("clicked"):
+                _release_card_line(job.get("series_id"), job.get("n"), "⚠️ buy attempt unconfirmed — check Amazon")
+                _job_set(job, "uncertain", f"a buy click happened but {step} could not be confirmed: {info}")
+                _state.setdefault("buy_ledger", {})[job["audio_asin"]] = {
+                    "series": job.get("series"), "n": job.get("n"), "at": _buy_now(), "job": job["id"],
+                    "price": job.get("price"), "auto": job.get("mode") == "auto", "uncertain": True}
+            else:
+                _job_set(job, "failed", f"{step}: {info}")
+            return
+        if step == "confirm":
+            job["purchased"] = True
+            job["purchased_at"] = _buy_now()
+            _release_card_line(job.get("series_id"), job.get("n"),
+                               f"✅ bought" + (f" ${job.get('price'):.2f}" if isinstance(job.get('price'), (int, float)) else ""),
+                               replace_last=True)
+            _state.setdefault("buy_ledger", {})[job["audio_asin"]] = {
+                "series": job.get("series"), "n": job.get("n"), "at": _buy_now(), "job": job["id"],
+                "price": job.get("price"), "auto": job.get("mode") == "auto"}
+        if step == "return":
+            if job.get("purchased"):
+                _release_card_line(job.get("series_id"), job.get("n"), "↩️ KU borrow returned")
+                _job_set(job, "done", "bought, borrow returned")
+                _buy_after_purchase(job)
+        return
+    if phase == "return":
+        _job_step(job, "return", ok, info)
+        if ok:
+            job["ku_borrowed_by_us"] = False
+            job["note"] = (job.get("note") or "") + " | KU borrow returned"
+        return
+    _job_step(job, phase, ok, info)
+
+
+def _buy_needs_signin(job):
+    """Firefox is signed out of Amazon. Park the job, tell the user ONCE (Discord +
+    email), and keep re-probing on the normal cadence so the moment he signs in
+    again the job carries on by itself. Reading dates still works signed out;
+    only buying needs the session."""
+    _job_set(job, "needs_signin", "Firefox is signed out of Amazon — sign in on the PC; I'll keep checking")
+    if job.get("signin_notified"):
+        return
+    job["signin_notified"] = _buy_now()
+    msg = (f"\U0001f511 Firefox is signed out of Amazon, so I can't buy {job.get('series', '')} — book {job.get('n')}. "
+           f"Sign in again on the PC (any Amazon page); I'll keep checking for {BUY_PROBE_DAYS} days and carry on by myself.")
+    _discord_notify(msg)
+    _send_email_async(job["id"], f"Release Radar: sign in to Amazon to buy {job.get('title', '')}", msg)
+
+
+def _buy_after_purchase(job):
+    price = job.get("price")
+    ptxt = f"${price:.2f}" if isinstance(price, (int, float)) else ""
+    if not _release_card_line(job.get("series_id"), job.get("n"),
+                              f"⬇️ downloading via Libation in {BUY_BAT_DELAY_S // 60} min…"):
+        _discord_notify(_fmt_line("bought", series=job.get("series", ""), n=job.get("n"),
+                                  price=ptxt or "the companion price")
+                        + ("" if job.get("status") == "done" else " (Return the KU borrow by hand.)"))
+    _run_update_audiobooks(job)
+
+
+# ---- the bat
+# ---- live Discord progress for Update Audiobooks -------------------------
+def _discord_live_start(text, embeds=None):
+    """Post a webhook message we can edit later. Returns the edit URL or None."""
+    wh = (get_settings().get("discord_webhook") or "").strip()
+    if not wh:
+        return None
+    try:
+        payload = {"content": (text or "")[:1900]}
+        if embeds:
+            payload["embeds"] = [e for e in embeds if e][:10]
+        data = json.dumps(payload).encode("utf-8")
+        url = wh + ("&" if "?" in wh else "?") + "wait=true"
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json", "User-Agent": APP_NAME})
+        with urlopen(req, timeout=10) as resp:
+            mid = json.loads(resp.read().decode("utf-8", "replace")).get("id")
+        return f"{wh.split('?')[0]}/messages/{mid}" if mid else None
+    except Exception as e:      # noqa: BLE001
+        add_log(f"Discord live message failed: {e}")
+        return None
+
+
+def _discord_live_edit(edit_url, text):
+    if not edit_url:
+        return False
+    try:
+        data = json.dumps({"content": (text or "")[:1900]}).encode("utf-8")
+        req = Request(edit_url, data=data, method="PATCH",
+                      headers={"Content-Type": "application/json", "User-Agent": APP_NAME})
+        with urlopen(req, timeout=10) as resp:
+            resp.read()
+        return True
+    except Exception:           # noqa: BLE001
+        return False
+
+
+class _BatProgress:
+    """Turns Update Audiobooks.bat output into one live progress message.
+    Line shapes from real runs: '1/3  Scanning...', 'Scanning Audible library:
+    2 accounts...', 'Total processed: 321', 'New: 1',
+    'DownloadDecryptBook Begin: date [ASIN] Title', '...Completed: ...',
+    then the filer's FILED/NEW/ADOPT/HOLD lines."""
+    BAR_W = 12
+
+    def __init__(self):
+        self.phase = "starting"
+        self.accounts = None
+        self.processed = None
+        self.new = None
+        self.total = 0
+        self.begun = 0
+        self.done_dl = 0
+        self.current = ""
+        self.filed = []
+        self.finished = False
+        self.rc = None
+        self.attempt = 1
+        self._buf = ""
+
+    def feed(self, chunk):
+        self._buf += chunk.replace("\r", "")
+        *lines, self._buf = self._buf.split("\n")
+        for l in lines:
+            self._line(l.strip())
+
+    def _line(self, l):
+        if not l:
+            return
+        if l.startswith("1/3"):
+            self.phase = "scan"
+        elif l.startswith("2/3"):
+            self.phase = "download"
+        elif l.startswith("3/3"):
+            self.phase = "file"
+        m = re.match(r"Scanning Audible library:\s*(\d+)\s*account", l)
+        if m:
+            self.accounts = int(m.group(1))
+        m = re.match(r"Total processed:\s*(\d+)", l)
+        if m:
+            self.processed = int(m.group(1))
+        m = re.match(r"New:\s*(\d+)", l)
+        if m:
+            self.new = int(m.group(1))
+            self.total = max(self.total, self.new)
+        m = re.match(r"DownloadDecryptBook Begin:\s*\S+\s*\[[A-Z0-9]+\]\s*(.+)", l)
+        if m:
+            self.begun += 1
+            self.total = max(self.total, self.begun)
+            self.current = m.group(1).strip()
+        if re.match(r"DownloadDecryptBook Completed:", l):
+            self.done_dl += 1
+        if re.match(r"(FILED|NEW|ADOPT|HOLD)\b", l) and not re.match(r"New:", l):
+            self.filed.append(l[:120])
+
+    def bar(self):
+        if not self.total:
+            return ""
+        done = min(self.done_dl, self.total)
+        f = int(self.BAR_W * done / self.total)
+        return "\u25b0" * f + "\u25b1" * (self.BAR_W - f) + f"  {done}/{self.total}"
+
+    def render(self):
+        rows = ["\U0001f4e6 **Update Audiobooks**" + (f" (attempt {self.attempt})" if self.attempt > 1 else "")]
+        if self.processed is not None:
+            rows.append(f"\u2705 Scan: {self.processed} titles, {self.new or 0} new")
+        elif self.phase == "starting":
+            rows.append("\u23f3 starting\u2026")
+        else:
+            rows.append("\U0001f50e Scanning the Audible library\u2026"
+                        + (f" ({self.accounts} accounts)" if self.accounts else ""))
+        if self.processed is not None:
+            if self.total == 0:
+                rows.append("\U0001f4a4 Nothing new to download")
+            else:
+                downloading = self.phase == "download" and not self.finished and self.done_dl < self.total
+                icon = "\u2b07\ufe0f" if downloading else "\u2705"
+                cur = f" \u00b7 *{self.current}*" if downloading and self.current else ""
+                rows.append(f"{icon} Download  {self.bar()}{cur}")
+        if self.phase == "file" and not self.finished:
+            rows.append("\U0001f5c2\ufe0f Filing into the library\u2026")
+        for l in self.filed[-6:]:
+            rows.append("\u2003" + l)
+        if self.finished:
+            rows.append({0: "\u2705 **Done.**",
+                         2: "\u26a0\ufe0f **Done \u2014 some books are HELD** (see the lines above)."}
+                        .get(self.rc, f"\u274c **Failed** (rc={self.rc}) \u2014 see autobuy-bat.log"))
+        return "\n".join(rows)[:1900]
+
+
+class _LiveEditor:
+    """Throttled edits: at most one PATCH per interval, only when the text changed."""
+    def __init__(self, edit_url, interval=2.5):
+        self.url = edit_url
+        self.interval = interval
+        self._last_t = 0.0
+        self._last_text = ""
+
+    def push(self, text, force=False):
+        if not self.url or text == self._last_text:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_t) < self.interval:
+            return
+        if _discord_live_edit(self.url, text):
+            self._last_t = now
+            self._last_text = text
+
+
+
+def _bat_path():
+    p = (get_settings().get("buy_bat") or "").strip()
+    if p and os.path.isfile(p):
+        return p
+    base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    for c in (os.path.join(base, "Update Audiobooks.bat"),
+              os.path.join(os.path.dirname(base), "Update Audiobooks.bat")):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _run_bat_once(bat, on_output=None):
+    """Run Update Audiobooks.bat --auto hidden; returns (rc, tail of its output).
+    on_output, when given, receives each new chunk of the bat's output while it
+    runs (drives the live Discord progress message)."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    logf = os.path.join(data_dir(), "autobuy-bat.log")
+    with open(logf, "ab") as f:
+        f.write(f"\n=== {_buy_now()} {bat} --auto ===\n".encode("utf-8", "replace"))
+        f.flush()
+        ofs = f.tell()
+        p = subprocess.Popen(["cmd.exe", "/c", bat, "--auto"], stdin=subprocess.DEVNULL, stdout=f,
+                             stderr=subprocess.STDOUT, creationflags=flags, cwd=os.path.dirname(bat))
+
+        def _drain():
+            nonlocal ofs
+            if not on_output:
+                return
+            try:
+                with open(logf, "rb") as rf:
+                    rf.seek(ofs)
+                    chunk = rf.read()
+                if chunk:
+                    ofs += len(chunk)
+                    on_output(chunk.decode("utf-8", "replace"))
+            except OSError:
+                pass
+
+        deadline = time.monotonic() + 3600
+        while True:
+            try:
+                rc = p.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                _drain()
+                if time.monotonic() > deadline:
+                    p.kill()
+                    rc = -1
+                    break
+        _drain()
+    try:
+        with open(logf, "rb") as f:
+            f.seek(max(0, os.path.getsize(logf) - 1500))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        tail = ""
+    return rc, tail
+
+
+def _run_update_audiobooks(job=None, delay=None):
+    """After a confirmed purchase (or on demand): wait for Audible to list it,
+    run the bat, re-run a couple of times if Libation didn't see the title yet."""
+    def _go():
+        time.sleep(BUY_BAT_DELAY_S if delay is None else delay)
+        bat = _bat_path()
+        if not bat:
+            add_log("auto-buy: Update Audiobooks.bat not found — set its path in Settings")
+            _discord_notify("\u26a0\ufe0f Update Audiobooks.bat not found — set its path in Settings.")
+            return
+        asin = job.get("audio_asin") if job else None
+        prog = _BatProgress()
+        editor = _LiveEditor(_discord_live_start(prog.render()))
+
+        def _on_output(chunk):
+            prog.feed(chunk)
+            editor.push(prog.render())
+
+        for attempt in range(1, BUY_BAT_RETRIES + 1):
+            prog.attempt = attempt
+            rc, tail = _run_bat_once(bat, on_output=_on_output)
+            owned = _libation_owns(asin) if asin else None
+            held = " (some books HELD — see the bat log)" if rc == 2 else ""
+            with _lock:
+                if job:
+                    _job_step(job, "bat", rc in (0, 2), f"attempt {attempt}: rc={rc}{held}; Libation has it: {owned}")
+                save_state()
+            add_log(f"Update Audiobooks ran (rc={rc}){held}; Libation has {asin or 'n/a'}: {owned}")
+            if owned or owned is None or not job:
+                break
+            time.sleep(BUY_BAT_RETRY_GAP_S)
+        prog.finished = True
+        prog.rc = rc
+        _own_cache["at"] = 0.0        # new files on disk: recount ownership soon
+        if rc in (0, 2):
+            try:
+                threading.Thread(target=_abs_trigger_scan, daemon=True).start()
+            except Exception:
+                pass
+        if job:
+            _release_card_line(job.get("series_id"), job.get("n"),
+                               "🗂️ filed into the library — complete ✔" if rc in (0, 2)
+                               else "❌ download/filing failed — see autobuy-bat.log", replace_last=True)
+        if editor.url:
+            editor.push(prog.render(), force=True)      # the live message becomes the summary
+        else:
+            filed = [ln.strip() for ln in tail.splitlines() if ln.startswith(("FILED", "NEW", "ADOPT", "HOLD"))][-4:]
+            _discord_notify("\U0001f4e6 Update Audiobooks finished (rc=%s).%s" % (rc, ("\n" + "\n".join(filed)) if filed else ""))
+    threading.Thread(target=_go, daemon=True).start()
+
+
+# ---- periodic
+# ---------------------------------------------------------------------------
+# Discord bot: two-way control. The webhook talks AT you; with a bot token in
+# Settings the radar also LISTENS - !buy, !approve, !status etc. from any
+# device with Discord. Commands run in-process against the same state and
+# guardrails as the dashboard. The gateway runs in its own thread; without a
+# token nothing starts.
+# ---------------------------------------------------------------------------
+_bot_state = {"running": False, "err": ""}
+
+
+def _bot_match_series(frag):
+    """Series whose name contains the fragment (normalised). Returns (series|None, err)."""
+    f = _norm(frag or "")
+    if not f:
+        return None, "which series? e.g. `!buy primal hunter 15`"
+    with _lock:
+        hits = [x for x in _state.get("series", []) if f in _norm(x.get("name", ""))]
+    if not hits:
+        return None, f"no tracked series matches '{frag}'"
+    if len(hits) > 1:
+        exact = [x for x in hits if _norm(x.get("name", "")) == f]
+        if len(exact) == 1:
+            return exact[0], None
+        return None, "that matches " + ", ".join(sorted(x.get("name", "?") for x in hits)[:5]) + " - be more specific"
+    return hits[0], None
+
+
+def _bot_find_job(frag, statuses):
+    with _lock:
+        jobs = [j for j in _state.get("buy_jobs", []) if j.get("status") in statuses]
+        if frag:
+            f = _norm(frag)
+            jobs = [j for j in jobs if f in _norm(j.get("series", "")) or f == str(j.get("n"))]
+    if not jobs:
+        return None, ("nothing is waiting" + (f" that matches '{frag}'" if frag else ""))
+    if len(jobs) > 1:
+        return None, ("more than one matches: "
+                      + "; ".join(f"{j.get('series','?')} #{j.get('n')} ({j.get('status')})" for j in jobs[:5]))
+    return jobs[0], None
+
+
+def _bot_fmt_job(j):
+    price = f"${j['price']:.2f}" if isinstance(j.get("price"), (int, float)) else "price ?"
+    return f"{j.get('series','?')} #{j.get('n')} \u00b7 {price} \u00b7 {j.get('status')}"
+
+
+def handle_bot_command(text):
+    """'!command args' -> reply string, or None when the message isn't ours.
+    Pure dispatch over the same internals the dashboard uses."""
+    t = (text or "").strip()
+    if not t.startswith("!"):
+        return None
+    parts = t[1:].split(None, 1)
+    cmd = (parts[0] if parts else "").lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd in ("help", "commands"):
+        return ("**Release Radar commands**\n"
+                "`!status` - radar health + what's next\n"
+                "`!jobs` - purchase jobs\n"
+                "`!buy <series> [book#]` - price-check a book's audiobook (asks before buying)\n"
+                "`!approve [series]` / `!deny [series]` - decide a waiting purchase\n"
+                "`!download` - run Update Audiobooks now\n"
+                "`!research <series>` - AI web-research on the next book\n"
+                "`!holds` - books the filer couldn't place")
+
+    if cmd == "status":
+        with _lock:
+            n_series = len(_state.get("series", []))
+            jobs = _state.get("buy_jobs", [])
+        ext_s = int((datetime.now() - _ext_last_poll).total_seconds())
+        ext = ("checking in" if ext_s < 120 else f"SILENT for {ext_s // 3600}h {ext_s % 3600 // 60}m")
+        up = [r for r in upcoming_of_kind("audiobook", False)[:3]]
+        nxt = "\n".join(f"\u2022 {r.get('series','?')} #{r.get('book_n','?')} \u2014 {r.get('date')}" for r in up) or "\u2022 nothing scheduled"
+        waiting = [j for j in jobs if j.get("status") == "awaiting_approval"]
+        return (f"**Release Radar** \u00b7 {n_series} series \u00b7 extension {ext}\n"
+                f"Next audiobooks:\n{nxt}\n"
+                + (f"\u23f3 {len(waiting)} purchase(s) waiting for approval \u2014 `!approve`" if waiting else "No purchases waiting."))
+
+    if cmd == "jobs":
+        with _lock:
+            jobs = list(reversed(_state.get("buy_jobs", [])))[:8]
+        if not jobs:
+            return "no purchase jobs."
+        return "\n".join("\u2022 " + _bot_fmt_job(j) for j in jobs)
+
+    if cmd == "approve":
+        job, err = _bot_find_job(arg, ("awaiting_approval",))
+        if err:
+            return err
+        with _lock:
+            job["dry_run"] = False
+            _buy_approve(job, who="discord")
+            save_state()
+        return f"\u2705 approved: {_bot_fmt_job(job)} \u2014 buying now."
+
+    if cmd == "deny":
+        job, err = _bot_find_job(arg, ("awaiting_approval", "retry_later", "probing", "waiting_offer"))
+        if err:
+            return err
+        with _lock:
+            _buy_deny(job, who="discord")
+            save_state()
+        return f"\u274c denied: {job.get('series','?')} #{job.get('n')}."
+
+    if cmd == "buy":
+        m = re.match(r"^(.*?)(?:\s+(\d+))?$", arg)
+        frag, n_txt = (m.group(1) or "").strip(), m.group(2)
+        srs, err = _bot_match_series(frag)
+        if err:
+            return err
+        if n_txt:
+            n = int(n_txt)
+        else:
+            with _lock:
+                ns = [e for e in srs.get("timeline", []) if _entry_n(e) is not None and e.get("audiobook")]
+            if not ns:
+                return f"{srs.get('name','?')}: no audiobook recorded yet - give a book number"
+            n = max(_entry_n(e) for e in ns)
+        ok, msg = _buy_for_book(srs["id"], n, source="Discord")
+        return (f"\U0001f6d2 {srs.get('name','?')} #{n}: {msg}" if ok else f"can't: {msg}")
+
+    if cmd == "download":
+        if not _bat_path():
+            return "Update Audiobooks.bat not found - set its path in Settings."
+        _run_update_audiobooks(None, delay=0)
+        return "\U0001f4e6 running Update Audiobooks - progress appears here."
+
+    if cmd == "research":
+        srs, err = _bot_match_series(arg)
+        if err:
+            return err
+        if not _ai_conf():
+            return "no AI key set (Settings \u2192 Integrations)."
+        threading.Thread(target=_ai_research_series, args=(srs["id"],), kwargs={"manual": True}, daemon=True).start()
+        return f"\U0001f50e researching {srs.get('name','?')} - the result lands on its card and in the log."
+
+    if cmd == "holds":
+        held = _load_holds()
+        if not held:
+            return "no held books."
+        return "\n".join(f"\u2022 {h.get('book','?')} \u2014 {h.get('reason','')[:120]}" for h in held[:8]) \
+               + "\nresolve them in Settings \u2192 Held books."
+
+    return f"unknown command `!{cmd}` - try `!help`"
+
+
+def _start_discord_bot():
+    tok = (get_settings().get("bot_token") or "").strip()
+    if not tok:
+        return
+
+    def _run():
+        try:
+            import asyncio
+            import discord
+        except ImportError:
+            _bot_state["err"] = "discord.py is not installed"
+            add_log("Discord bot: discord.py is not installed (pip install discord.py)")
+            return
+        intents = discord.Intents.default()
+        intents.message_content = True
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready():
+            _bot_state.update(running=True, err="")
+            add_log(f"Discord bot online as {client.user}")
+
+        @client.event
+        async def on_message(message):
+            if message.author.bot:
+                return
+            try:
+                reply = handle_bot_command(message.content)
+            except Exception as e:      # noqa: BLE001
+                reply = f"error: {e}"
+            if reply:
+                for i in range(0, len(reply), 1900):
+                    await message.channel.send(reply[i:i + 1900])
+
+        try:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            client.run(tok, log_handler=None)
+        except Exception as e:          # noqa: BLE001
+            hint = " - enable the MESSAGE CONTENT intent in the Developer Portal (Bot page)" \
+                   if "intent" in str(e).lower() else ""
+            _bot_state.update(running=False, err=str(e))
+            add_log(f"Discord bot stopped: {e}{hint}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+
+def _find_orphaned_bat_run(update_log, bat_log, max_age_h=2):
+    """An Update Audiobooks run the app launched but whose watcher thread died
+    (exe swapped mid-run, 25 Aug 2026: the 22:54 run finished at 23:01 into
+    silence). Returns the byte offset of the run's header in bat_log, or None.
+
+    In flight = the bat's own log ends with a 'started' line and no DONE/ERROR
+    after it, AND the app-side bat_log has a run header newer than the last
+    completed run (manual console runs never write bat_log - not ours to watch)."""
+    try:
+        with open(update_log, encoding="utf-8", errors="replace") as f:
+            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
+    except OSError:
+        return None
+    started_at = None
+    for l in lines:
+        if " Update Audiobooks started" in l:
+            started_at = l
+        elif started_at and re.search(r"\b(DONE|ERROR)\b", l):
+            started_at = None
+    if not started_at:
+        return None
+    m = re.search(r"(\d{2})/(\d{2})/(\d{4}) (\d{2}):(\d{2}):(\d{2})", started_at)
+    if m:
+        dd, mo, yy, hh, mi, ss = (int(x) for x in m.groups())
+        try:
+            if (datetime.now() - datetime(yy, mo, dd, hh, mi, ss)) > timedelta(hours=max_age_h):
+                return None                    # stale: the run died long ago
+        except ValueError:
+            pass
+    try:
+        with open(bat_log, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    i = data.rfind(b"\n=== ")
+    if i < 0:
+        i = 0 if data.startswith(b"=== ") else -1
+    return (i + 1 if i > 0 else i) if i >= 0 else None
+
+
+def _reattach_orphaned_bat_run():
+    """Called at startup: if a bat run is in flight with no watcher, adopt it -
+    feed its output so far into a fresh live progress message and post the
+    summary when it finishes."""
+    bat = _bat_path()
+    if not bat:
+        return
+    update_log = os.path.join(os.path.dirname(bat), "Update Audiobooks.log")
+    bat_log = os.path.join(data_dir(), "autobuy-bat.log")
+    ofs = _find_orphaned_bat_run(update_log, bat_log)
+    if ofs is None:
+        return
+    add_log("adopting an Update Audiobooks run that was in flight when the app restarted")
+
+    def _watch():
+        prog = _BatProgress()
+        pos = ofs
+        editor = None
+        deadline = time.monotonic() + 2 * 3600
+        while time.monotonic() < deadline:
+            try:
+                with open(bat_log, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                if chunk:
+                    pos += len(chunk)
+                    prog.feed(chunk.decode("utf-8", "replace"))
+                    if editor is None:
+                        editor = _LiveEditor(_discord_live_start(prog.render()))
+                    editor.push(prog.render())
+            except OSError:
+                pass
+            try:
+                with open(update_log, encoding="utf-8", errors="replace") as f:
+                    tail = f.read()[-400:]
+                done = None
+                for l in tail.splitlines():
+                    if " Update Audiobooks started" in l:
+                        done = None
+                    elif re.search(r"\b(DONE|ERROR)\b", l):
+                        done = l
+                if done:
+                    prog.finished = True
+                    prog.rc = 1 if "ERROR" in done else (2 if "held" in done.lower() else 0)
+                    if editor is None:
+                        editor = _LiveEditor(_discord_live_start(prog.render()))
+                    editor.push(prog.render(), force=True)
+                    return
+            except OSError:
+                pass
+            time.sleep(5)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
+
+# ---- audiobook ownership (feeds the per-series "owned x/y" meter) --------
+# Owned = Libation's database has the ASIN, OR the book number exists in the
+# AudioBooks library folder for the matching series (catches books obtained
+# outside Audible and adopted by the filer). Cached: a sqlite hit plus a
+# directory walk must never run per page load.
+OWN_CACHE_TTL_S = 30 * 60
+_own_cache = {"at": 0.0, "series": {}}      # sid -> {"owned": [n...], "missing": [n...]}
+
+
+def _library_series_index():
+    """{normalised series name: set of owned book numbers} from the AudioBooks folder."""
+    try:
+        import file_audiobooks as _fa
+    except Exception:
+        return {}
+    out = {}
+    try:
+        _, lib = _fa.scan_library(_fa.DEFAULT_DST)
+    except (FileNotFoundError, OSError):
+        return {}
+    for sd in lib:
+        ns = _fa.norm(sd.series)
+        nums = out.setdefault(ns, set())
+        for b in sd.books:
+            k = _fa.book_key(b)
+            if k[1] and "-" not in k[1]:
+                try:
+                    nums.add(int(float(k[1])))
+                except ValueError:
+                    pass
+    return out
+
+
+def _libation_asin_set():
+    d = _libation_files_dir()
+    if not d:
+        return set()
+    try:
+        con = sqlite3.connect(f"file:{os.path.join(d, 'LibationContext.db')}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = con.execute("select AudibleProductId from Books").fetchall()
+        finally:
+            con.close()
+        return {r[0] for r in rows if r and r[0]}
+    except Exception:
+        return set()
+
+
+def _refresh_ownership(force=False):
+    now = time.monotonic()
+    if not force and (now - _own_cache["at"]) < OWN_CACHE_TTL_S:
+        return
+    _own_cache["at"] = now                      # even on failure: don't hammer
+    owned_asins = _libation_asin_set()
+    folder_idx = _library_series_index()
+    try:
+        import file_audiobooks as _fa
+        norm = _fa.norm
+    except Exception:
+        norm = lambda x: (x or "").lower()      # noqa: E731
+    result = {}
+    with _lock:
+        series_list = [(s.get("id"), s.get("name", ""), dict(s.get("asins_audio") or {}),
+                        list(s.get("timeline") or [])) for s in _state.get("series", [])]
+    for sid, name, amap, tl in series_list:
+        folder_nums = folder_idx.get(norm(name), set())
+        owned, missing = [], []
+        for e in tl:
+            n = _entry_n(e)
+            ad = parse_date(e.get("audiobook"))
+            if n is None or not ad or ad > today():
+                continue                        # only released audiobooks count
+            has = (amap.get(str(n)) in owned_asins) or (n in folder_nums)
+            (owned if has else missing).append(n)
+        result[sid] = {"owned": sorted(owned), "missing": sorted(missing)}
+    _own_cache["series"] = result
+
+
+def _ownership_for(sid):
+    return _own_cache["series"].get(sid)
+
+
+
+# ---- living release card --------------------------------------------------
+# One Discord message per audiobook release that keeps its whole story:
+# detected -> approval -> bought -> downloaded -> filed. Appended lines edit
+# the same message instead of posting new ones.
+RELEASE_CARD_KEEP_DAYS = 7
+
+
+def _release_card_create(sid, n, text, embed=None):
+    url = _discord_live_start(text, embeds=[embed] if embed else None)
+    if not url:
+        return False
+    with _lock:
+        _state.setdefault("release_live", {})[f"{sid}:{n}"] = {
+            "url": url, "base": text, "lines": [], "at": _buy_now()}
+        save_state()
+    return True
+
+
+def _release_card_line(sid, n, line, replace_last=False):
+    """Append one progress line to the release card (no-op if none exists)."""
+    if sid is None or n is None:
+        return False
+    with _lock:
+        rec = _state.get("release_live", {}).get(f"{sid}:{n}")
+        if not rec:
+            return False
+        lines = rec.setdefault("lines", [])
+        if replace_last and lines:
+            lines[-1] = line
+        elif not lines or lines[-1] != line:
+            lines.append(line)
+        rec["lines"] = lines[-12:]
+        text = (rec["base"] + "\n" + "\n".join("\u2003" + l for l in rec["lines"]))[:1900]
+        url = rec["url"]
+        save_state()
+    threading.Thread(target=_discord_live_edit, args=(url, text), daemon=True).start()
+    return True
+
+
+def _release_card_prune():
+    with _lock:
+        live = _state.get("release_live", {})
+        cutoff = datetime.now() - timedelta(days=RELEASE_CARD_KEEP_DAYS)
+        stale = []
+        for k, rec in live.items():
+            try:
+                if datetime.fromisoformat(rec.get("at")) < cutoff:
+                    stale.append(k)
+            except (TypeError, ValueError):
+                stale.append(k)
+        for k in stale:
+            del live[k]
+
+
+
+# ---- Audiobookshelf ------------------------------------------------------
+# With abs_url + abs_token set: (1) after new books are filed, poke ABS to
+# re-scan its library so they appear in the player immediately; (2) pull
+# listening progress so cards can say "listening: book 14 - 82%".
+ABS_PROGRESS_TTL_S = 30 * 60
+_abs_cache = {"at": 0.0, "series": {}, "lib_id": None, "err": None}
+
+
+def _abs_conf():
+    st = get_settings()
+    u, t = (st.get("abs_url") or "").strip().rstrip("/"), (st.get("abs_token") or "").strip()
+    if not (u and t):
+        return None, None
+    return _abs_resolve_base(u, t), t
+
+
+def _abs_resolve_base(u, t):
+    """People paste whatever URL their browser shows — a config page, a library
+    view. Probe downwards until /api/libraries answers, cache the winner.
+    'http://localhost:13378/audiobookshelf/config' -> 'http://localhost:13378'."""
+    if _abs_cache.get("base") and _abs_cache.get("base_src") == u:
+        return _abs_cache["base"]
+    from urllib.parse import urlparse
+    p = urlparse(u if "://" in u else "http://" + u)
+    origin = f"{p.scheme}://{p.netloc}"
+    segs = [s for s in p.path.split("/") if s]
+    cands = [origin + ("/" + "/".join(segs[:k]) if k else "") for k in range(len(segs), -1, -1)]
+    for cand in dict.fromkeys(cands):
+        try:
+            req = Request(cand + "/api/libraries",
+                          headers={"Authorization": f"Bearer {t}", "Accept": "application/json",
+                                   "User-Agent": APP_NAME})
+            with urlopen(req, timeout=6) as resp:
+                if json.loads(resp.read().decode("utf-8", "replace")).get("libraries") is not None:
+                    _abs_cache["base"], _abs_cache["base_src"] = cand, u
+                    if cand != u:
+                        add_log(f"Audiobookshelf base resolved: {u} -> {cand}")
+                    return cand
+        except Exception:       # noqa: BLE001
+            continue
+    return u                     # let the caller fail loudly with the pasted value
+
+
+def _abs_req(path, method="GET", timeout=15):
+    u, t = _abs_conf()
+    if not u:
+        return None
+    req = Request(u + path, method=method,
+                  headers={"Authorization": f"Bearer {t}", "Accept": "application/json",
+                           "User-Agent": APP_NAME})
+    with urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return {}
+
+
+def _abs_library_id():
+    if _abs_cache["lib_id"]:
+        return _abs_cache["lib_id"]
+    try:
+        d = _abs_req("/api/libraries") or {}
+        libs = d.get("libraries") or []
+        book_libs = [l for l in libs if (l.get("mediaType") or "book") == "book"]
+        # several book libraries (e.g. "Audiobook Library" + "Dropped Books"):
+        # prefer the one that sounds like the main one, never a "dropped" bin
+        book_libs.sort(key=lambda l: ("dropped" in (l.get("name") or "").lower(),
+                                      "audiobook" not in (l.get("name") or "").lower()))
+        if book_libs:
+            _abs_cache["lib_id"] = book_libs[0].get("id")
+    except Exception as e:      # noqa: BLE001
+        _abs_cache["err"] = str(e)
+    return _abs_cache["lib_id"]
+
+
+def _abs_trigger_scan():
+    """Ask ABS to rescan its book library (after the filer added something)."""
+    lid = _abs_library_id()
+    if not lid:
+        return False
+    try:
+        _abs_req(f"/api/libraries/{lid}/scan", method="POST")
+        add_log("asked Audiobookshelf to rescan the library")
+        return True
+    except Exception as e:      # noqa: BLE001
+        add_log(f"Audiobookshelf scan request failed: {e}")
+        return False
+
+
+def _abs_refresh_progress(force=False):
+    """{norm(series name): {"n": book#, "pct": 0-100, "title": ...}} for books
+    currently in progress (not finished)."""
+    now = time.monotonic()
+    if not force and (now - _abs_cache["at"]) < ABS_PROGRESS_TTL_S:
+        return
+    _abs_cache["at"] = now
+    u, t = _abs_conf()
+    if not u:
+        return
+    try:
+        import file_audiobooks as _fa
+        normf = _fa.norm
+    except Exception:
+        normf = lambda x: (x or "").lower()     # noqa: E731
+    try:
+        me = _abs_req("/api/me") or {}
+        prog = [p for p in (me.get("mediaProgress") or [])
+                if not p.get("isFinished") and (p.get("progress") or 0) > 0.005]
+        prog.sort(key=lambda p: p.get("lastUpdate") or 0, reverse=True)
+        out = {}
+        for p in prog[:10]:                     # only the most recent listens
+            item_id = p.get("libraryItemId")
+            if not item_id:
+                continue
+            try:
+                item = _abs_req(f"/api/items/{item_id}") or {}
+            except Exception:
+                continue
+            md = ((item.get("media") or {}).get("metadata") or {})
+            series = md.get("seriesName") or ""
+            seq = None
+            m = re.search(r"#([\d.]+)", series)
+            if m:
+                seq = m.group(1)
+            series = re.sub(r"\s*#[\d.]+\s*$", "", series).strip()
+            if not series:
+                continue
+            key = normf(series)
+            if key in out:
+                continue                        # keep the most recent per series
+            try:
+                nnum = int(float(seq)) if seq else None
+            except ValueError:
+                nnum = None
+            out[key] = {"n": nnum, "pct": round((p.get("progress") or 0) * 100),
+                        "title": md.get("title") or ""}
+        _abs_cache["series"] = out
+        _abs_cache["err"] = None
+    except Exception as e:      # noqa: BLE001
+        _abs_cache["err"] = str(e)
+
+
+def _abs_listening_for(series_name):
+    try:
+        import file_audiobooks as _fa
+        key = _fa.norm(series_name)
+    except Exception:
+        key = (series_name or "").lower()
+    return _abs_cache["series"].get(key)
+
+
+
+# ---- AI series research --------------------------------------------------
+# For dormant/overdue series: ask an LLM with WEB SEARCH what's actually going
+# on (author announced a date? series concluded? publisher dropped it?) and pin
+# the answer to the card instead of guessing from cadence maths alone.
+# Provider + key live in Settings (write-only). Raw HTTP on purpose: the exe
+# bundles no SDKs, and four providers share one tiny call shape.
+AI_INTEL_TTL_DAYS = 14          # re-research a series at most this often
+AI_DAILY_MAX = 3                # automatic research calls per day (cost bound)
+AI_TIMEOUT_S = 120
+
+AI_DEFAULT_MODELS = {
+    "anthropic": "claude-opus-5",
+    "openrouter": "perplexity/sonar",
+    "openai": "gpt-5-mini",
+    "grok": "grok-3-mini",
+}
+
+_ai_day = {"date": None, "used": 0}
+
+
+def _ai_conf():
+    st = get_settings()
+    key = (st.get("ai_api_key") or "").strip()
+    if not key:
+        return None
+    prov = st.get("ai_provider") or "openrouter"
+    model = (st.get("ai_model") or "").strip() or AI_DEFAULT_MODELS.get(prov, "")
+    return {"provider": prov, "key": key, "model": model}
+
+
+def _ai_http(url, payload, headers):
+    req = Request(url, data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json", "User-Agent": APP_NAME, **headers})
+    with urlopen(req, timeout=AI_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _ai_call(prompt):
+    """One web-search-capable completion; returns the model's text or raises."""
+    conf = _ai_conf()
+    if not conf:
+        raise RuntimeError("no AI key configured")
+    prov, key, model = conf["provider"], conf["key"], conf["model"]
+    if prov == "anthropic":
+        d = _ai_http("https://api.anthropic.com/v1/messages",
+                     {"model": model, "max_tokens": 2048,
+                      "tools": [{"type": "web_search_20260209", "name": "web_search", "max_uses": 4}],
+                      "messages": [{"role": "user", "content": prompt}]},
+                     {"x-api-key": key, "anthropic-version": "2023-06-01"})
+        if d.get("stop_reason") == "refusal":
+            raise RuntimeError("model declined the request")
+        return "\n".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
+    if prov == "openai":
+        d = _ai_http("https://api.openai.com/v1/responses",
+                     {"model": model, "tools": [{"type": "web_search"}], "input": prompt},
+                     {"Authorization": f"Bearer {key}"})
+        out = []
+        for item in d.get("output", []):
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text":
+                        out.append(c.get("text", ""))
+        return "\n".join(out)
+    if prov == "grok":
+        d = _ai_http("https://api.x.ai/v1/chat/completions",
+                     {"model": model, "search_parameters": {"mode": "auto"},
+                      "messages": [{"role": "user", "content": prompt}]},
+                     {"Authorization": f"Bearer {key}"})
+        return ((d.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+    # openrouter (default): sonar-style models search on their own
+    d = _ai_http("https://openrouter.ai/api/v1/chat/completions",
+                 {"model": model, "messages": [{"role": "user", "content": prompt}]},
+                 {"Authorization": f"Bearer {key}"})
+    return ((d.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+
+
+def _ai_prompt_for(srs):
+    tl = sorted([e for e in srs.get("timeline", []) if _entry_n(e) is not None],
+                key=lambda e: _entry_n(e))
+    hist = "; ".join(f"book {_entry_n(e)}: novel {e.get('novel') or '?'}"
+                     + (f", audio {e.get('audiobook')}" if e.get("audiobook") else "")
+                     for e in tl[-5:])
+    return (
+        f"Research the book series '{srs.get('name', '')}' by {srs.get('author') or 'unknown author'} "
+        f"(LitRPG/progression fantasy, sold on Amazon/Audible/Royal Road).\n"
+        f"Known release history (may be incomplete): {hist or 'none recorded'}.\n"
+        f"Today is {today().isoformat()}.\n\n"
+        "Search the web for CURRENT information: has the author announced the next book or its audiobook, "
+        "is the series complete, on hiatus, or cancelled? Author newsletters, Patreon, Reddit "
+        "(r/litrpg, r/ProgressionFantasy), publisher (Aethon) announcements and Amazon pre-order pages are good sources.\n\n"
+        "Answer with ONLY a JSON object, no other text:\n"
+        '{"status": "ongoing|completed|hiatus|cancelled|unknown",\n'
+        ' "next_book": {"n": <number or null>, "kind": "novel|audiobook|null", "expected": "<date or timeframe or null>"},\n'
+        ' "summary": "<1-2 factual sentences, cite where the information came from>",\n'
+        ' "confidence": "high|medium|low"}'
+    )
+
+
+def _ai_parse(text):
+    m = re.search(r"\{(?:.|\n)*\}", text or "")
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or "status" not in d:
+        return None
+    return {"status": str(d.get("status", "unknown"))[:12],
+            "next_book": d.get("next_book") if isinstance(d.get("next_book"), dict) else None,
+            "summary": str(d.get("summary", ""))[:400],
+            "confidence": str(d.get("confidence", ""))[:8]}
+
+
+def _ai_research_series(sid, manual=False):
+    """Run one research pass for a series; stores the result on the series and
+    pings Discord when the picture changed. Returns (ok, message)."""
+    if not _ai_conf():
+        return False, "no AI key configured (Settings \u2192 Integrations)"
+    with _lock:
+        srs = _find(sid)
+        if not srs:
+            return False, "unknown series"
+        prompt = _ai_prompt_for(srs)
+        old = (srs.get("intel") or {}).get("status")
+        name = srs.get("name", "")
+    try:
+        raw = _ai_call(prompt)
+    except Exception as e:      # noqa: BLE001 - HTTP/auth/parse all end up here
+        add_log(f"AI research failed for {name}: {e}")
+        return False, f"research failed: {e}"
+    intel = _ai_parse(raw)
+    if not intel:
+        add_log(f"AI research for {name}: unparseable answer ({(raw or '')[:120]!r})")
+        return False, "the model's answer wasn't parseable"
+    intel["at"] = _buy_now()
+    with _lock:
+        srs = _find(sid)
+        if srs is not None:
+            srs["intel"] = intel
+            save_state()
+    add_log(f"AI research: {name} -> {intel['status']} ({intel['confidence']})")
+    nb = intel.get("next_book") or {}
+    if (intel["status"] != (old or intel["status"]) or nb.get("expected")) and intel["status"] != "unknown":
+        bits = f" Next: book {nb.get('n')} {nb.get('kind') or ''} ~{nb.get('expected')}." if nb.get("expected") else ""
+        _discord_notify(f"\U0001f50e **{name}** research: {intel['status']}.{bits}\n{intel['summary']}")
+    return True, intel["status"]
+
+
+def _ai_candidates():
+    """Series worth researching: overdue audio or dormant, intel stale/missing."""
+    out = []
+    cutoff = datetime.now() - timedelta(days=AI_INTEL_TTL_DAYS)
+    with _lock:
+        for srs in _state.get("series", []):
+            intel = srs.get("intel") or {}
+            try:
+                fresh = datetime.fromisoformat(intel.get("at", "")) > cutoff
+            except (TypeError, ValueError):
+                fresh = False
+            if fresh:
+                continue
+            tl = srs.get("timeline") or []
+            dates = [parse_date(e.get(k)) for e in tl for k in ("novel", "audiobook")]
+            dates = [d for d in dates if d]
+            newest = max(dates) if dates else None
+            dormant = newest is not None and (today() - newest).days > 270
+            overdue = bool(srs.get("audio_overdue")) or any(
+                parse_date(e.get("novel")) and not e.get("audiobook")
+                and (today() - parse_date(e.get("novel"))).days > 180 for e in tl)
+            if dormant or overdue:
+                out.append((newest or today(), srs["id"]))
+    out.sort()
+    return [sid for _, sid in out]
+
+
+def _ai_tick():
+    if not _ai_conf():
+        return
+    d = today().isoformat()
+    if _ai_day["date"] != d:
+        _ai_day.update({"date": d, "used": 0})
+    if _ai_day["used"] >= AI_DAILY_MAX:
+        return
+    for sid in _ai_candidates()[: AI_DAILY_MAX - _ai_day["used"]]:
+        _ai_day["used"] += 1
+        threading.Thread(target=_ai_research_series, args=(sid,), daemon=True).start()
+
+
+@app.post("/api/series/<sid>/research")
+def api_series_research(sid):
+    ok, msg = _ai_research_series(sid, manual=True)
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+
+def _buy_tick():
+    with _lock:
+        now = datetime.now()
+        changed = False
+        for job in _state.get("buy_jobs", []):
+            st = job.get("status")
+            if st in ("waiting_offer", "needs_signin"):
+                try:
+                    created = datetime.fromisoformat(job.get("created"))
+                    last = datetime.fromisoformat(job.get("last_probe") or job.get("created"))
+                except (TypeError, ValueError):
+                    continue
+                if (now - created).days >= BUY_PROBE_DAYS or int(job.get("probes") or 0) >= BUY_PROBE_MAX:
+                    _job_set(job, "failed", "still signed out when the window closed — buy it by hand" if st == "needs_signin"
+                             else "no companion offer appeared within the window")
+                    changed = True
+                elif (now - last) >= timedelta(hours=BUY_PROBE_GAP_H):
+                    _buy_push_probe(job)
+                    changed = True
+            elif st == "retry_later":
+                try:
+                    due = datetime.fromisoformat(job.get("retry_at"))
+                except (TypeError, ValueError):
+                    due = now
+                if now >= due:
+                    _job_set(job, "running", f"retrying the purchase (try {int(job.get('store_retries') or 0) + 1})")
+                    _push_command(type="buy", phase="execute", job=_job_cmd(job))
+                    changed = True
+            elif st == "awaiting_approval":
+                try:
+                    if datetime.fromisoformat(job.get("expires")) < now:
+                        _job_set(job, "expired", "approval link expired")
+                        changed = True
+                except (TypeError, ValueError):
+                    pass
+        if changed:
+            save_state()
+
+
+# ---- routes (local: dashboard + extension)
+@app.get("/api/buy/jobs")
+def api_buy_jobs():
+    with _lock:
+        jobs = [dict(j, token_hash=None) for j in reversed(_state.get("buy_jobs", []))]
+        ledger = dict(_state.get("buy_ledger", {}))
+    return jsonify({"jobs": jobs[:30], "ledger": ledger, "week_auto": _buy_week_count(),
+                    "bat": _bat_path() or "", "libation": _libation_files_dir() or ""})
+
+
+@app.post("/api/buy/report")
+def api_buy_report():
+    body = request.get_json(force=True, silent=True) or {}
+    with _lock:
+        job = _buy_job_by_id(str(body.get("job_id") or ""))
+        if not job:
+            return jsonify({"ok": False, "error": "unknown job"}), 404
+        _buy_handle_report(job, str(body.get("phase") or ""), bool(body.get("ok")), body.get("detail") or {})
+        save_state()
+        status = job["status"]
+    return jsonify({"ok": True, "status": status})
+
+
+@app.post("/api/buy/<jid>/<action>")
+def api_buy_action(jid, action):
+    with _lock:
+        job = _buy_job_by_id(jid)
+        if not job:
+            return jsonify({"ok": False, "error": "unknown job"}), 404
+        if action == "approve" and job["status"] in ("awaiting_approval", "waiting_offer", "dry_done", "failed", "expired", "denied", "cancelled", "retry_later"):
+            if job.get("price") is None:
+                return jsonify({"ok": False, "error": "no price known yet — probe first"}), 400
+            job["dry_run"] = False
+            _buy_approve(job, who="dashboard")
+        elif action == "deny" and job["status"] in ("awaiting_approval", "probing", "waiting_offer", "running", "retry_later"):
+            _buy_deny(job, who="dashboard")
+        elif action == "retry":
+            job["dry_run"] = bool(get_settings().get("buy_dry_run", True))
+            _job_set(job, "probing", "retry from dashboard")
+            _buy_push_probe(job)
+        elif action == "cancel":
+            _job_set(job, "cancelled", "cancelled from dashboard")
+        elif action == "returnku":
+            if not job.get("ku_borrowed_by_us"):
+                return jsonify({"ok": False, "error": "that borrow wasn't made by me"}), 400
+            _push_command(type="buy", phase="return", job=_job_cmd(job))
+            _job_step(job, "return", True, "asked the extension to return the KU borrow")
+        elif action == "notbought" and job["status"] in ("uncertain", "failed", "done_unreturned"):
+            led = _state.setdefault("buy_ledger", {})
+            if job.get("audio_asin") in led and led[job["audio_asin"]].get("job") == job["id"]:
+                del led[job["audio_asin"]]
+            job.pop("purchased", None)
+            _job_set(job, "failed", "you checked: not bought (unblocked)")
+        elif action == "bought" and job["status"] in ("uncertain", "failed", "done_unreturned", "dry_done"):
+            _state.setdefault("buy_ledger", {})[job["audio_asin"]] = {
+                "series": job.get("series"), "n": job.get("n"), "at": _buy_now(), "job": job["id"],
+                "price": job.get("price"), "auto": False}
+            job["purchased"] = True
+            job["purchased_at"] = _buy_now()
+            _job_set(job, "done_unreturned" if job.get("ku_borrowed_by_us") else "done",
+                     "you checked: bought" + (" - return the KU borrow by hand" if job.get("ku_borrowed_by_us") else ""))
+            _run_update_audiobooks(job, delay=5)
+        elif action == "forget":
+            _state["buy_jobs"] = [j for j in _state.get("buy_jobs", []) if j.get("id") != jid]
+        else:
+            return jsonify({"ok": False, "error": f"can't {action} a job that is {job['status']}"}), 400
+        save_state()
+    return jsonify({"ok": True})
+
+
+def _buy_for_book(sid, n, source="the timeline"):
+    """Queue a verify-mode purchase for one tracked book (any age). Shared by
+    the hover-card endpoint and the Discord bot. Returns (ok, message)."""
+    st = get_settings()
+    if not st.get("buy_master"):
+        return False, "auto-buy master switch is off (Settings)"
+    with _lock:
+        srs = _find(sid)
+        if not srs:
+            return False, "unknown series"
+        audio = (srs.get("asins_audio") or {}).get(str(n))
+        kindle = (srs.get("asins_novel") or {}).get(str(n)) or (srs.get("asins") or {}).get(str(n))
+        if not audio and not kindle:
+            return False, "no store page recorded for this book yet"
+        if audio and audio in _state.get("buy_ledger", {}):
+            return False, "that audiobook was already bought through the radar"
+        existing = _buy_job_for(sid, n)
+        if existing:
+            return False, f"a job for this book already exists ({existing['status']})"
+        if audio and _libation_owns(audio):
+            return False, "Libation already has this audiobook"
+        ent = next((e for e in srs.get("timeline", []) if _entry_n(e) == n), {}) or {}
+        if ent.get("ku") is False:
+            return False, "not a Kindle Unlimited title - the companion-price flow only works for KU books"
+        job = {"id": uuid.uuid4().hex[:10], "series_id": sid, "series": srs.get("name", ""), "n": n,
+               "title": (ent.get("title") or f"{srs.get('name', '')} {n}"),
+               "audio_asin": audio, "kindle_asin": kindle,
+               "store_host": srs.get("store_host") or "www.amazon.com.au",
+               "mode": "verify",
+               "cap": _clean_buy_cap(srs.get("buy_cap")) or _clean_buy_cap(st.get("buy_cap_default")) or BUY_DEFAULT_CAP,
+               "dry_run": False, "status": "probing", "price": None,
+               "created": _buy_now(), "updated": _buy_now(), "probes": 0, "last_probe": None,
+               "steps": [], "note": f"requested from {source}"}
+        _state.setdefault("buy_jobs", []).append(job)
+        _state["buy_jobs"] = _state["buy_jobs"][-100:]
+        _buy_push_probe(job)
+        save_state()
+    add_log(f"buy requested from {source}: {job['series']} book {n}")
+    return True, ("Checking the live price \u2014 approve from the Discord link or "
+                  "Settings \u2192 Purchase jobs (about a minute).")
+
+
+@app.post("/api/buy/for-book")
+def api_buy_for_book():
+    """Hover-card Buy button."""
+    body = request.get_json(force=True, silent=True) or {}
+    sid = str(body.get("series_id") or "")
+    try:
+        n = int(body.get("n"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "need a book number"}), 400
+    ok, msg = _buy_for_book(sid, n)
+    if not ok:
+        return jsonify({"ok": False, "error": msg}), (404 if msg == "unknown series" else 400)
+    return jsonify({"ok": True, "message": msg})
+
+
+# ---- held books (filer HOLDs): list, resolve, teach ----------------------
+def _filer_report_path():
+    return os.path.join(data_dir(), "filer-report.json")
+
+
+def _load_holds():
+    """Current HOLDs from the last filer run, only those still on disk."""
+    try:
+        with open(_filer_report_path(), encoding="utf-8") as f:
+            rep = json.load(f)
+    except (OSError, ValueError):
+        return []
+    holds = []
+    for r in rep.get("results", []):
+        if r.get("action") != "HELD" or not r.get("src"):
+            continue
+        if not os.path.exists(r["src"]):
+            continue                       # resolved by hand / a later run
+        holds.append(r)
+    return holds
+
+
+def _hold_candidates(reason):
+    """Folder names offered by an 'ambiguous: ... under ['A', 'B']' reason."""
+    m = re.search(r"\[([^\]]*)\]", reason or "")
+    if not m:
+        return []
+    return [c.strip().strip("'\"") for c in m.group(1).split(",") if c.strip().strip("'\"")]
+
+
+@app.get("/api/holds")
+def api_holds():
+    holds = _load_holds()
+    try:
+        import file_audiobooks as _fa
+        authors = _fa._subdirs(_fa.DEFAULT_DST)
+    except Exception:
+        authors = []
+    out = []
+    for h in holds:
+        out.append({**h, "candidates": _hold_candidates(h.get("reason"))})
+    return jsonify({"holds": out, "authors": authors})
+
+
+@app.post("/api/holds/resolve")
+def api_holds_resolve():
+    """Move one held book under the chosen author folder (series kept from the
+    hold, or overridden), and TEACH the correction so this spelling never
+    holds again."""
+    body = request.get_json(force=True, silent=True) or {}
+    src = (body.get("src") or "").strip()
+    author_folder = (body.get("author") or "").strip()
+    series_folder = (body.get("series") or "").strip()
+    if not (src and author_folder):
+        return jsonify({"ok": False, "error": "need the held path and an author folder"}), 400
+    holds = {h["src"]: h for h in _load_holds()}
+    h = holds.get(src)
+    if not h:
+        return jsonify({"ok": False, "error": "that hold is gone (already resolved?)"}), 404
+    try:
+        import file_audiobooks as _fa
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"filer module unavailable: {e}"}), 500
+    series_folder = series_folder or (h.get("series") or "")
+    book = h.get("book") or os.path.basename(src)
+    want = _fa.schema_book_name(book, series_folder) or book
+    if series_folder:
+        dst_dir = os.path.join(_fa.DEFAULT_DST, author_folder, series_folder, want)
+    else:
+        dst_dir = os.path.join(_fa.DEFAULT_DST, author_folder, want)
+    if os.path.exists(dst_dir):
+        return jsonify({"ok": False, "error": f"already exists: {dst_dir}"}), 409
+    try:
+        os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
+        import shutil as _sh
+        _sh.move(src, dst_dir)
+        _fa._rename_single_audio(dst_dir)
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"move failed: {e}"}), 500
+    # teach: the hold's author string now always means this author folder
+    taught = []
+    try:
+        if h.get("author") and _fa.norm(h["author"]) != _fa.norm(author_folder):
+            _fa.save_alias("authors", h["author"], author_folder)
+            taught.append(f"author '{h['author']}' -> '{author_folder}'")
+        if h.get("series") and series_folder and _fa.norm(h["series"]) != _fa.norm(series_folder):
+            _fa.save_alias("series", h["series"], series_folder)
+            taught.append(f"series '{h['series']}' -> '{series_folder}'")
+    except OSError:
+        pass
+    _own_cache["at"] = 0.0
+    threading.Thread(target=_abs_trigger_scan, daemon=True).start()
+    add_log(f"hold resolved: {book} -> {author_folder}/{series_folder or ''}"
+            + (f" (learned: {'; '.join(taught)})" if taught else ""))
+    return jsonify({"ok": True, "moved_to": dst_dir, "learned": taught})
+
+
+
+
+@app.post("/api/buy/test-email")
+def api_buy_test_email():
+    ok, msg = _send_email("Release Radar: test email", "If you can read this, approval emails will work.")
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.post("/api/buy/run-bat")
+def api_buy_run_bat():
+    if not _bat_path():
+        return jsonify({"ok": False, "message": "Update Audiobooks.bat not found"}), 404
+    _run_update_audiobooks(None, delay=0)
+    return jsonify({"ok": True, "message": "running in the background — outcome goes to Discord and the log"})
+
+
+@app.post("/api/buy/test-probe")
+def api_buy_test_probe():
+    """Dashboard: probe any audiobook ASIN once (dry, no job side effects) to see
+    what the extension can read on your signed-in pages."""
+    body = request.get_json(force=True, silent=True) or {}
+    asin = (body.get("audio_asin") or "").strip().upper()
+    if not re.fullmatch(r"B0[0-9A-Z]{8}", asin):
+        return jsonify({"ok": False, "error": "need an audiobook ASIN like B0H8ZN7RB8"}), 400
+    with _lock:
+        job = {"id": "probe-" + uuid.uuid4().hex[:6], "series_id": None, "series": "(test probe)", "n": 0,
+               "title": asin, "audio_asin": asin, "kindle_asin": (body.get("kindle_asin") or "").strip() or None,
+               "store_host": (body.get("store_host") or "www.amazon.com.au"), "mode": "verify",
+               "cap": _clean_buy_cap(get_settings().get("buy_cap_default")) or BUY_DEFAULT_CAP,
+               "dry_run": True, "status": "probing", "price": None, "created": _buy_now(),
+               "updated": _buy_now(), "probes": 0, "steps": [], "note": "manual test probe"}
+        _state.setdefault("buy_jobs", []).append(job)
+        _buy_push_probe(job)
+        save_state()
+    return jsonify({"ok": True, "job_id": job["id"]})
+
+
+# ---- the token page (the one thing the tunnel may POST to)
+_BUY_PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Release Radar — approve purchase</title><style>
+body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#14121a;color:#f1ecff;margin:0;padding:28px 18px}
+.card{max-width:520px;margin:0 auto;background:#1e1a29;border:1px solid #35304a;border-radius:14px;padding:22px}
+h1{font-size:18px;margin:0 0 12px} .t{font-size:20px;margin:6px 0} .p{font-size:28px;color:#ffd27a;margin:8px 0}
+.m{color:#b8b0d0;font-size:14px} form{display:inline-block;margin:16px 8px 0 0}
+button{font-size:16px;padding:12px 22px;border-radius:10px;border:0;cursor:pointer}
+.ok{background:#3fae6a;color:#fff} .no{background:#5a3157;color:#ffb0b0} .done{font-size:18px;margin-top:14px}
+</style></head><body><div class="card">%s</div></body></html>"""
+
+
+def _buy_find_by_token(token):
+    h = hashlib.sha256((token or "").encode()).hexdigest()
+    return next((j for j in _state.get("buy_jobs", []) if j.get("token_hash") == h), None)
+
+
+@app.get("/buy/<token>")
+def buy_page(token):
+    with _lock:
+        job = _buy_find_by_token(token)
+        if not job:
+            return Response(_BUY_PAGE % "<h1>Unknown or used link</h1><div class='m'>Nothing was done.</div>", mimetype="text/html"), 404
+        price = job.get("price")
+        ptxt = f"${price:.2f}" if isinstance(price, (int, float)) else "price unknown"
+        if job["status"] != "awaiting_approval":
+            body = f"<h1>Already decided</h1><div class='t'>{job.get('series','')} — book {job.get('n')}</div><div class='m'>Status: {job['status']}. {job.get('note','')}</div>"
+            return Response(_BUY_PAGE % body, mimetype="text/html")
+        body = (f"<h1>Buy this audiobook?</h1><div class='t'>{job.get('series','')} — book {job.get('n')}</div>"
+                f"<div class='m'>{job.get('title','')}</div><div class='p'>{ptxt}</div>"
+                f"<div class='m'>Cap ${float(job.get('cap') or 0):.2f} · {job.get('note','')}</div>"
+                f"<div class='m'>Borrows the Kindle edition on KU, buys the audiobook at the companion price, returns the borrow, runs Update Audiobooks.</div>"
+                f"<form method='post' action='/buy/{token}/approve'><button class='ok'>Approve</button></form>"
+                f"<form method='post' action='/buy/{token}/deny'><button class='no'>Deny</button></form>")
+    return Response(_BUY_PAGE % body, mimetype="text/html")
+
+
+@app.post("/buy/<token>/<decision>")
+def buy_decide_route(token, decision):
+    with _lock:
+        job = _buy_find_by_token(token)
+        if not job or job["status"] != "awaiting_approval":
+            return Response(_BUY_PAGE % "<h1>Link already used or expired</h1><div class='m'>Nothing was done.</div>", mimetype="text/html"), 410
+        try:
+            if datetime.fromisoformat(job.get("expires")) < datetime.now():
+                _job_set(job, "expired", "approval link expired")
+                save_state()
+                return Response(_BUY_PAGE % "<h1>This link has expired</h1><div class='m'>Nothing was done.</div>", mimetype="text/html"), 410
+        except (TypeError, ValueError):
+            pass
+        job["token_hash"] = None                      # single use
+        if decision == "approve":
+            _buy_approve(job, who="link")
+            body = f"<h1>Approved</h1><div class='done'>\u2705 Buying {job.get('series','')} — book {job.get('n')}. You'll get a Discord message when it's done.</div>"
+        else:
+            _buy_deny(job, who="link")
+            body = f"<h1>Denied</h1><div class='done'>Nothing will be bought for {job.get('series','')} — book {job.get('n')}.</div>"
+        save_state()
+    return Response(_BUY_PAGE % body, mimetype="text/html")
+
 
 
 @app.post("/api/ext/crawl")
@@ -2545,7 +4599,27 @@ def api_get_settings():
                     "discord_on_release": s.get("discord_on_release", True),
                     "discord_daily": s.get("discord_daily", False),
                     "discord_daily_hour": s.get("discord_daily_hour", 9),
-                    "discord_digest_days": s.get("discord_digest_days", 1)})
+                    "discord_digest_days": s.get("discord_digest_days", 1),
+                    # auto-buy (the app password is write-only: never echoed back)
+                    "buy_master": bool(s.get("buy_master")),
+                    "buy_dry_run": bool(s.get("buy_dry_run", True)),
+                    "buy_cap_default": s.get("buy_cap_default", BUY_DEFAULT_CAP),
+                    "buy_weekly_max": s.get("buy_weekly_max", BUY_WEEKLY_MAX),
+                    "buy_email_to": ("" if remote else s.get("buy_email_to", "")),
+                    "buy_smtp_user": ("" if remote else s.get("buy_smtp_user", "")),
+                    "buy_smtp_pass_set": bool(s.get("buy_smtp_pass")),
+                    "buy_public_base": s.get("buy_public_base", ""),
+                    "buy_bat": s.get("buy_bat", ""),
+                    "buy_bat_found": _bat_path() or "",
+                    "buy_tab_mode": s.get("buy_tab_mode", "foreground"),
+                    "bot_token_set": bool(s.get("bot_token")),
+                    "bot_running": _bot_state["running"], "bot_err": _bot_state["err"],
+                    "ai_provider": s.get("ai_provider", "openrouter"),
+                    "ai_api_key_set": bool(s.get("ai_api_key")),
+                    "ai_model": s.get("ai_model", ""),
+                    "abs_url": ("" if remote else s.get("abs_url", "")),
+                    "abs_token_set": bool(s.get("abs_token")),
+                    "buy_libation_found": _libation_files_dir() or ""})
 
 
 @app.post("/api/settings")
@@ -2563,6 +4637,37 @@ def api_set_settings():
                 s["upcoming_mode"] = m
         if "discord_webhook" in body:
             s["discord_webhook"] = (body.get("discord_webhook") or "").strip()
+        for k in ("buy_master", "buy_dry_run"):
+            if k in body:
+                s[k] = bool(body.get(k))
+        for k in ("buy_email_to", "buy_smtp_user", "buy_public_base", "buy_bat", "buy_libation_files", "buy_smtp_host"):
+            if k in body:
+                s[k] = (body.get(k) or "").strip()
+        if body.get("buy_tab_mode") in BUY_TAB_MODES:
+            s["buy_tab_mode"] = body["buy_tab_mode"]
+        if "buy_smtp_pass" in body and (body.get("buy_smtp_pass") or "").strip():
+            s["buy_smtp_pass"] = body["buy_smtp_pass"].strip().replace(" ", "")
+        if body.get("buy_smtp_pass_clear"):
+            s["buy_smtp_pass"] = ""
+        # integration secrets: same write-only rules
+        for sec in ("bot_token", "ai_api_key", "abs_token"):
+            if sec in body and (body.get(sec) or "").strip():
+                s[sec] = body[sec].strip()
+            if body.get(sec + "_clear"):
+                s[sec] = ""
+        if body.get("ai_provider") in ("openrouter", "anthropic", "openai", "grok"):
+            s["ai_provider"] = body["ai_provider"]
+        if "ai_model" in body:
+            s["ai_model"] = (body.get("ai_model") or "").strip()
+        if "abs_url" in body:
+            s["abs_url"] = (body.get("abs_url") or "").strip().rstrip("/")
+        if "buy_cap_default" in body:
+            s["buy_cap_default"] = _clean_buy_cap(body.get("buy_cap_default")) or BUY_DEFAULT_CAP
+        if "buy_weekly_max" in body:
+            try:
+                s["buy_weekly_max"] = max(0, int(body.get("buy_weekly_max")))
+            except (TypeError, ValueError):
+                pass
         if "discord_on_new" in body:
             s["discord_on_new"] = bool(body.get("discord_on_new"))
         if "discord_on_release" in body:
@@ -2788,1040 +4893,27 @@ def _clean_timeline(raw, existing=None):
 # Front-end (inlined so the exe is a single self-contained file)
 # ---------------------------------------------------------------------------
 
-PAGE_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Release Radar</title>
-<link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<style>
-:root{
-  --bg:#15131f; --bg2:#1b1827; --card:#211d30; --card2:#272237;
-  --line:#332c47; --ink:#f1ebdd; --muted:#9b93ac; --faint:#6f6883;
-  --amber:#e7b14c; --amber-dim:#3a2f1b;
-  --teal:#62bd9c; --teal-dim:#1d3330;
-  --violet:#9d8cff; --violet-dim:#272140;
-  --rose:#d98a8a;
-  --radius:14px; --mono:"SF Mono","Cascadia Code","JetBrains Mono",Consolas,monospace;
-  --serif:"Iowan Old Style","Palatino Linotype","Book Antiqua",Georgia,serif;
-  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-}
-*{box-sizing:border-box}
-body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#241f37 0,var(--bg) 60%);
-  color:var(--ink);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
-a{color:var(--amber);text-decoration:none}
-a:hover{text-decoration:underline}
-.wrap{max-width:1060px;margin:0 auto;padding:28px 22px 80px}
-header{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;flex-wrap:wrap;margin-bottom:8px}
-.brand{display:flex;align-items:center;gap:13px}
-.logo{width:40px;height:40px;flex:0 0 auto}
-h1{font-family:var(--serif);font-weight:600;font-size:30px;letter-spacing:.2px;margin:0}
-.sub{color:var(--muted);font-size:13px;margin-top:2px}
-.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-button{font-family:inherit;font-size:14px;border-radius:10px;border:1px solid var(--line);
-  background:var(--card2);color:var(--ink);padding:9px 14px;cursor:pointer;transition:.15s}
-button:hover{border-color:#4a4067;background:#2c2640}
-button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
-.btn-primary{background:var(--amber);color:#1a1408;border-color:var(--amber);font-weight:600}
-.btn-primary:hover{background:#f0c062;border-color:#f0c062}
-.ghost{background:transparent}
-.meta-line{display:flex;gap:16px;align-items:center;color:var(--faint);font-size:12.5px;margin:14px 0 22px;flex-wrap:wrap}
-.meta-line .mono{font-family:var(--mono)}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--teal);display:inline-block;box-shadow:0 0 0 3px var(--teal-dim)}
-.pulse{animation:p 2.4s infinite}
-@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
+# ---------------------------------------------------------------------------
+# Dashboard page. The real, editable sources live in static/dashboard.html/
+# .css/.js (lintable, diffable); they are composed here into the same single
+# self-contained page this app has always served. PyInstaller bundles the
+# folder via:  --add-data "static;static"  (see build.bat).
+# ---------------------------------------------------------------------------
+_STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 
-.section-eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);margin:30px 0 12px}
 
-/* hero: next three */
-.hero{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
-.up{position:relative;background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);
-  border-radius:var(--radius);padding:16px;min-height:128px;display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}
-.up.soonest{border-color:#5a4a25;background:linear-gradient(180deg,#2c2417,var(--card))}
-.up .count{font-family:var(--mono);font-size:30px;font-weight:600;line-height:1}
-.up.soonest .count{color:var(--amber)}
-.up .count small{font-size:13px;color:var(--muted);font-weight:400;margin-left:6px;font-family:var(--sans)}
-/* release day: a ticking timer replaces the day count */
-.up .count.tick{font-size:22px;letter-spacing:.01em}
-.up .count.tick.countdown{color:var(--amber)}
-.up .count.tick.late{color:var(--rose)}
-.up.late{border-color:#5a3540;background:linear-gradient(180deg,#2b1d24,var(--card))}
-/* confirmed out: green */
-.up .count.rel{font-size:18px;letter-spacing:.08em;color:#56d18a}
-.up.released{border-color:#2c5a3f;background:linear-gradient(180deg,#16271d,var(--card))}
-.up.released .count small{color:#56d18a;opacity:.8}
-.remote-ro{position:sticky;top:0;z-index:50;padding:7px 14px;font-size:12.5px;text-align:center;
-  background:#3a2a12;color:#f0c97a;border-bottom:1px solid #6b4d1e}
-.up .t{font-family:var(--serif);font-size:17px;margin-top:10px;line-height:1.25}
-.up .d{color:var(--muted);font-size:12.5px;margin-top:4px}
-.kind{display:inline-block;font-size:10.5px;font-family:var(--mono);letter-spacing:.06em;text-transform:uppercase;
-  padding:2px 7px;border-radius:6px;border:1px solid var(--line);color:var(--muted)}
-.kind.audio{color:var(--amber);border-color:#5a4a25;background:var(--amber-dim)}
-.kind.novel{color:var(--violet);border-color:#3a3360;background:var(--violet-dim)}
-.kind.est{color:var(--faint)}
+def _load_page_html():
+    def rd(name):
+        # universal newlines: the old r\"\"\"-literal went through Python's source
+        # parser, which normalised CRLF - the served page must stay identical
+        with open(os.path.join(_STATIC_DIR, name), encoding="utf-8") as f:
+            return f.read()
+    return (rd("dashboard.html")
+            .replace("__RR_CSS__", rd("dashboard.css"))
+            .replace("__RR_JS__", rd("dashboard.js")))
 
-/* top row: header + meta on the left, the overdue panel filling the space right */
-.topgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,380px);
-  gap:20px;align-items:start}
-@media(max-width:900px){.topgrid{grid-template-columns:1fr}}
 
-/* overdue panel */
-.overdue{display:flex;flex-direction:column;gap:5px;max-height:196px;overflow-y:auto;
-  padding-right:4px;scrollbar-width:thin;scrollbar-color:#4a4067 transparent}
-.overdue::-webkit-scrollbar{width:8px}
-.overdue::-webkit-scrollbar-thumb{background:#4a4067;border-radius:4px}
-.overdue::-webkit-scrollbar-track{background:transparent}
-.od{display:flex;align-items:center;gap:9px;padding:6px 9px;border:1px solid #5a3540;
-  border-radius:10px;background:linear-gradient(180deg,#2b1d24,var(--card))}
-.od .late{font-family:var(--mono);font-size:17px;font-weight:600;line-height:1;
-  color:var(--rose);min-width:40px;text-align:center;flex:0 0 auto}
-.od .late small{display:block;font-size:9px;color:var(--muted);font-weight:400;
-  margin-top:2px;font-family:var(--sans);letter-spacing:.02em}
-.od .cov{width:24px;height:36px;object-fit:cover;border-radius:3px;border:1px solid var(--line);flex:0 0 auto}
-.od .info{flex:1;min-width:0}
-.od .t{font-family:var(--serif);font-size:12.5px;line-height:1.25;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.od .d{color:var(--faint);font-size:10px;font-family:var(--mono);margin-top:2px;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-/* series cards */
-.sortbar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 10px}
-.sortbar .left{display:flex;align-items:center;gap:8px}
-.sortbar .lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
-.sortbar select{width:auto;padding:5px 9px;font-size:12.5px}
-.grid{display:flex;flex-direction:column;gap:8px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:10px 12px;
-  display:flex;gap:11px;align-items:flex-start;flex-wrap:wrap}
-.card.dragging{opacity:.4}
-.card.dragover{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber) inset}
-.grip{cursor:grab;color:var(--faint);font-size:14px;line-height:1.1;align-self:center;user-select:none;letter-spacing:1px}
-.grip:active{cursor:grabbing}
-.cover{width:60px;height:90px;object-fit:cover;border-radius:6px;border:1px solid var(--line);background:var(--bg2);flex:0 0 auto}
-.cover.ph{display:flex;align-items:center;justify-content:center;color:var(--faint);font-family:var(--serif);font-size:24px}
-.cmain{flex:1 1 240px;min-width:0}
-.card h3{font-family:var(--serif);font-weight:600;font-size:16px;margin:0 0 1px;line-height:1.2}
-.byline{color:var(--muted);font-size:11.5px;margin-bottom:7px}
-.facts{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:7px}
-.fact .k{font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--faint)}
-.fact .v{font-family:var(--mono);font-size:12px;margin-top:1px}
-/* which volume this column is about — often not the one on the Novel line */
-.fact .bk{color:var(--faint);font-size:11px}
-.pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;border:1px solid}
-.pill.released{color:var(--teal);border-color:#2c5147;background:var(--teal-dim)}
-.pill.announced{color:var(--amber);border-color:#5a4a25;background:var(--amber-dim)}
-.pill.none,.pill.unknown{color:var(--muted);border-color:var(--line);background:var(--bg2)}
-.predict{margin-top:5px;font-size:11.5px;color:var(--violet)}
-.predict .mono{font-family:var(--mono)}
-.err{margin-top:6px;font-size:11.5px;color:var(--rose)}
-.changed{margin-top:6px;font-size:11.5px;color:var(--teal)}
-.chg-time{color:var(--faint)}
-.right{display:flex;flex-direction:column;align-items:flex-end;gap:5px;flex:0 0 auto;margin-left:auto}
-.rowbtns{display:flex;gap:5px}
-.rowbtns button{padding:5px 9px;font-size:12px}
-
-/* gap timeline signature */
-.timeline{margin-top:7px;padding-top:7px;border-top:1px dashed var(--line)}
-.tl-row{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:10.5px;color:var(--muted);margin:3px 0}
-.track{position:relative;flex:1;height:2px;background:var(--line);border-radius:2px;min-width:80px;margin-right:40px}
-.tl-end{position:absolute;top:7px;font:500 10px/1 var(--mono,monospace);color:var(--faint);white-space:nowrap;letter-spacing:.02em}
-.tl-row{padding-bottom:12px}
-.tl-today{position:absolute;top:-4px;bottom:-4px;width:1px;background:var(--faint);opacity:.7;transform:translateX(-50%)}
-.tl-today::after{content:'';position:absolute;top:-2px;left:-2px;width:5px;height:5px;border-radius:50%;background:var(--faint);opacity:.9}
-a.plain{color:inherit;text-decoration:none}a.plain:hover h3,a.plain:hover{text-decoration:underline;text-decoration-color:var(--faint)}
-a.mark{text-decoration:none}
-.mark{position:absolute;top:50%;transform:translate(-50%,-50%);width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 1.5px var(--card)}
-.mark.novel{color:var(--violet)}
-.mark.audio{color:var(--amber)}
-.mark.both{width:11px;height:11px;color:var(--amber);background:linear-gradient(135deg,var(--violet) 0 50%,var(--amber) 50% 100%)}
-.mark.est{color:var(--amber);background:transparent;border:1.5px dashed currentColor;box-shadow:none}
-.mark.future{background:transparent;border:2px solid currentColor;box-shadow:none}
-/* hollow = upcoming, but a same-day novel+audiobook must stay half violet /
-   half amber: the transparent background drops the gradient, so the split is
-   carried by the border instead (violet top-left, amber bottom-right) */
-.mark.future.both{background:transparent;border:2px solid;
-  border-color:var(--violet) var(--amber) var(--amber) var(--violet)}
-.gaplabel{flex:0 0 auto;color:var(--ink)}
-.hovercard{position:fixed;z-index:70;display:flex;gap:10px;align-items:flex-start;background:var(--card2);
-  border:1px solid #4a4067;border-radius:10px;padding:9px 11px;max-width:270px;
-  box-shadow:0 10px 30px rgba(0,0,0,.5);pointer-events:none}
-.hovercard img{width:44px;height:66px;object-fit:cover;border-radius:5px;border:1px solid var(--line);flex:0 0 auto}
-.hovercard .hc-t{font-family:var(--serif);font-size:13px;line-height:1.25;margin-bottom:3px}
-.hovercard .hc-d{font-family:var(--mono);font-size:10.5px;color:var(--muted);line-height:1.4}
-.hovercard .hc-n{font-size:10.5px;color:var(--faint);margin-top:3px}
-.legend{display:flex;gap:14px;margin:-2px 0 10px;font-size:10.5px;color:var(--faint);font-family:var(--mono);flex-wrap:wrap}
-.legend span{display:inline-flex;align-items:center;gap:5px}
-.legend .sw{width:9px;height:9px;border-radius:50%;display:inline-block}
-.legend .sw.novel{background:var(--violet)}
-.legend .sw.audio{background:var(--amber)}
-.legend .sw.both{width:11px;height:11px;background:linear-gradient(135deg,var(--violet) 0 50%,var(--amber) 50% 100%)}
-.legend .sw.est{background:transparent;border:1.5px dashed var(--amber)}
-.legend .sw.upc{background:transparent;border:2px solid var(--muted)}
-.legend .sw.bothupc{width:11px;height:11px;background:transparent;border:2px solid;
-  border-color:var(--violet) var(--amber) var(--amber) var(--violet)}
-.legend .sw.today{width:1px;height:11px;border-radius:0;background:var(--faint)}
-
-/* empty */
-.empty{text-align:center;padding:64px 20px;border:1px dashed var(--line);border-radius:var(--radius);background:var(--bg2)}
-.empty h2{font-family:var(--serif);font-weight:600;margin:0 0 8px}
-.empty p{color:var(--muted);max-width:440px;margin:0 auto 18px}
-
-/* modal */
-.scrim{position:fixed;inset:0;background:rgba(8,6,14,.66);display:none;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto;z-index:50}
-.scrim.open{display:flex}
-.modal{background:var(--bg2);border:1px solid var(--line);border-radius:16px;width:100%;max-width:560px;padding:22px}
-.modal h2{font-family:var(--serif);font-weight:600;margin:0 0 16px;font-size:22px}
-label{display:block;font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:var(--faint);margin:12px 0 5px}
-input,select,textarea{width:100%;background:var(--card);border:1px solid var(--line);color:var(--ink);
-  border-radius:9px;padding:9px 11px;font-family:inherit;font-size:14px}
-textarea{resize:vertical;min-height:54px}
-.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.hist-row{display:grid;grid-template-columns:46px 1fr 1fr auto;gap:8px;margin-bottom:8px;align-items:center}
-.hist-row input{font-family:var(--mono);font-size:12.5px}
-.linkrow{display:flex;gap:8px;align-items:flex-end}
-.linkrow input{flex:1}
-.hint{font-size:12px;color:var(--faint);margin-top:6px}
-.modal-actions{display:flex;justify-content:space-between;gap:10px;margin-top:22px;align-items:center}
-.del-link{color:var(--rose);background:none;border:none;cursor:pointer;font-size:13px;padding:6px}
-.small{padding:6px 10px;font-size:12.5px}
-.activity{margin-top:14px;font-family:var(--mono);font-size:11.5px;color:var(--faint)}
-.activity div{padding:2px 0}
-.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--card2);border:1px solid var(--line);
-  padding:10px 16px;border-radius:10px;font-size:13px;display:none;z-index:60}
-.toast.show{display:block}
-.cand{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);
-  border-radius:10px;margin-bottom:6px;cursor:pointer;transition:.12s}
-.cand:hover{border-color:#4a4067;background:var(--card2)}
-.cand.sel{border-color:var(--amber);background:var(--amber-dim)}
-.cand .meta{color:var(--faint);font-size:12px;font-family:var(--mono);white-space:nowrap}
-@media(max-width:760px){.hero{grid-template-columns:1fr}.card{grid-template-columns:1fr}.right{flex-direction:row;align-items:center;flex-wrap:wrap}.two{grid-template-columns:1fr}}
-@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
-</style>
-</head>
-<body>
-<div class="wrap">
- <div class="topgrid">
-  <div>
-  <header>
-    <div class="brand">
-      <svg class="logo" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-        <circle cx="20" cy="20" r="18.5" stroke="#332c47"/>
-        <circle cx="20" cy="20" r="12" stroke="#4a4067"/>
-        <path d="M8 20a12 12 0 0 1 12-12" stroke="#e7b14c" stroke-width="2.4" stroke-linecap="round"/>
-        <circle cx="20" cy="20" r="3.2" fill="#e7b14c"/>
-      </svg>
-      <div>
-        <h1>Release Radar</h1>
-        <div class="sub">Your audiobook &amp; novel release shelf — collected automatically by the Release Radar browser extension.</div>
-      </div>
-    </div>
-    <div class="toolbar">
-      <a class="ghost" id="feedLink" href="/feed.xml" target="_blank"><button class="ghost small">RSS feed</button></a>
-      <a class="ghost" id="calLink" href="/calendar.ics" target="_blank" title="iCalendar feed — subscribe from Google/Outlook/your phone's calendar app using this URL. Confirmed releases only, as all-day events."><button class="ghost small">&#128197; Calendar</button></a>
-      <button class="ghost small" id="settingsBtn">&#9881; Settings</button>
-      <button class="ghost small" id="quitBtn">&#11096; Quit</button>
-      <button class="ghost small" id="extRefreshBtn" title="Ask the browser extension to re-check pending pages (pre-orders / missing audiobooks) for new dates. Takes a few seconds to start.">&#8635; Refresh dates</button>
-      <button class="btn-primary" id="extCrawlBtn" title="Ask the browser extension to re-crawl every series and find newly-released books. Slower; takes a few seconds to start.">Crawl all</button>
-    </div>
-  </header>
-
-  <div class="meta-line">
-    <span><span class="dot pulse"></span> <span id="lastCheck">waiting for the extension…</span></span>
-    <span id="countLine" class="mono"></span>
-  </div>
-  </div>
-
-  <div id="overdueWrap" style="display:none">
-    <div class="section-eyebrow" style="margin:2px 0 8px" title="Audiobooks whose expected window has passed with no announcement. They're kept out of the upcoming schedule — a date that already failed isn't a forecast — and nothing behind them can be predicted until they land.">Overdue audiobooks <span id="overdueCount"></span></div>
-    <div class="overdue" id="overdue"></div>
-  </div>
- </div>
-
-  <div id="heroWrap" style="display:none">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px">
-      <div class="section-eyebrow" id="heroTitle" style="margin:0">Next audiobook releases</div>
-      <div style="display:flex;gap:8px">
-        <button id="modeToggle" type="button" title="Switch the upcoming list between novels and audiobooks" style="font:inherit;cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:4px 11px;font-size:12px">⇄ Show novels</button>
-        <button id="estToggle" type="button" style="font:inherit;cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:4px 11px;font-size:12px">Estimates</button>
-      </div>
-    </div>
-    <div class="hero" id="hero"></div>
-  </div>
-
-  <div class="section-eyebrow" id="seriesEyebrow" style="display:none">Tracked series</div>
-  <div class="sortbar" id="sortbar" style="display:none">
-    <div class="left">
-      <span class="lbl">Sort</span>
-      <select id="sortSel">
-        <option value="manual">Manual (drag to reorder)</option>
-        <option value="next">Next release</option>
-        <option value="title">Title A–Z</option>
-        <option value="status">Status</option>
-      </select>
-    </div>
-  </div>
-  <div class="legend" id="legend" style="display:none">
-    <span><i class="sw novel"></i>novel</span>
-    <span><i class="sw audio"></i>audiobook</span>
-    <span><i class="sw both"></i>same day</span>
-    <span><i class="sw bothupc"></i>same day, upcoming</span>
-    <span><i class="sw upc"></i>upcoming (hollow)</span>
-    <span><i class="sw est"></i>estimated</span>
-    <span><i class="sw today"></i>today</span>
-  </div>
-  <div class="grid" id="grid"></div>
-
-  <div id="empty" class="empty" style="display:none">
-    <h2>Nothing on the radar yet</h2>
-    <p>Open an Amazon page for any book in a series (with the Release Radar extension installed) and it'll be collected automatically. Or hit <b>Crawl all</b> once you've opened a few.</p>
-  </div>
-
-  <div class="activity" id="activity"></div>
-</div>
-
-<!-- modal -->
-<div class="scrim" id="scrim">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mTitle">
-    <h2 id="mTitle">Add series</h2>
-    <input type="hidden" id="f_id">
-
-    <label>Amazon link</label>
-    <div class="linkrow">
-      <input id="f_url" placeholder="https://www.amazon.com.au/dp/..." >
-      <button class="small" id="autofillBtn" type="button">Auto-fill</button>
-    </div>
-    <div class="hint">Auto-fill reads the page itself. Anything it misses, type by hand.</div>
-
-    <div class="two">
-      <div><label>Series / book name</label><input id="f_name" placeholder="The Stormlight Archive"></div>
-      <div><label>Author</label><input id="f_author" placeholder="Brandon Sanderson"></div>
-    </div>
-
-    <label>Latest novel title</label>
-    <input id="f_novel_title" placeholder="Wind and Truth">
-
-    <div class="two">
-      <div><label>Novel release date</label><input id="f_novel_date" placeholder="2024-12-06" type="text"></div>
-      <div><label>Audiobook status</label>
-        <select id="f_status">
-          <option value="unknown">Unknown</option>
-          <option value="none">No audiobook yet</option>
-          <option value="announced">Announced / preorder</option>
-          <option value="released">Released</option>
-        </select>
-      </div>
-    </div>
-
-    <label>Audiobook date (if announced or released)</label>
-    <input id="f_audio_date" placeholder="2024-12-06" type="text">
-
-    <label>Release timeline — every book's dates</label>
-    <div id="histRows"></div>
-    <button class="small ghost" type="button" id="addHistBtn">+ Add a release</button>
-    <div class="hint">One row per book. <b>#</b> is the book's number in the series — it's how new info is matched to the right book, so fixes stick while new releases still fill in. Leave the audiobook blank if there isn't one yet. Rows with both dates also feed the gap average.</div>
-
-    <label>Notes</label>
-    <textarea id="f_notes" placeholder="Anything you want to remember"></textarea>
-
-    <div class="modal-actions">
-      <button class="del-link" id="deleteBtn" type="button" style="visibility:hidden">Delete</button>
-      <div style="display:flex;gap:10px">
-        <button class="ghost" type="button" onclick="closeModal()">Cancel</button>
-        <button class="btn-primary" id="saveBtn" type="button">Save</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<!-- settings modal -->
-<div class="scrim" id="settingsScrim">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="setTitle">
-    <h2 id="setTitle">Settings</h2>
-
-    <label>Discord notifications</label>
-    <div class="hint" style="margin:0 0 6px">Paste a channel <b>webhook URL</b> (in Discord: channel → Edit Channel → Integrations → Webhooks → New Webhook → Copy URL). Messages post into that channel.</div>
-    <input id="discWebhook" type="text" placeholder="https://discord.com/api/webhooks/…" autocomplete="off" spellcheck="false">
-    <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
-      <button class="small ghost" type="button" id="discTestBtn" style="width:auto">Send test</button>
-      <span id="discTestMsg" class="hint" style="margin:0"></span>
-    </div>
-    <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px">
-      <input type="checkbox" id="discOnNew" style="width:auto;margin:0"> Ping when a new or changed release date arrives
-    </label>
-    <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin:8px 0 0;font-size:13px">
-      <input type="checkbox" id="discOnRelease" style="width:auto;margin:0"> Ping when a release goes live (the store page flips from pre-order to buyable)
-    </label>
-    <label style="text-transform:none;letter-spacing:0;color:var(--ink);display:flex;align-items:center;gap:8px;margin:8px 0 0;font-size:13px;flex-wrap:wrap">
-      <input type="checkbox" id="discDaily" style="width:auto;margin:0"> Forecast digest
-      <select id="discDigestDays" style="width:auto;margin:0;padding:4px 6px">
-        <option value="1">every day</option><option value="2">every 2 days</option>
-        <option value="3">every 3 days</option><option value="7">weekly</option>
-      </select> at
-      <input type="number" id="discDailyHour" min="0" max="23" style="width:54px;margin:0;padding:4px 6px"> <span style="color:var(--faint)">:00 — upcoming novels &amp; audiobooks, estimates included. Delivered by a very reluctant, very bratty assistant. Her lines live in <b>digest_lines</b> next to your data.json — edit or replace them freely.</span>
-    </label>
-    <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
-      <button class="small ghost" type="button" id="digNowBtn" style="width:auto">Send one now</button>
-      <span id="digNowMsg" class="hint" style="margin:0"></span>
-    </div>
-    <div style="border-bottom:1px solid var(--line);margin:16px 0"></div>
-
-    <label style="color:#ff9b9b">Danger zone</label>
-    <div style="display:flex;align-items:center;gap:10px">
-      <button class="small ghost" type="button" id="clearAllBtn" style="border-color:#5a3157;color:#ffb0b0">Clear all tracked series</button>
-      <span class="hint" style="margin:0">Wipes every series so you can rebuild from Amazon only.</span>
-    </div>
-    <div class="hint">Your <code>data.json</code> is backed up first (recoverable by renaming <code>data.json.bak</code>), and settings are kept. After clearing, open one Amazon page per series (or hit "Crawl all now" in the extension) and the crawl repopulates everything.</div>
-
-    <div class="modal-actions">
-      <button class="del-link" style="visibility:hidden">.</button>
-      <div style="display:flex;gap:10px">
-        <button class="btn-primary" type="button" onclick="closeSettings()">Close</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<script>
-const $=s=>document.querySelector(s);
-const api=(u,o)=>fetch(u,o).then(r=>r.json());
-let STATE={series:[]};
-
-function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600);}
-function fmtDate(s){if(!s)return '--';const d=new Date(s+'T00:00:00');if(isNaN(d))return s;
-  return d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});}
-function isReleased(s){if(!s)return null;const d=new Date(s+'T00:00:00');if(isNaN(d))return null;const t=new Date();t.setHours(0,0,0,0);return d<t;}
-function isTodayStr(sd){if(!sd)return false;const d=new Date(sd+'T00:00:00');if(isNaN(d))return false;const t=new Date();t.setHours(0,0,0,0);return d.getTime()===t.getTime();}
-function storeLink(s,n,kind){                     // page URL for book n's edition, or null
-  if(n==null) return null;
-  const host=s.store_host; if(!host) return (s.url||null);
-  const key=String(n);
-  const asin=(kind==='audio'?(s.asins_audio||{})[key]:(s.asins_novel||{})[key])||(s.asins||{})[key];
-  return asin?('https://'+host+'/dp/'+asin):(s.url||null);
-}
-function authorLink(s){
-  if(!s.store_host||!s.author) return null;
-  return 'https://'+s.store_host+'/s?k='+encodeURIComponent(s.author);
-}
-function wrapLink(html,url,title){ return url?`<a class="plain" href="${attrEsc(url)}" target="_blank" rel="noopener" ${title?`title="${attrEsc(title)}"`:''}>${html}</a>`:html; }
-function latestEntry(s){let best=null,bn=-1;(s.timeline||[]).forEach(e=>{const n=(e&&e.n!=null)?+e.n:NaN;if(!isNaN(n)&&n>bn){bn=n;best=e;}});return best;}
-function daysLate(iso){      // whole days since a date that has already passed
-  const dt=new Date(iso+'T00:00:00');if(isNaN(dt))return 0;
-  const t=new Date();t.setHours(0,0,0,0);
-  return Math.max(0,Math.round((t-dt)/86400000));
-}
-function bkTag(n){ return n!=null?`<span class="bk">Book ${n}</span> `:''; }
-// novel_n tracks the highest book number, which can come from an audio-only
-// entry; the Novel column must name whichever book actually has this date.
-function novelBookN(s){
-  const hit=(s.timeline||[]).find(e=>e&&e.novel===s.novel_date&&e.n!=null);
-  return hit?hit.n:(s.novel_n??null);
-}
-function audioFact(s){
-  // The Audiobook column tracks whatever we actually know, in order of strength:
-  // the tracked book's own date, then a confirmed pre-order for an earlier book
-  // (the series-level field only ever mirrors the LATEST book, which is why this
-  // read blank), then how far past due an overdue one is, as a red count. Each
-  // names its book, because it often isn't the one on the Novel line.
-  if(s.audiobook_date)
-    return bkTag(s.novel_n)+fmtDate(s.audiobook_date)+dateTag(s.audiobook_date,(latestEntry(s)||{}).audio_pre===false);
-  const ra=nextRealAudio(s);
-  if(ra){
-    const val=bkTag(ra.n)+fmtDate(ra.date)+dateTag(ra.date,ra.live);
-    const t=ra.n!=null?`Book ${ra.n}'s audiobook`:'The next audiobook';
-    return wrapLink(val,storeLink(s,ra.n,'audio'),t+' — open on Amazon');
-  }
-  if(s.predicted_date&&isReleased(s.predicted_date)===true){
-    const n=daysLate(s.predicted_date);
-    const who=s.predicted_book_n!=null?`Book ${s.predicted_book_n}'s audiobook is `:'Overdue by ';
-    return bkTag(s.predicted_book_n)
-      +`<span style="color:var(--rose)" title="${attrEsc(who+n+' day'+(n===1?'':'s')+' past its expected window (expected ~ '+fmtDate(s.predicted_date)+'). Later books cannot be predicted until it lands.')}">−${n}d</span>`;
-  }
-  return '—';
-}
-function nextRealAudio(s){   // soonest still-upcoming REAL audiobook date in the timeline, or null
-  let best=null;
-  (s.timeline||[]).forEach(e=>{
-    if(!e||!e.audiobook||isReleased(e.audiobook)!==false) return;
-    if(!best||e.audiobook<best.date) best={date:e.audiobook,n:e.n!=null?+e.n:null,live:e.audio_pre===false};
-  });
-  return best;
-}
-function dateTag(d,live){const past=isReleased(d);if(past===null)return '';
-  const out=past||(live===true&&isTodayStr(d));   // confirmed buyable on release day counts as out
-  const label=past?'out':(out?'out now':'pre-order');
-  const css=out?'color:#56d18a;border-color:#2c5a3f;background:#16271d':'color:#e7b14c;border-color:#5a4a25;background:#262017';
-  return `<span style="font:600 9px/1 var(--mono,monospace);letter-spacing:.04em;text-transform:uppercase;padding:1px 5px;border:1px solid;border-radius:6px;margin-left:6px;vertical-align:middle;${css}">${label}</span>`;}
-function confChip(c){
-  if(!c) return '';
-  const M={high:['high','#56d18a','#16271d','#2c5a3f'],medium:['med','#f0a500','#262017','#5a4a25'],low:['low','#b9a6d6','#221d3a','#3a3360']};
-  const m=M[c.level]||M.low;
-  const pm=(c.spread_days!=null)?` ±${c.spread_days}d`:'';
-  const drop=c.outliers?`, ignoring ${c.outliers} freak gap${c.outliers===1?'':'s'}`:'';
-  const basis=(c.spread_days!=null)
-    ? `${c.level} confidence — based on ${c.n} past gap${c.n===1?'':'s'} that varied by about ±${c.spread_days} days${drop}`
-    : `${c.level} confidence — only ${c.n} past release to go on, so the spread is unknown${drop}`;
-  return ` <span title="${esc(basis)}" style="font:600 9px/1 var(--mono,monospace);letter-spacing:.04em;text-transform:uppercase;padding:1px 5px;border:1px solid ${m[3]};background:${m[2]};color:${m[1]};border-radius:6px;vertical-align:middle">${m[0]}${pm}</span>`;}
-function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML;}
-function attrEsc(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
-
-/* ---- timeline hover card: cover art + details for a release dot ---- */
-let HOVERCARD=null;
-function hideHover(){if(HOVERCARD)HOVERCARD.style.display='none';}
-function showHover(mark){
-  let tip;try{tip=JSON.parse(mark.dataset.tip||'null');}catch(_){tip=null;}
-  if(!tip)return;
-  if(!HOVERCARD){HOVERCARD=document.createElement('div');HOVERCARD.className='hovercard';document.body.appendChild(HOVERCARD);}
-  const name=tip.est?('Estimated audiobook'+(tip.estN!=null?` · book ${tip.estN}`:''))
-    :(tip.t||((tip.sn||'')+(tip.nN!=null?' '+tip.nN:(tip.aN!=null?' '+tip.aN:''))));
-  // a broken per-book cover URL degrades to the series cover, then to no image
-  const img=(tip.cover&&!tip.est)?`<img src="${attrEsc(tip.cover)}" alt="" data-fb="${attrEsc(tip.cover2||'')}" onerror="if(this.dataset.fb){this.src=this.dataset.fb;this.dataset.fb='';}else{this.remove();}">`:'';
-  const narr=tip.narr?`<div class="hc-n">Narrated by ${esc(tip.narr)}</div>`:'';
-  const hint=(tip.est&&tip.estWhy)?`<div class="hc-n">${esc(tip.estWhy)}</div>`:'';
-  HOVERCARD.innerHTML=`${img}<div><div class="hc-t">${esc(name)}</div><div class="hc-d">${esc(tip.label)}</div>${narr}${hint}</div>`;
-  HOVERCARD.style.display='flex';HOVERCARD.style.visibility='hidden';HOVERCARD.style.left='0px';HOVERCARD.style.top='0px';
-  const r=mark.getBoundingClientRect(),hw=HOVERCARD.offsetWidth,hh=HOVERCARD.offsetHeight;
-  let x=Math.min(Math.max(8,r.left+r.width/2-hw/2),window.innerWidth-hw-8);
-  let y=r.top-hh-10; if(y<8)y=r.bottom+10;
-  HOVERCARD.style.left=x+'px';HOVERCARD.style.top=y+'px';HOVERCARD.style.visibility='visible';
-}
-document.addEventListener('mouseover',e=>{const m=e.target.closest&&e.target.closest('.mark[data-tip]');if(m)showHover(m);});
-document.addEventListener('mouseout',e=>{const m=e.target.closest&&e.target.closest('.mark[data-tip]');if(m)hideHover();});
-window.addEventListener('scroll',hideHover,true);
-
-let LAST_CHANGES=null;   // map id -> last_change, to spot new updates
-function checkForNotifications(){
-  const cur={};STATE.series.forEach(s=>cur[s.id]=s.last_change||'');
-  if(LAST_CHANGES!==null && 'Notification' in window && Notification.permission==='granted'){
-    STATE.series.forEach(s=>{
-      const prev=LAST_CHANGES[s.id];
-      if(s.last_change && prev!==undefined && s.last_change!==prev){
-        try{new Notification('Release Radar — '+s.name,{body:s.last_change});}catch(_){}
-      }
-    });
-  }
-  LAST_CHANGES=cur;
-}
-
-async function refresh(){
-  STATE=await api('/api/state');
-  const lc=$('#lastCheck');
-  if(lc) lc.textContent = STATE.last_ingest
-      ? ('Last updated '+timeAgo(STATE.last_ingest)+' · via the browser extension')
-      : 'No data yet · open a series page in your browser (with the extension installed) to collect it';
-  const c=STATE.counts;
-  $('#countLine').textContent=`${c.total} tracked · ${c.out} out · ${c.announced} announced · ${c.waiting} waiting`;
-  renderHero();renderOverdue();renderGrid();renderActivity();
-  checkForNotifications();
-}
-
-function renderOverdue(){
-  const list=STATE.overdue||[];
-  const wrap=$('#overdueWrap'),box=$('#overdue');
-  if(!wrap||!box) return;
-  if(!list.length){wrap.style.display='none';box.innerHTML='';return;}
-  wrap.style.display='block';
-  const cnt=$('#overdueCount'); if(cnt) cnt.textContent='('+list.length+')';
-  box.innerHTML=list.map(o=>{
-    // count the days here rather than trusting the payload, so the number stays
-    // right on a dashboard left open across midnight
-    const exp=new Date(o.expected+'T00:00:00');
-    const t=new Date();t.setHours(0,0,0,0);
-    const days=isNaN(exp)?(o.days_late||0):Math.max(0,Math.round((t-exp)/86400000));
-    const cov=o.cover?`<img class="cov" src="${attrEsc(o.cover)}" alt="" onerror="this.remove()">`:'';
-    const bk=o.book_n!=null?` · book ${o.book_n}`:'';
-    const s=STATE.series.find(x=>x.id===o.series_id)||{};
-    const title=wrapLink(esc(o.title),storeLink(s,o.book_n,'novel'),'Open on Amazon');
-    return `<div class="od"><div class="late">${days}<small>${days===1?'day':'days'} late</small></div>${cov}
-      <div class="info"><div class="t">${title}</div>
-      <div class="d">expected ~ ${esc(fmtDate(o.expected))}${bk} · ${esc(o.series)}</div></div></div>`;
-  }).join('');
-}
-
-// ---- release-day timer ----
-// Target instant = release date at the hour this series usually goes live
-// (learned from past confirmed releases: its own, then everyone's, then 2pm).
-function releaseTarget(u){
-  const h=Number(u.expected_hour==null?14:u.expected_hour);
-  const d=new Date(u.date+'T00:00:00'); if(isNaN(d)) return null;
-  d.setHours(Math.floor(h),Math.round((h%1)*60),0,0);
-  return d.getTime();
-}
-function fmtDur(ms){
-  ms=Math.abs(ms); const s=Math.floor(ms/1000);
-  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
-  if(h>=48) return Math.floor(h/24)+'d '+(h%24)+'h';
-  return (h>0?h+'h ':'')+String(m).padStart(2,'0')+'m '+String(sec).padStart(2,'0')+'s';
-}
-function releaseState(u){
-  if(u.estimate) return {state:'plain'};
-  if(u.live){
-    let when='out now';
-    if(u.live_at){const t=new Date(u.live_at); if(!isNaN(t)) when='live since '+t.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});}
-    return {state:'released', when};
-  }
-  const target=releaseTarget(u); if(target==null) return {state:'plain'};
-  const now=Date.now();
-  if(u.countdown_days!==0 && now<target-36*3600*1000) return {state:'plain'};   // not release day yet
-  const basisWord={series:'this series usually goes live',global:'your series usually go live',default:'typical US release time'}[u.expected_hour_basis]||'expected';
-  const hh=new Date(target).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-  if(now<target) return {state:'countdown', target, text:fmtDur(target-now), sub:'until ~'+hh, basis:basisWord};
-  return {state:'late', target, text:'−'+fmtDur(now-target), sub:'past ~'+hh+' · not yet seen live', basis:basisWord};
-}
-// keep every visible timer moving without re-rendering the whole hero
-setInterval(()=>{
-  document.querySelectorAll('.count.tick').forEach(el=>{
-    const target=+el.dataset.target; if(!target) return;
-    const now=Date.now(); const late=now>=target;
-    el.classList.toggle('countdown',!late); el.classList.toggle('late',late);
-    el.closest('.up')?.classList.toggle('late',late);
-    const small=el.querySelector('small'); const subTxt=small?small.textContent:'';
-    el.firstChild.nodeValue=(late?'−':'')+fmtDur(target-now);
-    if(late && small && !/past/.test(subTxt)) small.textContent=subTxt.replace(/^until/,'past')+' · not yet seen live';
-  });
-},1000);
-
-function renderHero(){
-  const up=STATE.upcoming||[];
-  const wrap=$('#heroWrap');const hero=$('#hero');
-  const hasSeries=(STATE.series||[]).length>0;
-  if(!hasSeries){wrap.style.display='none';return;}
-  wrap.style.display='block';
-  const mode=STATE.upcoming_mode||'audiobook';
-  const isNovel=mode==='novel';
-  const ht=$('#heroTitle'); if(ht) ht.textContent=isNovel?'Next novel releases':'Next audiobook releases';
-  const mt=$('#modeToggle'); if(mt) mt.textContent=isNovel?'⇄ Show audiobooks':'⇄ Show novels';
-  const estOn=isNovel?!!STATE.show_estimates_novel:!!STATE.show_estimates;
-  const tb=$('#estToggle');
-  if(tb){
-    tb.textContent=estOn?'Estimates: on':'Estimates: off';
-    tb.style.color=estOn?'var(--amber)':'var(--muted)';
-    tb.style.borderColor=estOn?'#5a4a25':'var(--line)';
-    tb.title=isNovel
-      ? "Include the next book in each series, estimated from how far apart past novels released"
-      : "Include likely audiobooks not yet announced, estimated from each series' past novel-to-audio timing";
-  }
-  hero.innerHTML='';
-  if(!up.length){
-    const kindWord=isNovel?'novels':'audiobooks';
-    hero.innerHTML='<div style="color:var(--faint);padding:14px 2px;font-size:13px">No upcoming '+kindWord+(estOn?'':' — turn on estimates to include predicted releases')+'.</div>';
-    return;}
-  up.forEach((u,i)=>{
-    const el=document.createElement('div');el.className='up'+(i===0?' soonest':'');
-    const note=(u.estimate&&u.note)?` <span class="hint" style="margin:0">· ${esc(u.note)}</span>`:'';
-    const conf=u.estimate?confChip(u.confidence):'';
-    const kindCls=u.kind==='novel'?'novel':'audio';
-    const kindLbl=u.kind==='novel'?'Novel':'Audiobook';
-    // Release day gets three states instead of a useless "0 days":
-    //   released  -> green RELEASED (the store confirmed it buyable)
-    //   before    -> live countdown to the hour this series usually goes live
-    //   after     -> red negative timer: it's late against that expected hour
-    const st=releaseState(u);
-    if(st.state==='released') el.classList.add('released');
-    else if(st.state==='late') el.classList.add('late');
-    let countHtml;
-    if(st.state==='released') countHtml=`<div class="count rel">RELEASED<small>${esc(st.when)}</small></div>`;
-    else if(st.state==='countdown'||st.state==='late')
-      countHtml=`<div class="count tick ${st.state}" data-target="${st.target}" data-basis="${esc(st.basis)}">${st.text}<small>${esc(st.sub)}</small></div>`;
-    else countHtml=`<div class="count">${u.countdown_days}<small>${u.countdown_days===1?'day':'days'}</small></div>`;
-    el.innerHTML=`<div>${countHtml}</div>
-      <div><div class="t">${esc(u.title)}</div>
-      <div class="d">${fmtDate(u.date)} · <span class="kind ${kindCls} ${u.estimate?'est':''}">${kindLbl}${u.estimate?' · est':''}</span>${conf}${note}</div></div>`;
-    hero.appendChild(el);
-  });
-}
-
-function timelineHtml(s){
-  // one entry per unique date, tracking the book number(s) on that date plus
-  // whatever the entry knows for the hover card (title, cover, narrator)
-  const ev={};
-  const add=(d,k,num,meta)=>{if(!d)return;const e=(ev[d]=ev[d]||{});e[k]=true;
-    if(num!=null){if(k==='novel')e.nN=num;else if(k==='audio')e.aN=num;}
-    if(meta){if(meta.title&&!e.title)e.title=meta.title;if(meta.cover&&!e.cover)e.cover=meta.cover;
-      if(k==='audio'&&meta.narrator)e.narr=meta.narrator;}};
-  const tl=(s.timeline&&s.timeline.length)?s.timeline:null;
-  const live={};                                                 // date -> {n:true,a:true} = confirmed buyable
-  const mklive=(d,k)=>{if(d)(live[d]=live[d]||{})[k]=true;};
-  if(tl){tl.forEach(t=>{add(t.novel,'novel',t.n,t);add(t.audiobook,'audio',t.n,t);
-    if(t.novel_pre===false)mklive(t.novel,'n');if(t.audio_pre===false)mklive(t.audiobook,'a');});}
-  else{(s.history||[]).forEach(h=>{add(h.novel,'novel',h.n);add(h.audiobook,'audio',h.n);});}
-  add(s.novel_date,'novel',s.novel_n);                          // always include the tracked book
-  if(s.audiobook_status!=='none') add(s.audiobook_date,'audio',s.novel_n);
-  // dashed ring only for a still-future estimate; a lapsed one is reported as
-  // "overdue" in the predict line, not drawn as if it were ahead of us
-  if((s.audiobook_status==='none'||s.audiobook_status==='unknown')&&s.predicted_date&&isReleased(s.predicted_date)===false) add(s.predicted_date,'est',null);
-
-  const dates=Object.keys(ev).filter(d=>!isNaN(+new Date(d+'T00:00:00')));
-  if(!dates.length) return '';
-  const times=dates.map(d=>+new Date(d+'T00:00:00'));
-  const min=Math.min(...times),max=Math.max(...times),span=(max-min)||1;
-  const isLive=(d,e)=>{const lv=live[d]||{};return (!e.novel||lv.n)&&(!e.audio||lv.a);};
-  const rel=(d,e)=>{const r=isReleased(d);return r===null?'':(r?' (out)':(isTodayStr(d)&&isLive(d,e)?' (out now)':' (pre-order)'));};
-  const marks=dates.map(d=>{
-    const t=+new Date(d+'T00:00:00');
-    const left=dates.length===1?50:((t-min)/span*100);
-    const e=ev[d];let cls,title;
-    const nn=e.nN!=null?(' #'+e.nN):'', an=e.aN!=null?(' #'+e.aN):'';
-    if(e.novel&&e.audio){cls='both';title=`Novel${nn} + Audiobook${an} · ${fmtDate(d)}${rel(d,e)}`;}
-    else if(e.novel){cls='novel';title=`Novel${nn} · ${fmtDate(d)}${rel(d,e)}`;}
-    else if(e.audio){cls='audio';title=`Audiobook${an} · ${fmtDate(d)}${rel(d,e)}`;}
-    else{cls='est';title=`Estimated audiobook · likely ~${fmtDate(d)}`;}
-    if(cls!=='est'&&isReleased(d)===false&&!(isTodayStr(d)&&isLive(d,e))) cls+=' future';   // hollow = still upcoming; confirmed-live today renders solid
-    const mUrl=e.novel?storeLink(s,e.nN,'novel'):(e.audio?storeLink(s,e.aN,'audio'):null);
-    const isEst=cls==='est';
-    const tip={sn:s.name||'',label:title,t:e.title||null,cover:e.cover||s.cover_url||null,
-      cover2:(e.cover&&s.cover_url&&e.cover!==s.cover_url)?s.cover_url:null,
-      narr:e.narr||null,nN:e.nN??null,aN:e.aN??null,est:isEst,
-      estN:isEst?(s.predicted_book_n??null):null,
-      estWhy:isEst?(s.predicted_queued
-        ? (s.predicted_after_n!=null?`queued behind book ${s.predicted_after_n}'s audiobook, at this series' usual pace`:'next in this series’ audio queue')
-        : 'projected from this series’ past novel→audio gaps'):null};
-    const attrs=`class="mark ${cls}" style="left:${left.toFixed(1)}%" aria-label="${esc(title)}" data-tip="${attrEsc(JSON.stringify(tip))}"`;
-    return mUrl?`<a ${attrs} href="${esc(mUrl)}" target="_blank" rel="noopener"></a>`:`<span ${attrs}></span>`;
-  }).join('');
-  // "today" line: only when it falls within the span, so past sits left / upcoming right
-  const now=Date.now();let today='';
-  if(dates.length>1&&now>=min&&now<=max){const tl=((now-min)/span*100);today=`<span class="tl-today" style="left:${tl.toFixed(1)}%" title="today"></span>`;}
-  const lbl=s.avg_gap_label?`avg gap ${s.avg_gap_label}`:(dates.length>1?'releases':'release');
-  // pin the latest (rightmost) date under its mark, always visible
-  let endLbl='';
-  {
-    const lastD=dates.find(d=>(+new Date(d+'T00:00:00'))===max);
-    if(lastD){
-      const e=ev[lastD]||{};
-      const isEst=!e.novel&&!e.audio;
-      const left=dates.length===1?50:100;
-      endLbl=`<span class="tl-end" style="left:${left}%;transform:translateX(-50%)">${isEst?'~':''}${esc(fmtDate(lastD))}</span>`;
-    }
-  }
-  return `<div class="timeline"><div class="tl-row">
-      <span class="gaplabel">${lbl}</span>
-      <span class="track">${today}${marks}${endLbl}</span>
-    </div></div>`;
-}
-
-function timeAgo(iso){
-  if(!iso) return 'not yet';
-  const t=new Date(iso); if(isNaN(t)) return '';
-  const s=Math.floor((Date.now()-t)/1000);
-  if(s<60) return 'just now';
-  if(s<3600) return Math.floor(s/60)+'m ago';
-  if(s<86400) return Math.floor(s/3600)+'h ago';
-  return Math.floor(s/86400)+'d ago';
-}
-function initials(name){return (name||'?').replace(/^(the|a|an)\s+/i,'').trim().charAt(0).toUpperCase()||'?';}
-
-function sortedSeries(){
-  const arr=STATE.series.slice();
-  const mode=$('#sortSel')?$('#sortSel').value:'manual';
-  if(mode==='title') arr.sort((a,b)=>(a.name||'').localeCompare(b.name||''));
-  else if(mode==='next') arr.sort((a,b)=>{
-    const x=a.next_date||'9999',y=b.next_date||'9999';return x<y?-1:x>y?1:0;});
-  else if(mode==='status'){const rank={announced:0,none:1,unknown:1,released:2};
-    arr.sort((a,b)=>(rank[a.status_class||a.audiobook_status]??1)-(rank[b.status_class||b.audiobook_status]??1));}
-  return arr; // 'manual' keeps stored order
-}
-
-function renderGrid(){
-  const grid=$('#grid');const empty=$('#empty');
-  const has=STATE.series.length>0;
-  $('#seriesEyebrow').style.display=has?'block':'none';
-  $('#sortbar').style.display=has?'flex':'none';
-  const lg=$('#legend'); if(lg) lg.style.display=has?'flex':'none';
-  if(!has){empty.style.display='block';grid.innerHTML='';return;}
-  empty.style.display='none';grid.innerHTML='';
-  const manual=!$('#sortSel')||$('#sortSel').value==='manual';
-  sortedSeries().forEach(s=>{
-    const card=document.createElement('div');card.className='card';card.dataset.id=s.id;
-    if(manual) card.setAttribute('draggable','true');
-    const st=s.audiobook_status;
-    const mode=STATE.upcoming_mode||'audiobook';
-    let predict='';
-    if(mode==='novel'){
-      if(STATE.show_estimates_novel && s.predicted_novel_date){
-        predict=`<div class="predict">Likely next novel <span class="mono">~ ${fmtDate(s.predicted_novel_date)}</span> · ${s.novel_history_count} past gap${s.novel_history_count===1?'':'s'} (${s.avg_novel_gap_label})${confChip(s.predicted_novel_confidence)}</div>`;
-      }
-    }else{
-      if(st==='none'||st==='unknown'){
-        // Confirmed dates and overdue counts both live in the Audiobook column
-        // now, so this line carries only a genuine forward-looking forecast. A
-        // lapsed projection says nothing here — it's the column's red count and
-        // the Overdue panel that report it.
-        if(s.predicted_date&&isReleased(s.predicted_date)===false){
-          const bk=s.predicted_book_n!=null?` book ${s.predicted_book_n}`:'';
-          // say what the guess is built on: the audio queue when a confirmed date
-          // ahead of it sets the pace, the novel→audio gap history otherwise
-          const basis=s.predicted_queued
-            ? (s.predicted_after_n!=null?`queued after book ${s.predicted_after_n}'s audio`:'next in the audio queue')
-            : `${s.history_count} past gap${s.history_count===1?'':'s'} (${s.avg_gap_label})`;
-          predict=`<div class="predict">Likely audiobook${bk} <span class="mono">~ ${fmtDate(s.predicted_date)}</span> · ${basis}${confChip(s.predicted_confidence)}</div>`;
-        }
-      }
-    }
-    const err=s.fetch_error?`<div class="err">⚠ ${esc(s.fetch_error)}</div>`:'';
-    const chgTime=s.last_change_at?` <span class="chg-time" title="${esc(new Date(s.last_change_at).toLocaleString())}">· ${timeAgo(s.last_change_at)}</span>`:'';
-    const chg=s.last_change?`<div class="changed">● ${esc(s.last_change)}${chgTime}</div>`:'';
-    const cover=s.cover_url
-      ? `<img class="cover" src="${attrEsc(s.cover_url)}" alt="" onerror="this.outerHTML='<div class=&quot;cover ph&quot;>${esc(initials(s.name))}</div>'">`
-      : `<div class="cover ph">${esc(initials(s.name))}</div>`;
-    const bookUrl=storeLink(s,(latestEntry(s)||{}).n!=null?(latestEntry(s)||{}).n:s.novel_n,'novel');
-    card.innerHTML=`
-      ${manual?'<div class="grip" title="Drag to reorder">⋮⋮</div>':''}
-      ${wrapLink(cover,bookUrl,'Open on Amazon')}
-      <div class="cmain">
-        ${wrapLink(`<h3>${esc(s.name)}</h3>`,bookUrl,'Open the latest book on Amazon')}
-        <div class="byline">${s.author?wrapLink(esc(s.author),authorLink(s),'Search this author on Amazon'):'<span style="color:var(--faint)">unknown author</span>'}${s.novel_title?' · '+wrapLink(esc(s.novel_title),bookUrl):''}</div>
-        <div class="facts">
-          <div class="fact"><div class="k">Novel</div><div class="v">${bkTag(novelBookN(s))}${fmtDate(s.novel_date)}${dateTag(s.novel_date,(latestEntry(s)||{}).novel_pre===false)}</div></div>
-          <div class="fact"><div class="k">Audiobook</div><div class="v">${audioFact(s)}</div></div>
-          <div class="fact"><div class="k">Avg gap</div><div class="v">${s.avg_gap_label||'—'}</div></div>
-          ${s.narrator?`<div class="fact"><div class="k">Narrator</div><div class="v">${esc(s.narrator)}</div></div>`:''}
-        </div>
-        <span class="pill ${s.status_class||st}">${esc(s.status_label)}</span>
-        ${predict}${chg}${err}
-        ${timelineHtml(s)}
-      </div>
-      <div class="right">
-        <div class="rowbtns">
-          <button class="small" data-check="${s.id}" title="Ask the extension to re-check just this series for new or newly-released books. Needs the extension running with Firefox open; takes a few seconds.">Check</button>
-          <button class="small" data-edit="${s.id}">Edit</button>
-        </div>
-      </div>`;
-    grid.appendChild(card);
-  });
-  wireDrag();
-  grid.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>openModal(b.dataset.edit));
-  grid.querySelectorAll('[data-check]').forEach(b=>b.onclick=()=>{
-    const nm=(STATE.series.find(x=>x.id===b.dataset.check)||{}).name||'this series';
-    askExtension('/api/ext/crawl-series','Checking \u201c'+nm+'\u201d',{id:b.dataset.check});
-  });
-}
-
-/* ---- drag to reorder ---- */
-let DRAG_ID=null;
-function wireDrag(){
-  const grid=$('#grid');
-  grid.querySelectorAll('.card[draggable="true"]').forEach(card=>{
-    card.ondragstart=e=>{
-      // don't start a drag from a button
-      if(e.target.closest('button,a,select,input')){e.preventDefault();return;}
-      DRAG_ID=card.dataset.id;card.classList.add('dragging');
-      e.dataTransfer.effectAllowed='move';
-      try{e.dataTransfer.setData('text/plain',DRAG_ID);}catch(_){}
-    };
-    card.ondragend=()=>{card.classList.remove('dragging');grid.querySelectorAll('.card').forEach(c=>c.classList.remove('dragover'));};
-    card.ondragover=e=>{e.preventDefault();e.dataTransfer.dropEffect='move';
-      grid.querySelectorAll('.card').forEach(c=>c.classList.remove('dragover'));card.classList.add('dragover');};
-    card.ondrop=e=>{
-      e.preventDefault();card.classList.remove('dragover');
-      if(!DRAG_ID||DRAG_ID===card.dataset.id)return;
-      const src=grid.querySelector('.card[data-id="'+DRAG_ID+'"]');
-      if(!src)return;
-      const rect=card.getBoundingClientRect();
-      const after=e.clientY>rect.top+rect.height/2;
-      grid.insertBefore(src, after?card.nextSibling:card);
-      persistOrder();
-    };
-  });
-}
-async function persistOrder(){
-  const ids=[...$('#grid').querySelectorAll('.card')].map(c=>c.dataset.id);
-  // reorder STATE to match so re-renders keep the new order
-  STATE.series.sort((a,b)=>ids.indexOf(a.id)-ids.indexOf(b.id));
-  try{await api('/api/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});}catch(_){}
-}
-
-function renderActivity(){
-  const a=$('#activity');const rows=(STATE.log||[]).slice(0,6);
-  a.innerHTML=rows.map(r=>`<div>${new Date(r.time).toLocaleString()} — ${esc(r.msg)}</div>`).join('');
-}
-
-/* ---- modal ---- */
-function histRow(num='',nov='',aud=''){
-  const div=document.createElement('div');div.className='hist-row';
-  div.innerHTML=`<input class="bnum" placeholder="#" value="${esc(num)}" title="Book number" style="max-width:46px;text-align:center">
-    <input placeholder="novel date" value="${esc(nov)}"><input placeholder="audiobook date" value="${esc(aud)}">
-    <button class="small ghost" type="button">✕</button>`;
-  div.querySelector('button').onclick=()=>div.remove();
-  return div;
-}
-function openModal(id){
-  $('#histRows').innerHTML='';
-  if(id){
-    const s=STATE.series.find(x=>x.id===id);
-    $('#mTitle').textContent='Edit series';
-    $('#f_id').value=s.id;$('#f_url').value=s.url||'';$('#f_name').value=s.name||'';
-    $('#f_author').value=s.author||'';$('#f_novel_title').value=s.novel_title||'';
-    $('#f_novel_date').value=s.novel_date||'';$('#f_status').value=s.audiobook_status||'unknown';
-    $('#f_audio_date').value=s.audiobook_date||'';$('#f_notes').value=s.notes||'';
-    const rows=(s.timeline&&s.timeline.length)?s.timeline:(s.history||[]);
-    rows.forEach(h=>$('#histRows').appendChild(histRow(h.n??'',h.novel||'',h.audiobook||'')));
-    $('#deleteBtn').style.visibility='visible';
-  }else{
-    $('#mTitle').textContent='Add series';
-    ['f_id','f_url','f_name','f_author','f_novel_title','f_novel_date','f_audio_date','f_notes'].forEach(k=>$('#'+k).value='');
-    $('#f_status').value='unknown';
-    $('#deleteBtn').style.visibility='hidden';
-  }
-  $('#scrim').classList.add('open');
-}
-function closeModal(){$('#scrim').classList.remove('open');}
-$('#addHistBtn').onclick=()=>$('#histRows').appendChild(histRow());
-
-$('#autofillBtn').onclick=async()=>{
-  const url=$('#f_url').value.trim();if(!url){toast('Paste a link first');return;}
-  $('#autofillBtn').textContent='…';
-  const r=await api('/api/fetch-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-  $('#autofillBtn').textContent='Auto-fill';
-  if(r.error){toast(r.error);return;}
-  if(!$('#f_name').value)$('#f_name').value=r.series_guess||r.title||'';
-  if(r.title&&!$('#f_novel_title').value)$('#f_novel_title').value=r.title;
-  if(r.author&&!$('#f_author').value)$('#f_author').value=r.author;
-  if(r.date&&!$('#f_novel_date').value)$('#f_novel_date').value=r.date;
-  if(r.audiobook_date&&!$('#f_audio_date').value){
-    $('#f_audio_date').value=r.audiobook_date;
-    const ad=new Date(r.audiobook_date+'T00:00:00');
-    $('#f_status').value=(!isNaN(ad)&&ad<=new Date())?'released':'announced';
-  } else if(r.is_audiobook&&r.date&&!$('#f_audio_date').value){
-    $('#f_audio_date').value=r.date;$('#f_status').value='released';
-  }
-  const src=(r.sources||[]).filter(s=>s!=='page');
-  toast(src.length?('Filled from '+src.join(' + ')):'Filled what I could find');
-};
-
-$('#saveBtn').onclick=async()=>{
-  const timeline=[...document.querySelectorAll('.hist-row')].map(r=>{
-    const i=r.querySelectorAll('input');
-    const num=i[0].value.trim();
-    return {n:num===''?null:parseInt(num,10),novel:i[1].value.trim(),audiobook:i[2].value.trim()};
-  }).filter(h=>h.novel||h.audiobook||h.n!=null);
-  const body={
-    name:$('#f_name').value.trim(),author:$('#f_author').value.trim(),url:$('#f_url').value.trim(),
-    novel_title:$('#f_novel_title').value.trim(),novel_date:$('#f_novel_date').value.trim(),
-    audiobook_date:$('#f_audio_date').value.trim(),audiobook_status:$('#f_status').value,
-    notes:$('#f_notes').value.trim(),timeline
-  };
-  if(!body.name){toast('A name is required');return;}
-  const id=$('#f_id').value;
-  const res=await api(id?('/api/series/'+id):'/api/series',
-    {method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(res.error){toast(res.error);return;}
-  closeModal();toast(id?'Saved':'Added');refresh();
-};
-$('#deleteBtn').onclick=async()=>{
-  const id=$('#f_id').value;if(!id)return;
-  if(!confirm('Remove this series from the radar?'))return;
-  await api('/api/series/'+id,{method:'DELETE'});closeModal();toast('Removed');refresh();
-};
-$('#scrim').onclick=e=>{if(e.target===$('#scrim'))closeModal();};
-
-/* ---- settings ---- */
-let REMOTE_RO=false;
-async function loadDiscordSettings(){
-  try{
-    const s=await api('/api/settings');
-    if(s.remote_readonly && !REMOTE_RO){
-      REMOTE_RO=true;
-      document.body.insertAdjacentHTML('afterbegin',
-        '<div class="remote-ro">Viewing over the tunnel — read-only. Edits, crawls and settings only work on the PC.</div>');
-    }
-    $('#discWebhook').value=s.discord_webhook||(s.discord_webhook_set?'(set — hidden on this device)':'');
-    $('#discWebhook').disabled=!!s.remote_readonly;
-    $('#discOnNew').checked=!!s.discord_on_new;
-    $('#discOnRelease').checked=!!s.discord_on_release;
-    $('#discDaily').checked=!!s.discord_daily;
-    $('#discDailyHour').value=(s.discord_daily_hour!=null?s.discord_daily_hour:9);
-    $('#discDigestDays').value=String(s.discord_digest_days||1);
-  }catch(_){}
-}
-async function saveDiscord(){
-  if(REMOTE_RO) return;                      // never post the masked value back
-  const body={
-    discord_webhook:$('#discWebhook').value.trim(),
-    discord_on_new:$('#discOnNew').checked,
-    discord_on_release:$('#discOnRelease').checked,
-    discord_daily:$('#discDaily').checked,
-    discord_daily_hour:parseInt($('#discDailyHour').value,10),
-    discord_digest_days:parseInt($('#discDigestDays').value,10)
-  };
-  try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch(_){}
-}
-['#discWebhook','#discOnNew','#discOnRelease','#discDaily','#discDailyHour','#discDigestDays'].forEach(sel=>{
-  const el=$(sel); if(el) el.addEventListener('change',saveDiscord);
-});
-const _discTest=$('#discTestBtn');
-if(_discTest) _discTest.onclick=async()=>{
-  const msg=$('#discTestMsg'); msg.textContent='Sending…'; msg.style.color='var(--faint)';
-  await saveDiscord();
-  try{
-    const d=await api('/api/discord/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({discord_webhook:$('#discWebhook').value.trim()})});
-    msg.textContent=d.message||(d.ok?'Sent!':'Failed'); msg.style.color=d.ok?'var(--green)':'var(--red)';
-  }catch(e){ msg.textContent='Failed: '+e; msg.style.color='var(--red)'; }
-};
-const _digNow=$('#digNowBtn');
-if(_digNow) _digNow.onclick=async()=>{
-  const msg=$('#digNowMsg'); msg.textContent='Sending\u2026'; msg.style.color='var(--faint)';
-  await saveDiscord();
-  try{ const d=await api('/api/discord/digest-now',{method:'POST'});
-       msg.textContent=d.message||(d.ok?'Sent!':'Failed'); msg.style.color=d.ok?'var(--green)':'var(--red)'; }
-  catch(e){ msg.textContent='Failed: '+e; msg.style.color='var(--red)'; }
-};
-function openSettings(){ loadDiscordSettings(); $('#settingsScrim').classList.add('open'); }
-function closeSettings(){$('#settingsScrim').classList.remove('open');}
-$('#settingsBtn').onclick=openSettings;
-$('#estToggle').onclick=async()=>{
-  const mode=STATE.upcoming_mode||'audiobook';
-  const body=(mode==='novel')
-    ? {show_estimates_novel:!STATE.show_estimates_novel}
-    : {show_estimates:!STATE.show_estimates};
-  await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(typeof refresh==='function') refresh();
-};
-$('#modeToggle').onclick=async()=>{
-  const next=((STATE.upcoming_mode||'audiobook')==='audiobook')?'novel':'audiobook';
-  await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({upcoming_mode:next})});
-  if(typeof refresh==='function') refresh();
-};
-$('#clearAllBtn').onclick=async()=>{
-  if(!confirm("Delete ALL tracked series from the app AND tell the extension to forget every page?\n\nUse this for a true reset. (To just rebuild the app's data from pages the extension already knows, use 'Crawl all now' in the extension instead.)\n\nYour data.json is backed up first; settings are kept.")) return;
-  const r=await api('/api/series/clear',{method:'POST',body:JSON.stringify({forget:true})});
-  closeSettings();
-  toast((r&&r.ok)?('Cleared '+r.removed+' series \u2014 extension will forget its pages shortly'):'Could not clear');
-  if(typeof refresh==='function') refresh(); else location.reload();
-};
-
-/* ---- quit ---- */
-$('#quitBtn').onclick=async()=>{
-  if(!confirm('Close Release Radar? It stops collecting until you reopen it.'))return;
-  try{await api('/api/quit',{method:'POST'});}catch(e){}
-  document.body.innerHTML='<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;'+
-    'font-family:var(--serif);font-size:22px;color:var(--muted);text-align:center;padding:40px">'+
-    'Release Radar has stopped.<br><span style="font-size:15px">You can close this tab.</span></div>';
-};
-
-async function askExtension(path,label,body){
-  try{ const opt=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{method:'POST'};
-       const r=await api(path,opt); if(!r||!r.ok){toast('Could not reach the app');return;} }
-  catch(e){ toast('Could not reach the app'); return; }
-  toast(label+' \u2014 the extension will start within ~20s. Make sure it\u2019s installed and Firefox is open.');
-  // poll a little faster for a couple of minutes so results show as they land
-  if(window.__extPoll) clearInterval(window.__extPoll);
-  let n=0; window.__extPoll=setInterval(()=>{ refresh(); if(++n>40){clearInterval(window.__extPoll);window.__extPoll=null;} }, 3000);
-}
-$('#extRefreshBtn').onclick=()=>askExtension('/api/ext/refresh','Asked the extension to refresh dates');
-$('#extCrawlBtn').onclick=()=>askExtension('/api/ext/crawl','Asked the extension to crawl all series');
-
-$('#settingsScrim').onclick=e=>{if(e.target===$('#settingsScrim'))$('#settingsScrim').classList.remove('open');};
-document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModal();closeSettings();}});
-
-if($('#sortSel')) $('#sortSel').onchange=renderGrid;
-
-refresh();
-setInterval(refresh,60000);
-</script>
-</body>
-</html>"""
+PAGE_HTML = _load_page_html()
 
 
 # ---------------------------------------------------------------------------
@@ -3929,6 +5021,8 @@ def main():
     load_state()
     _ensure_line_files()
     _start_daily_digest()
+    _reattach_orphaned_bat_run()
+    _start_discord_bot()
     port = pick_port(preferred)
     url = f"http://127.0.0.1:{port}/"
     add_log(f"{APP_NAME} started on {url}")
