@@ -1,3 +1,6 @@
+# === GENERATED FILE - DO NOT EDIT ===
+# app.py is composed from the parts in src/ by compose_app.py.
+# Edit the src/ part, then run:  python compose_app.py
 """
 Release Radar - a local audiobook release tracker.
 
@@ -23,6 +26,7 @@ import random
 import html
 import statistics
 import threading
+import base64
 import subprocess
 import sqlite3
 import smtplib
@@ -3371,6 +3375,24 @@ def _run_update_audiobooks(job=None, delay=None):
 _bot_state = {"running": False, "err": ""}
 
 
+def _bot_invite_url():
+    """The OAuth invite link for the bot - the application id is public and is
+    simply the base64 first segment of the token. Being online (gateway) and
+    being IN a server are different things; the server owner must open this
+    link once. Permissions: view channels + send messages + read history."""
+    tok = (get_settings().get("bot_token") or "").strip()
+    if not tok:
+        return ""
+    try:
+        seg = tok.split(".")[0]
+        app_id = base64.b64decode(seg + "=" * (-len(seg) % 4)).decode("ascii")
+        if not app_id.isdigit():
+            return ""
+        return f"https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot&permissions=68608"
+    except Exception:      # noqa: BLE001
+        return ""
+
+
 def _bot_match_series(frag):
     """Series whose name contains the fragment (normalised). Returns (series|None, err)."""
     f = _norm(frag or "")
@@ -3953,6 +3975,7 @@ AI_DAILY_MAX = 3                # automatic research calls per day (cost bound)
 AI_TIMEOUT_S = 120
 
 AI_DEFAULT_MODELS = {
+    "claude-code": "sonnet",       # headless Claude Code: plan-usage friendly default
     "anthropic": "claude-opus-5",
     "openrouter": "perplexity/sonar",
     "openai": "gpt-5-mini",
@@ -3965,9 +3988,18 @@ _ai_day = {"date": None, "used": 0}
 def _ai_conf():
     st = get_settings()
     key = (st.get("ai_api_key") or "").strip()
+    prov = st.get("ai_provider") or "openrouter"
+    if prov == "claude-code":
+        # runs the local Claude Code CLI under someone's own subscription login -
+        # no API key involved; configured iff the CLI is installed
+        import shutil as _sh
+        exe = _sh.which("claude")
+        if not exe:
+            return None
+        model = (st.get("ai_model") or "").strip() or AI_DEFAULT_MODELS["claude-code"]
+        return {"provider": prov, "key": "", "model": model, "exe": exe}
     if not key:
         return None
-    prov = st.get("ai_provider") or "openrouter"
     model = (st.get("ai_model") or "").strip() or AI_DEFAULT_MODELS.get(prov, "")
     return {"provider": prov, "key": key, "model": model}
 
@@ -3985,6 +4017,25 @@ def _ai_call(prompt):
     if not conf:
         raise RuntimeError("no AI key configured")
     prov, key, model = conf["provider"], conf["key"], conf["model"]
+    if prov == "claude-code":
+        # Headless Claude Code with web search, billed to the subscription the
+        # CLI is logged into (usage limits apply; a maxed-out window errors).
+        # Run from data_dir so it never picks up a project's CLAUDE.md context.
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        r = subprocess.run(
+            [conf["exe"], "-p", prompt, "--model", model,
+             "--tools", "WebSearch", "WebFetch",
+             "--allowedTools", "WebSearch", "WebFetch"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=max(AI_TIMEOUT_S, 240), cwd=data_dir(), creationflags=flags,
+            stdin=subprocess.DEVNULL)
+        if r.returncode != 0:
+            raise RuntimeError(f"claude CLI failed ({r.returncode}): "
+                               f"{(r.stderr or r.stdout or '').strip()[:200] or 'no output'}")
+        out = (r.stdout or "").strip()
+        if not out:
+            raise RuntimeError("claude CLI returned nothing")
+        return out
     if prov == "anthropic":
         d = _ai_http("https://api.anthropic.com/v1/messages",
                      {"model": model, "max_tokens": 2048,
@@ -4131,10 +4182,31 @@ def _ai_tick():
         threading.Thread(target=_ai_research_series, args=(sid,), daemon=True).start()
 
 
+_ai_running = set()
+
+
 @app.post("/api/series/<sid>/research")
 def api_series_research(sid):
-    ok, msg = _ai_research_series(sid, manual=True)
-    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+    """Kick one research pass off in the background and answer at once - the
+    call takes 1-3 minutes (web search) and the Check popup must not hang."""
+    if not _ai_conf():
+        return jsonify({"ok": False, "message": "no AI configured (Settings \u2192 Integrations)"}), 400
+    with _lock:
+        if not _find(sid):
+            return jsonify({"ok": False, "message": "unknown series"}), 404
+        if sid in _ai_running:
+            return jsonify({"ok": True, "message": "already researching \u2014 give it a couple of minutes"})
+        _ai_running.add(sid)
+
+    def _go():
+        try:
+            _ai_research_series(sid, manual=True)
+        finally:
+            _ai_running.discard(sid)
+
+    threading.Thread(target=_go, daemon=True).start()
+    return jsonify({"ok": True, "message": "AI check started \u2014 the result lands on the card "
+                                           "(and Discord if the picture changed) in a couple of minutes."})
 
 
 
@@ -4614,6 +4686,7 @@ def api_get_settings():
                     "buy_tab_mode": s.get("buy_tab_mode", "foreground"),
                     "bot_token_set": bool(s.get("bot_token")),
                     "bot_running": _bot_state["running"], "bot_err": _bot_state["err"],
+                    "bot_invite": ("" if remote else _bot_invite_url()),
                     "ai_provider": s.get("ai_provider", "openrouter"),
                     "ai_api_key_set": bool(s.get("ai_api_key")),
                     "ai_model": s.get("ai_model", ""),
@@ -4655,7 +4728,7 @@ def api_set_settings():
                 s[sec] = body[sec].strip()
             if body.get(sec + "_clear"):
                 s[sec] = ""
-        if body.get("ai_provider") in ("openrouter", "anthropic", "openai", "grok"):
+        if body.get("ai_provider") in ("openrouter", "anthropic", "openai", "grok", "claude-code"):
             s["ai_provider"] = body["ai_provider"]
         if "ai_model" in body:
             s["ai_model"] = (body.get("ai_model") or "").strip()

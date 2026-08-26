@@ -12,6 +12,10 @@ python -m pip install -r requirements.txt pyinstaller
 if errorlevel 1 goto :err
 
 echo.
+echo Composing app.py from src\ ...
+python compose_app.py
+if errorlevel 1 goto :err
+
 echo Building ReleaseRadar.exe ...
 REM --onefile   = single .exe
 REM --noconsole = no terminal window (it runs in the background and opens your browser)

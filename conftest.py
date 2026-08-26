@@ -9,8 +9,15 @@ individual tests may still stub save_state, but they no longer have to remember.
 """
 import importlib.util
 import os
+import subprocess
+import sys
 
 import pytest
+
+# app.py is composed from src/ parts (see compose_app.py). Recompose before the
+# module loads whenever a part is newer, so tests can never run stale code.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+subprocess.run([sys.executable, os.path.join(_HERE, "compose_app.py")], check=True)
 
 _spec = importlib.util.spec_from_file_location(
     "radar", os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"))

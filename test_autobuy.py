@@ -705,3 +705,54 @@ def test_bot_commands(env, monkeypatch):
     monkeypatch.setattr(radar, "_bat_path", lambda: "x.bat")
     assert "running Update Audiobooks" in radar.handle_bot_command("!download")
     assert sent["bat"] == [None]
+
+
+def test_claude_code_ai_provider(env, monkeypatch):
+    """Provider 'claude-code' runs the local CLI under the user's subscription:
+    no API key required, configured iff the CLI exists, output passed through."""
+    import shutil, subprocess as sp
+    radar._state["settings"].update({"ai_provider": "claude-code", "ai_api_key": ""})
+    monkeypatch.setattr(shutil, "which", lambda n: r"C:\fake\claude.CMD" if n == "claude" else None)
+    conf = radar._ai_conf()
+    assert conf and conf["provider"] == "claude-code" and conf["model"] == "sonnet"
+    calls = {}
+    class R: returncode = 0; stdout = "Research says: book 9 due March."; stderr = ""
+    def fake_run(args, **kw):
+        calls["args"] = args; calls["kw"] = kw; return R()
+    monkeypatch.setattr(radar.subprocess, "run", fake_run)
+    out = radar._ai_call("what about book 9?")
+    assert out == "Research says: book 9 due March."
+    assert calls["args"][0].endswith("claude.CMD") and "-p" in calls["args"]
+    assert "WebSearch" in calls["args"] and "--model" in calls["args"]
+    # CLI failure surfaces as an error (e.g. usage limit reached)
+    class F: returncode = 1; stdout = ""; stderr = "5-hour limit reached"
+    monkeypatch.setattr(radar.subprocess, "run", lambda *a, **k: F())
+    with pytest.raises(RuntimeError):
+        radar._ai_call("x")
+    # no CLI on PATH -> unconfigured, never a crash
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    assert radar._ai_conf() is None
+
+
+def test_research_endpoint_is_async_and_deduped(env, monkeypatch):
+    """The Check popup's AI option must return at once; the pass runs in a
+    thread and a second click while one is running says so instead of stacking."""
+    import shutil
+    c, s, sent = env
+    monkeypatch.setattr(shutil, "which", lambda n: r"C:\fake\claude.CMD" if n == "claude" else None)
+    radar._state["settings"].update({"ai_provider": "claude-code", "ai_api_key": ""})
+    started = []
+    monkeypatch.setattr(radar, "_ai_research_series", lambda sid, manual=False: started.append(sid) or (True, "ok"))
+    r = c.post("/api/series/sid1/research").get_json()
+    assert r["ok"] and "started" in r["message"].lower()
+    import time as _t
+    for _ in range(50):
+        if started: break
+        _t.sleep(0.05)
+    assert started == ["sid1"]
+    # dedupe: pretend one is still running
+    radar._ai_running.add("sid1")
+    r2 = c.post("/api/series/sid1/research").get_json()
+    assert "already researching" in r2["message"]
+    radar._ai_running.discard("sid1")
+    assert c.post("/api/series/nope/research").status_code == 404

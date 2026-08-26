@@ -957,3 +957,11 @@ def test_dashboard_is_composed_from_static_files():
     for name in ("dashboard.html", "dashboard.css", "dashboard.js"):
         assert os.path.isfile(os.path.join(radar._STATIC_DIR, name)), name
     assert radar.PAGE_HTML == radar._load_page_html()
+
+
+def test_app_py_matches_its_parts():
+    """app.py is generated from src/ — direct edits to app.py (or a forgotten
+    compose) must fail loudly, not ship silently."""
+    import compose_app
+    assert compose_app.compose_text() == open(compose_app.APP, encoding="utf-8", newline="").read()
+    assert len(compose_app.parts()) >= 20

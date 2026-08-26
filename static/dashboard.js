@@ -429,6 +429,7 @@ function renderGrid(){
           ${s.narrator?`<div class="fact"><div class="k">Narrator</div><div class="v">${esc(s.narrator)}</div></div>`:''}
           ${s.listening?`<div class="fact"><div class="k">Listening</div><div class="v listening" title="From Audiobookshelf">🎧 book ${s.listening.n??'?'} · ${Math.round(s.listening.pct)}%</div></div>`:''}
         </div>
+        ${s.intel?`<div class="intel" title="AI web research · ${attrEsc((s.intel.at||'').slice(0,16).replace('T',' '))} · confidence: ${attrEsc(s.intel.confidence||'?')}">🔎 ${esc(s.intel.summary||s.intel.status||'')}${(s.intel.next_book&&s.intel.next_book.expected)?` · next: book ${esc(String(s.intel.next_book.n??'?'))} ~${esc(s.intel.next_book.expected)}`:''}</div>`:''}
         <span class="pill ${s.status_class||st}">${esc(s.status_label)}</span>
         ${predict}${chg}${err}
         ${timelineHtml(s)}
@@ -443,10 +444,41 @@ function renderGrid(){
   });
   wireDrag();
   grid.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>openModal(b.dataset.edit));
-  grid.querySelectorAll('[data-check]').forEach(b=>b.onclick=()=>{
-    const nm=(STATE.series.find(x=>x.id===b.dataset.check)||{}).name||'this series';
-    askExtension('/api/ext/crawl-series','Checking \u201c'+nm+'\u201d',{id:b.dataset.check});
+  grid.querySelectorAll('[data-check]').forEach(b=>b.onclick=ev=>showCheckMenu(ev.currentTarget,b.dataset.check));
+}
+
+/* ---- Check menu: quick Amazon re-read vs the AI web-research check ---- */
+let CHECKMENU=null;
+function hideCheckMenu(){if(CHECKMENU){CHECKMENU.remove();CHECKMENU=null;}}
+function showCheckMenu(anchor,sid){
+  hideCheckMenu();
+  const s=STATE.series.find(x=>x.id===sid)||{};
+  const nm=s.name||'this series';
+  CHECKMENU=document.createElement('div');
+  CHECKMENU.className='checkmenu';
+  CHECKMENU.innerHTML=`
+    <button class="small" data-cm="amazon">\ud83d\udcc4 Quick check \u2014 re-read the Amazon pages</button>
+    <button class="small" data-cm="ai">\ud83d\udd0e AI check \u2014 web research on what's known${s.intel?` <span class="cm-sub">last: ${esc((s.intel.at||'').slice(0,10))}</span>`:''}</button>
+    <button class="small ghost" data-cm="x">Cancel</button>`;
+  document.body.appendChild(CHECKMENU);
+  const r=anchor.getBoundingClientRect();
+  CHECKMENU.style.left=Math.min(r.left,window.innerWidth-CHECKMENU.offsetWidth-10)+'px';
+  CHECKMENU.style.top=Math.min(r.bottom+6,window.innerHeight-CHECKMENU.offsetHeight-10)+'px';
+  CHECKMENU.addEventListener('click',async ev=>{
+    const b=ev.target.closest('button[data-cm]');if(!b)return;
+    const act=b.dataset.cm;hideCheckMenu();
+    if(act==='amazon'){
+      askExtension('/api/ext/crawl-series','Checking \u201c'+nm+'\u201d',{id:sid});
+    }else if(act==='ai'){
+      try{const rr=await api('/api/series/'+sid+'/research',{method:'POST'});
+          toast(rr.message||(rr.ok?'AI check started':'Failed'));}
+      catch(e){toast('Failed: '+e);}
+    }
   });
+  setTimeout(()=>document.addEventListener('click',function outside(e){
+    if(CHECKMENU&&!CHECKMENU.contains(e.target))hideCheckMenu();
+    document.removeEventListener('click',outside);
+  }),0);
 }
 
 /* ---- drag to reorder ---- */
@@ -732,8 +764,11 @@ async function loadIntegrations(){
     $('#intAiModel').value=s.ai_model||'';
     $('#intAbsUrl').value=s.abs_url||'';
     $('#intBotToken').value=''; $('#intAiKey').value=''; $('#intAbsToken').value='';
-    $('#intBotHint').textContent=s.bot_token_set?'A token is saved. Type a new one to replace it.':'Discord → Developer Portal → New Application → Bot → Reset Token.';
-    $('#intAiHint').textContent=s.ai_api_key_set?'A key is saved. Type a new one to replace it.':'Not set yet.';
+    if(s.bot_token_set){
+      const st=s.bot_running?'Bot online.':'Bot offline'+(s.bot_err?' — '+s.bot_err:' (starting, or restart the app after a token change).');
+      $('#intBotHint').innerHTML=st+(s.bot_invite?' <a href="'+s.bot_invite+'" target="_blank" rel="noopener">Invite it to your server</a> (one-time; needs Manage Server).':'');
+    } else $('#intBotHint').textContent='Discord → Developer Portal → New Application → Bot → Reset Token.';
+    $('#intAiHint').textContent=($('#intAiProvider').value==='claude-code')?'No key needed — uses the Claude Code CLI installed on this PC (your subscription; its usage limits apply).':(s.ai_api_key_set?'A key is saved. Type a new one to replace it.':'Not set yet.');
     $('#intAbsHint').textContent=s.abs_token_set?'A token is saved. Type a new one to replace it.':'ABS → Settings → Users → your user → API token.';
     ['#intBotToken','#intAiProvider','#intAiKey','#intAiModel','#intAbsUrl','#intAbsToken'].forEach(sel=>{const el=$(sel); if(el) el.disabled=!!s.remote_readonly;});
   }catch(_){}
