@@ -127,7 +127,7 @@ def test_the_picker_honours_the_apps_libation_files_setting(tmp_path):
 # Arcane Academy book 5's audiobook came out on 2 Oct 2026 titled "Spell
 # Breaker" (every book in that series is), with NO series on Audible's record
 # yet, under Audible's own product ID. All three rules missed it and the run
-# refused a book the user tracks.
+# refused a tracked book.
 
 ARCANE = {
     "name": "Arcane Academy", "author": "by A.P. Gore", "novel_n": 7,

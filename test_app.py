@@ -1357,7 +1357,7 @@ def test_ai_failed_series_leaves_the_batch_for_the_day(monkeypatch):
 
 
 def test_ai_candidates_are_overdue_novels_only():
-    """the user: research only when a NOVEL is overdue. An overdue or missing
+    """Rule: research only when a NOVEL is overdue. An overdue or missing
     audiobook, a series that is merely quiet, or a next novel already on
     pre-order is not a reason to spend a research call."""
     radar._state = {"series": [], "log": [], "settings": {}}
@@ -1466,7 +1466,7 @@ def test_problem_banner_can_actually_hide():
 
 
 def test_a_missed_estimate_is_researched_that_night_cap_or_no_cap(monkeypatch):
-    """the user: 'the day it's overdue from the estimates, not some arbitrary
+    """Rule: 'the day it's overdue from the estimates, not some arbitrary
     amount'. A just-missed estimate is urgent and never queues behind the
     daily cap; long-overdue re-checks fill what's left of it."""
     sent = _quiet(monkeypatch)
@@ -1558,7 +1558,7 @@ def test_novel_pings_are_violet_and_audiobook_pings_amber(monkeypatch):
 
 
 # ---------------------------------------------------------------- alerts tidy up after themselves
-# the user: when something disconnects and comes back, the "reconnected" message
+# Rule: when something disconnects and comes back, the "reconnected" message
 # should be the old warning edited, and an hour later it should disappear.
 
 def _alert_env(monkeypatch):
@@ -1616,7 +1616,7 @@ def test_watchdog_and_problems_use_self_tidying_alerts(monkeypatch):
 
 
 # ---------------------------------------------------------------- AI research: the author's plan, nothing else
-# the user (7 Oct 2026): "way too wordy ... I wanted it to find info like 'November,
+# Feedback (7 Oct 2026): "way too wordy ... I wanted it to find info like 'November,
 # then a bunch right after each other', not explain random trivia".
 
 
@@ -1632,7 +1632,7 @@ def test_research_brief_is_schedule_only():
 
 
 # ---------------------------------------------------------------- research feeds the estimates, says nothing
-# the user (7 Oct 2026): it shouldn't tell me anything - update the timing logic
+# Feedback (7 Oct 2026): it shouldn't tell me anything - update the timing logic
 # when there's an update, with a hoverable asterisk for the sourcing.
 
 def _month_ahead(days):
@@ -1803,7 +1803,7 @@ def test_research_waits_for_the_royal_road_harvest_then_runs(monkeypatch):
 
 # ---------------------------------------------------------------- Audiobookshelf status line (11 Oct 2026)
 # One plain fact ABS doesn't have, no emoji, or nothing; the same words as the
-# extension's overlay chip. the user: "no emojis please ... cluttered".
+# extension's overlay chip. Feedback: "no emojis please ... cluttered".
 
 def test_abs_status_line_is_one_plain_fact_or_nothing():
     T = "2026-10-11"

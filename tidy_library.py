@@ -44,7 +44,7 @@ import sys
 import file_audiobooks as fa   # shares norm(), AUDIO_EXT, IGNORE_*, schema naming
 
 DEFAULT_DST = fa.DEFAULT_DST
-LIBATION_DB = r"C:\Users\<user>\Libation\LibationContext.db"
+LIBATION_DB = os.path.join(os.path.expanduser("~"), "Libation", "LibationContext.db")
 
 
 # ------------------------------------------------------------------ Libation

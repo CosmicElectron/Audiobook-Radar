@@ -10,7 +10,7 @@
 //
 // ABS is a single-page app (Nuxt): routes change without page loads, so a
 // poll watches the URL and re-applies. Markup (ABS client 2.37, verified on
-// the user's server 11 Oct 2026): the top app bar carries <h1>audiobookshelf</h1>
+// a live server, 11 Oct 2026): the top app bar carries <h1>audiobookshelf</h1>
 // inside #appbar, FIRST in the document, so document.querySelector("h1") is
 // never the page title — that is where the chip used to land, twice. The
 // series page has no heading at all: the name is the first <p> of #toolbar.
@@ -120,7 +120,7 @@ function rrDays(fromIso, toIso) {
   return Math.round((Date.UTC(+b[1], +b[2] - 1, +b[3]) - Date.UTC(+a[1], +a[2] - 1, +a[3])) / 864e5);
 }
 
-// One plain fact ABS doesn't have, or nothing. No emoji (the user, 11 Oct 2026:
+// One plain fact ABS doesn't have, or nothing. No emoji (feedback, 11 Oct 2026:
 // "cluttered, not visually appealing"); the icon is ABS's own Material
 // Symbols font. Listening progress is ABS's own data, so it is not repeated.
 function rrAbsChipText(s, todayIso) {

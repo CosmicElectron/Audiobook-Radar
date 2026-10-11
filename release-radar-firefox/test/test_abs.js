@@ -1,6 +1,6 @@
 // The Audiobookshelf overlay: which series a page is about, where the chip
 // goes, and what it says. Markup shapes are ABS client 2.37 as seen on
-// the user's server (11 Oct 2026): the app bar's <h1>audiobookshelf</h1> comes
+// a live server (11 Oct 2026): the app bar's <h1>audiobookshelf</h1> comes
 // first in every document, the series page names the series in a <p> inside
 // #toolbar, the item page's series links sit beside the h1 in #item-page-wrapper.
 //

@@ -197,7 +197,7 @@ def _abs_listening_for(series_name):
 # clients show yet (11 Oct 2026: the web client is being rewritten in React
 # and frontend pull requests are paused). It is the official, scan-proof home
 # for one line like "Audio 2 overdue by 10 days": the server stores it
-# untouched across its updates, the user's patched phone app shows it under the
+# untouched across its updates, a patched phone app shows it under the
 # series name, and any future client can. A description the radar did not
 # write is never touched; a line the radar wrote is removed again the moment
 # there is nothing to say.

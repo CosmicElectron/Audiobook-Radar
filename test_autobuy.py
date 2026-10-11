@@ -997,7 +997,7 @@ def test_download_again_button_reruns_update_audiobooks(env, monkeypatch):
 
 
 # ---------------------------------------------------------------- progress: the picker's count, per-book bars, honest ticks
-# the user (7 Oct 2026): the bar sat at 1/2 under a green tick - Libation's
+# Feedback (7 Oct 2026): the bar sat at 1/2 under a green tick - Libation's
 # "New: 2" was the total, but the tracked-series picker let one through. And
 # a bar that only counts finished books is no progress bar for a 20-hour title.
 

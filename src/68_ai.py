@@ -81,7 +81,7 @@ def _ai_conf():
     key = (st.get("ai_api_key") or "").strip()
     prov = st.get("ai_provider") or "openrouter"
     if prov == "claude-code":
-        # runs the local Claude Code CLI under someone's own subscription login -
+        # runs the local Claude Code CLI under the user's own subscription login -
         # no API key involved; configured iff the CLI is installed
         exe = _ai_cli_exe()
         if not exe:
@@ -246,7 +246,7 @@ def _ai_prompt_for(srs, missed=None):
     name = srs.get("name", "")
     searches = (f'"{author} {name} audiobook", "{name} book {(_entry_n(novels[-1]) + 1) if novels else "next"} release", '
                 f'"site:reddit.com {name} audiobook", "site:royalroad.com {name} author note", "{author} patreon {name}"')
-    # links the user keeps in the series notes (its Royal Road page, Patreon, a
+    # links kept in the series notes (its Royal Road page, Patreon, a
     # Discord announcement mirror) are the author's own places: read them first
     links = re.findall(r"https?://\S+", srs.get("notes") or "")
     if links:
@@ -266,7 +266,7 @@ def _ai_prompt_for(srs, missed=None):
                   "here is authoritative, quote it in 'said':\n" + "\n".join(lines) + "\n")
     # Schedule-only brief. The first version asked for "1-2 factual sentences"
     # and got trivia back (where the series is serialised, what it is about);
-    # the user wants what he'd find himself: the author's own words on WHEN -
+    # The user wants what they'd find themselves: the author's own words on WHEN -
     # "book 10 in November, then 11-13 back to back" - with the source.
     return (
         f"You research release dates for ONE book series. Find what the AUTHOR or PUBLISHER has said about "
@@ -523,7 +523,7 @@ def _ai_mark_tried(sid):
 def _novel_overdue(srs):
     """The next NOVEL is overdue: the forecast the card would show has passed
     and nothing is pre-ordered. Only this earns an automatic research call
-    (the user's rule) - a missing audiobook or a merely quiet series does not;
+    (house rule) - a missing audiobook or a merely quiet series does not;
     the manual Check button stays available for those."""
     pred = predicted_novel_date(srs)
     if not pred or pred >= today():

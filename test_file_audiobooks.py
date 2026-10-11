@@ -1,4 +1,4 @@
-"""Tests for file_audiobooks.py — built from real shapes in the user's library."""
+"""Tests for file_audiobooks.py — built from real shapes in a real library."""
 import os
 
 import pytest

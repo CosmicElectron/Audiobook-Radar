@@ -1,5 +1,5 @@
 """Which Libation books may Update Audiobooks download? Only ones in a series
-Release Radar tracks - the user's rule (29 Sep 2026), after a run fetched and
+Release Radar tracks - the house rule (29 Sep 2026), after a run fetched and
 filed two unrelated books alongside the one it had just bought.
 
 Prints the Audible product IDs to download on ONE line (stdout, for the bat's
