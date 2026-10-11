@@ -20,6 +20,12 @@
 #   owned/failed/denied/expired/cancelled/needs_signin   terminal, with a note
 # ---------------------------------------------------------------------------
 
+try:
+    import pick_downloads      # the ONE definition of "a tracked book", shared with Update Audiobooks.bat
+except ImportError:            # a copy without the file next to app.py: Libation checks answer "can't tell"
+    pick_downloads = None
+
+
 def _clean_buy_mode(v):
     v = (v or "off") if isinstance(v, str) else "off"
     v = v.strip().lower()
@@ -111,6 +117,11 @@ def _job_set(job, status, note=None):
 
 
 # ---- ownership: Libation's own library db is the truth for "already have it"
+def _libation_ro_uri(files_dir):
+    db = os.path.join(files_dir, "LibationContext.db")
+    return pick_downloads.ro_uri(db) if pick_downloads else f"file:{db}?mode=ro"
+
+
 def _libation_files_dir():
     cands = [get_settings().get("buy_libation_files") or "",
              os.path.join(os.path.expanduser("~"), "Libation"),
@@ -122,20 +133,54 @@ def _libation_files_dir():
     return None
 
 
-def _libation_owns(asin):
-    """True/False from Libation's library, None when it can't be checked."""
+def _series_key(name):
+    """Series names as Audible and Amazon spell them differently ('The Unfallen
+    Series' / 'The Unfallen'); same rule as pick_downloads.py."""
+    s = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    s = re.sub(r"^(?:the|a|an) ", "", s)
+    return re.sub(r" (?:series|saga|trilogy|cycle)$", "", s).strip()
+
+
+def _libation_match(asin=None, series=None, n=None, srs=None):
+    """Libation's record of one book: {"in_library": bool, "downloaded": bool},
+    or None when it can't be told. Recognition is pick_downloads' (series
+    name + number, a recorded product ID, author + title with the date
+    agreeing): Audible's ID is not the Amazon listing ASIN the radar knows
+    (Riftside 4: B0HJ9CQDHW vs B0HJ9DX4S2), and a brand-new release can arrive
+    with no series on Audible's record at all (Arcane Academy 5, 2 Oct 2026).
+    srs: the radar's series record (author, the book's title, its audiobook
+    date). "downloaded" follows the strongest match: Audible's own series
+    number or a recorded ID outrank an author+title guess, so a liberated
+    sibling can never make a failed download look complete."""
     d = _libation_files_dir()
-    if not d or not asin:
+    if not d or pick_downloads is None or not (asin or ((srs or series) and n is not None)):
+        if d and pick_downloads is None:
+            log.warning("pick_downloads.py is missing next to app.py - Libation checks can't tell")
         return None
     try:
-        con = sqlite3.connect(f"file:{os.path.join(d, 'LibationContext.db')}?mode=ro", uri=True, timeout=2)
-        try:
-            row = con.execute("select 1 from Books where AudibleProductId = ? limit 1", (asin,)).fetchone()
-        finally:
-            con.close()
-        return bool(row)
+        books = pick_downloads.library_books(d, pending_only=False)
+        rec = dict(srs) if isinstance(srs, dict) else {}
+        rec.setdefault("name", series or "")
+        ent = pick_downloads.series_entry(rec, n=n) if n is not None else pick_downloads.series_entry({"name": ""})
+        if asin:
+            ent["asins"].add(asin)
+        hits = []
+        for b in books:
+            m = pick_downloads.match_book(b, [ent])
+            if m:
+                hits.append((m[1] in (ent["name"], "matched by ID"), b["status"]))
     except Exception:
         return None
+    strong = [st for sure, st in hits if sure]
+    use = strong or [st for _, st in hits]
+    return {"in_library": bool(hits),
+            "downloaded": bool(use) and all(st == pick_downloads.LIBERATED for st in use)}
+
+
+def _libation_owns(asin, series=None, n=None, srs=None):
+    """True/False from Libation's library, None when it can't be checked."""
+    m = _libation_match(asin, series, n, srs=srs)
+    return None if m is None else m["in_library"]
 
 
 # ---- creation (called from ingest, under the lock)
@@ -164,7 +209,7 @@ def _maybe_create_buy_job(s, n, ent, audio_date):
            "dry_run": bool(st.get("buy_dry_run", True)), "status": "probing", "price": None,
            "created": _buy_now(), "updated": _buy_now(), "probes": 0, "last_probe": None,
            "steps": [], "note": ""}
-    owned = _libation_owns(audio_asin)
+    owned = _libation_owns(audio_asin, series=s.get("name"), n=n, srs=s)
     if owned:
         _job_set(job, "owned", "Libation already has this audiobook")
     _state.setdefault("buy_jobs", []).append(job)
@@ -180,6 +225,26 @@ def _buy_push_probe(job):
     job["probes"] = int(job.get("probes") or 0) + 1
     job["last_probe"] = _buy_now()
     _push_command(type="buy", phase="probe", job=_job_cmd(job))
+
+
+# a job parked or stopped for a reason a person can clear (signed back in, the
+# store now sells it) - what the dashboard's Retry, !retry and the Discord
+# button accept
+BUY_RETRYABLE = ("needs_signin", "retry_later", "failed", "expired")
+
+
+def _buy_retry(job, who):
+    """Re-check a parked job NOW instead of at the next 3-hourly probe. It gets
+    a fresh probe window, and a still-signed-out answer is announced again
+    (with a new button). Caller holds _lock."""
+    job["dry_run"] = bool(get_settings().get("buy_dry_run", True))
+    job["probes"] = 0
+    job["window_start"] = _buy_now()
+    job.pop("signin_notified", None)
+    job.pop("signin_button_at", None)
+    _job_step(job, "retry", True, f"retry from {who}")
+    _job_set(job, "probing", f"retry from {who}")
+    _buy_push_probe(job)
 
 
 def _buy_week_count():
@@ -201,6 +266,7 @@ def _buy_decide(job):
     if job.get("dry_run"):
         _job_set(job, "running", "dry run: borrows on KU, finds the audiobook offer, returns the borrow - buys nothing")
         _push_command(type="buy", phase="dry", job=_job_cmd(job))
+        _buy_live_begin(job)
         return
     if job.get("mode") == "auto" and price is not None and price <= _job_cap(job):
         if _buy_week_count() >= int(st.get("buy_weekly_max", BUY_WEEKLY_MAX)):
@@ -247,6 +313,7 @@ def _buy_approve(job, who="link"):
     job["approved_at"] = _buy_now()
     _push_command(type="buy", phase="execute", job=_job_cmd(job))
     _job_set(job, "running", f"approved by {who}; extension is working")
+    _buy_live_begin(job)
 
 
 def _buy_deny(job, who="link"):
@@ -297,6 +364,9 @@ def _buy_handle_report(job, phase, ok, detail):
     """Apply one report from the extension to a job. Runs under the lock."""
     detail = detail if isinstance(detail, dict) else {"info": str(detail)}
     info = str(detail.get("info") or "")[:300]
+    if phase == "progress":
+        job["now"] = info                     # what it is trying right now: the live message, not a step
+        return
     if phase == "probe":
         job["probes_ok"] = int(job.get("probes_ok") or 0) + (1 if ok else 0)
         if detail.get("buybox_html"):
@@ -413,10 +483,16 @@ def _buy_needs_signin(job):
     if job.get("signin_notified"):
         return
     job["signin_notified"] = _buy_now()
-    msg = (f"\U0001f511 Firefox is signed out of Amazon, so I can't buy {job.get('series', '')} — book {job.get('n')}. "
-           f"Sign in again on the PC (any Amazon page); I'll keep checking for {BUY_PROBE_DAYS} days and carry on by myself.")
-    _discord_notify(msg)
-    _send_email_async(job["id"], f"Release Radar: sign in to Amazon to buy {job.get('title', '')}", msg)
+    job["signin_button_at"] = _buy_now()
+    head = (f"\U0001f511 Firefox is signed out of Amazon, so I can't buy {job.get('series', '')} — book {job.get('n')}. "
+            f"Sign in again on the PC (any Amazon page)")
+    tail = f"; otherwise I re-check every {BUY_PROBE_GAP_H} h for {BUY_PROBE_DAYS} days and carry on by myself."
+    # the bot posts it with a Retry button (a webhook can't carry one); without
+    # the bot, the webhook says where the Retry lives instead
+    _notify_with_button(head + ", then hit the button" + tail,
+                        [("I've signed in — retry now", f"rr:retry:{job['id']}")],
+                        fallback=head + ", then hit Retry on the dashboard's purchase card" + tail)
+    _send_email_async(job["id"], f"Release Radar: sign in to Amazon to buy {job.get('title', '')}", head + tail)
 
 
 def _buy_after_purchase(job):
@@ -483,7 +559,13 @@ class _BatProgress:
         self.total = 0
         self.begun = 0
         self.done_dl = 0
+        self.failed_dl = 0
+        self.picked = None          # what the tracked-series picker let through (None: picker not seen)
+        self.skipped = 0            # ...and what it refused
+        self.picked_ids = {}        # Audible product ID -> why the picker took it
         self.current = ""
+        self.current_asin = None
+        self.book_pct = None        # how far the current book's download is (sampled from Libation's temp file)
         self.filed = []
         self.finished = False
         self.rc = None
@@ -514,14 +596,34 @@ class _BatProgress:
         m = re.match(r"New:\s*(\d+)", l)
         if m:
             self.new = int(m.group(1))
-            self.total = max(self.total, self.new)
-        m = re.match(r"DownloadDecryptBook Begin:\s*\S+\s*\[[A-Z0-9]+\]\s*(.+)", l)
+            if self.picked is None:
+                self.total = max(self.total, self.new)
+        # the tracked-series picker decides what is actually downloaded: its
+        # count is the bar's total, not Libation's "New: N" (a 1/2 bar that
+        # never filled, 7 Oct 2026, was one tracked book out of two new ones)
+        if l.startswith("Download (tracked):"):
+            self.picked = (self.picked or 0) + 1
+            self.total = self.picked
+            m = re.search(r"\[([A-Z0-9]+)\]\s*-\s*(.+?)\s*$", l)
+            if m:
+                self.picked_ids[m.group(1)] = m.group(2)
+        elif l.startswith("Not downloading (not in a tracked series):"):
+            self.skipped = len([x for x in l.split(":", 1)[1].split(";") if x.strip()])
+        elif l.startswith("Nothing new from the series Release Radar tracks"):
+            self.picked = 0
+            self.total = 0
+        m = re.match(r"DownloadDecryptBook Begin:\s*\S+\s*\[([A-Z0-9]+)\]\s*(.+)", l)
         if m:
             self.begun += 1
             self.total = max(self.total, self.begun)
-            self.current = m.group(1).strip()
+            self.current_asin, self.current = m.group(1), m.group(2).strip()
+            self.book_pct = None
         if re.match(r"DownloadDecryptBook Completed:", l):
             self.done_dl += 1
+            self.book_pct = None
+        if l.startswith("Error processing book"):
+            self.failed_dl += 1
+            self.done_dl = max(0, self.done_dl - 1)       # Libation says Completed before it says Error
         if re.match(r"(FILED|NEW|ADOPT|HOLD)\b", l) and not re.match(r"New:", l):
             self.filed.append(l[:120])
 
@@ -529,13 +631,22 @@ class _BatProgress:
         if not self.total:
             return ""
         done = min(self.done_dl, self.total)
-        f = int(self.BAR_W * done / self.total)
+        # the book in flight moves the bar too, by how far its download is
+        partial = (self.book_pct or 0) / 100 if (done < self.total and self.book_pct) else 0
+        f = int(self.BAR_W * (done + partial) / self.total)
         return "\u25b0" * f + "\u25b1" * (self.BAR_W - f) + f"  {done}/{self.total}"
+
+    def book_bar(self):
+        if self.book_pct is None:
+            return ""
+        f = int(8 * self.book_pct / 100)
+        return " " + "\u25b0" * f + "\u25b1" * (8 - f) + f" {self.book_pct}%"
 
     def render(self):
         rows = ["\U0001f4e6 **Update Audiobooks**" + (f" (attempt {self.attempt})" if self.attempt > 1 else "")]
         if self.processed is not None:
-            rows.append(f"\u2705 Scan: {self.processed} titles, {self.new or 0} new")
+            tracked = f" \u00b7 {self.picked} tracked" if self.picked is not None and self.new else ""
+            rows.append(f"\u2705 Scan: {self.processed} titles, {self.new or 0} new{tracked}")
         elif self.phase == "starting":
             rows.append("\u23f3 starting\u2026")
         else:
@@ -543,12 +654,18 @@ class _BatProgress:
                         + (f" ({self.accounts} accounts)" if self.accounts else ""))
         if self.processed is not None:
             if self.total == 0:
-                rows.append("\U0001f4a4 Nothing new to download")
+                rows.append("\U0001f4a4 Nothing new from the series you track"
+                            + (f" ({self.skipped} skipped, not tracked)" if self.skipped else ""))
             else:
-                downloading = self.phase == "download" and not self.finished and self.done_dl < self.total
-                icon = "\u2b07\ufe0f" if downloading else "\u2705"
-                cur = f" \u00b7 *{self.current}*" if downloading and self.current else ""
-                rows.append(f"{icon} Download  {self.bar()}{cur}")
+                # a tick only when every book came through; a download that
+                # Libation gave up on is a warning, not a tick
+                all_done = self.done_dl >= self.total and not self.failed_dl
+                downloading = self.phase == "download" and not self.finished and not all_done and not self.failed_dl
+                icon = "\u2b07\ufe0f" if downloading else ("\u2705" if all_done else "\u26a0\ufe0f")
+                cur = f" \u00b7 *{self.current}*{self.book_bar()}" if downloading and self.current else ""
+                fail = f" \u00b7 {self.failed_dl} failed (Libation will retry)" if self.failed_dl else ""
+                skip = f" \u00b7 {self.skipped} skipped, not tracked" if self.skipped else ""
+                rows.append(f"{icon} Download  {self.bar()}{cur}{fail}{skip}")
         if self.phase == "file" and not self.finished:
             rows.append("\U0001f5c2\ufe0f Filing into the library\u2026")
         for l in self.filed[-6:]:
@@ -579,6 +696,119 @@ class _LiveEditor:
             self._last_text = text
 
 
+# ---- live Discord progress for a purchase run ------------------------------
+# The outcome alone wasn't enough (29 Sep 2026: a purchase stopped mid-way and
+# the only trace was the dashboard card). One message per run, edited in place
+# as the extension reports: each step's result, what it is trying right now,
+# then the outcome. A failure also gets a Retry button (bot) of its own.
+BUY_STEP_TEXT = {"approve": "Approved", "retry": "Retry", "borrow": "Kindle Unlimited borrow",
+                 "borrow-ajax": "Borrow (fallback)", "borrow-verify": "Borrow confirmed",
+                 "buy-click": "Pressed Buy", "payment": "Payment method", "review": "Review page",
+                 "checkout": "Checkout", "confirm": "Order confirmation", "return": "Kindle Unlimited return",
+                 "offer": "Audiobook offer"}
+BUY_RUN_STATES = ("probing", "awaiting_approval", "approved", "running")
+_BUY_OUTCOME = {
+    "done": "✅ Bought — Update Audiobooks runs next.",
+    "done_unreturned": "✅ Bought — but return the KU borrow by hand.",
+    "failed": "❌ Stopped — nothing was bought.",
+    "uncertain": "⚠️ A Buy click happened but I couldn't see a confirmation — check your Amazon orders before retrying.",
+    "retry_later": "⏳ Amazon refused the checkout — I'll try again automatically.",
+    "dry_done": "\U0001f9ea Dry run finished — nothing was bought.",
+}
+_buy_live = {}
+
+
+def _buy_step_text(name):
+    if name.startswith("offer on "):
+        return "Audiobook offer on the " + name[len("offer on "):]
+    return BUY_STEP_TEXT.get(name, name)
+
+
+def _buy_live_render(job):
+    price = job.get("price")
+    ptxt = f"${price:.2f}" if isinstance(price, (int, float)) else "price ?"
+    lines = [f"\U0001f6d2 **{job.get('series', '')} — book {job.get('n')}** · {ptxt}"
+             + (" · dry run" if job.get("dry_run") else "")]
+    since = job.get("run_started") or ""
+    for st in job.get("steps") or []:
+        if (st.get("at") or "") < since:
+            continue
+        name, detail = str(st.get("step") or ""), str(st.get("detail") or "")
+        mark = "✅" if st.get("ok") else "❌"
+        if name.startswith("offer on ") and detail.startswith("not here"):
+            mark = "➖"                   # looked, not on this page: the search moves on
+        lines.append(f"{mark} {_buy_step_text(name)} — {detail[:150]}")
+    status = job.get("status")
+    if status in BUY_RUN_STATES:
+        if job.get("now"):
+            lines.append(f"⏳ now: {str(job['now'])[:160]}")
+    else:
+        out = _BUY_OUTCOME.get(status, f"Finished: {status}.")
+        if status in ("failed", "uncertain") and job.get("note"):
+            out += f"\n({str(job['note'])[:200]})"
+        lines.append(out)
+    return "\n".join(lines)[:1900]
+
+
+class _BuyLive:
+    """One live Discord message per purchase run. Network happens on its own
+    thread; callers (holding _lock) only drop the latest text in."""
+    IDLE_LIMIT_S = 3 * 3600
+
+    def __init__(self, text):
+        self.text, self.final, self.ev = text, False, threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def set(self, text, final=False):
+        self.text = text
+        self.final = self.final or final
+        self.ev.set()
+
+    def _run(self):
+        ed = _LiveEditor(_discord_live_start(self.text))
+        shown, idle = self.text, 0
+        while True:
+            if not self.ev.wait(timeout=60):
+                idle += 60
+                if idle >= self.IDLE_LIMIT_S:
+                    return                    # an abandoned run: stop watching
+                continue
+            self.ev.clear()
+            idle = 0
+            t = self.text
+            if t != shown:
+                ed.push(t, force=True)
+                shown = t
+            if self.final and self.text == shown:
+                return
+            time.sleep(1.2)                   # pace the edits; anything newer is picked up next loop
+
+
+def _buy_live_begin(job):
+    """A purchase run (dry or real) was handed to the extension."""
+    job["run_started"] = _buy_now()
+    job["now"] = "handed to the browser extension — waiting for it to pick the job up"
+    _buy_live[job["id"]] = _BuyLive(_buy_live_render(job))
+
+
+def _buy_live_update(job):
+    lv = _buy_live.get(job.get("id"))
+    if not lv:
+        return
+    final = job.get("status") not in BUY_RUN_STATES
+    if final:
+        job.pop("now", None)
+    lv.set(_buy_live_render(job), final=final)
+    if final:
+        _buy_live.pop(job["id"], None)
+        if job.get("status") == "failed":
+            head = (f"❌ {job.get('series', '')} — book {job.get('n')}: the purchase stopped "
+                    f"({str(job.get('note') or '')[:160]}). Nothing was bought.")
+            _notify_with_button(head + " Retry once it's sorted:",
+                                [("Retry", f"rr:retry:{job['id']}")],
+                                fallback=head + " Retry it from the dashboard's purchase card (or `!retry`).")
+
+
 
 def _bat_path():
     p = (get_settings().get("buy_bat") or "").strip()
@@ -592,10 +822,63 @@ def _bat_path():
     return None
 
 
-def _run_bat_once(bat, on_output=None):
+LIBATION_MB_PER_MIN = 0.91      # measured: Riftside 4 1202 min -> 1093 MB, Loopbreaker 1 1313 min -> 1194 MB
+_libation_len_cache = {}
+
+
+def _libation_length_minutes(asin):
+    if asin in _libation_len_cache:
+        return _libation_len_cache[asin]
+    d = _libation_files_dir()
+    mins = None
+    if d:
+        try:
+            con = sqlite3.connect(_libation_ro_uri(d), uri=True, timeout=2)
+            try:
+                row = con.execute("select LengthInMinutes from Books where AudibleProductId = ?", (asin,)).fetchone()
+            finally:
+                con.close()
+            mins = int(row[0]) if row and row[0] else None
+        except Exception:       # noqa: BLE001
+            mins = None
+    _libation_len_cache[asin] = mins
+    return mins
+
+
+def _libation_download_pct(asin):
+    """How far Libation's in-flight download of a book is, 0-99, or None.
+    LibationCli prints nothing between 'Begin' and 'Completed'; the growing
+    file in its DownloadsInProgress folder, against the book's length, is the
+    only progress there is (the encrypted download is ~0.91 MB per minute)."""
+    if not asin:
+        return None
+    temp = os.path.join(os.environ.get("LOCALAPPDATA") or "", "Temp")
+    size = None
+    try:
+        for name in os.listdir(temp):
+            if not name.lower().startswith("libation"):
+                continue
+            d = os.path.join(temp, name, "DownloadsInProgress")
+            if not os.path.isdir(d):
+                continue
+            for f in os.listdir(d):
+                if f.upper().startswith(asin.upper() + "."):
+                    size = max(size or 0, os.path.getsize(os.path.join(d, f)))
+    except OSError:
+        return None
+    if size is None:
+        return None
+    mins = _libation_length_minutes(asin)
+    if not mins:
+        return None
+    return int(min(99, 100 * size / (mins * LIBATION_MB_PER_MIN * 1048576)))
+
+
+def _run_bat_once(bat, on_output=None, on_tick=None):
     """Run Update Audiobooks.bat --auto hidden; returns (rc, tail of its output).
     on_output, when given, receives each new chunk of the bat's output while it
-    runs (drives the live Discord progress message)."""
+    runs (drives the live Discord progress message); on_tick runs every couple
+    of seconds regardless of output (a download prints nothing while it runs)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     logf = os.path.join(data_dir(), "autobuy-bat.log")
     with open(logf, "ab") as f:
@@ -626,6 +909,11 @@ def _run_bat_once(bat, on_output=None):
                 break
             except subprocess.TimeoutExpired:
                 _drain()
+                if on_tick:
+                    try:
+                        on_tick()
+                    except Exception:   # noqa: BLE001 - progress sampling must never stop the run
+                        pass
                 if time.monotonic() > deadline:
                     p.kill()
                     rc = -1
@@ -658,17 +946,44 @@ def _run_update_audiobooks(job=None, delay=None):
             prog.feed(chunk)
             editor.push(prog.render())
 
+        def _on_tick():
+            # the book in flight: sample Libation's temp file for a per-book bar
+            if prog.phase == "download" and prog.current_asin and not prog.finished:
+                pct = _libation_download_pct(prog.current_asin)
+                if pct is not None and pct != prog.book_pct:
+                    prog.book_pct = pct
+                    editor.push(prog.render())
+
+        downloaded = None
         for attempt in range(1, BUY_BAT_RETRIES + 1):
             prog.attempt = attempt
-            rc, tail = _run_bat_once(bat, on_output=_on_output)
-            owned = _libation_owns(asin) if asin else None
+            rc, tail = _run_bat_once(bat, on_output=_on_output, on_tick=_on_tick)
+            # DOWNLOADED, not merely in the library: Audible's licence service
+            # can fail right after a purchase (29 Sep 2026) while the book
+            # already sits in Libation's list
+            got = (_libation_match(asin, job.get("series"), job.get("n"),
+                                   srs=_find(job.get("series_id")) if job.get("series_id") else None)
+                   if job else None)
+            if job and got is not None and not got["downloaded"]:
+                # the picker's own word: the ONE book it took for THIS series, now in
+                # Libation. Two picks for the series and it can't tell which was bought.
+                ours = [pid for pid, why in prog.picked_ids.items()
+                        if _series_key(why.split(" (")[0]) == _series_key(job.get("series"))]
+                if len(ours) == 1:
+                    m = _libation_match(ours[0])
+                    if m and m["downloaded"]:
+                        got = m
+            downloaded = None if got is None else got["downloaded"]
             held = " (some books HELD — see the bat log)" if rc == 2 else ""
+            said = {True: "yes", False: "not yet", None: "can't tell"}[downloaded]
             with _lock:
                 if job:
-                    _job_step(job, "bat", rc in (0, 2), f"attempt {attempt}: rc={rc}{held}; Libation has it: {owned}")
+                    _job_step(job, "bat", rc in (0, 2) and downloaded is not False,
+                              f"attempt {attempt}: rc={rc}{held}; downloaded: {said}")
                 save_state()
-            add_log(f"Update Audiobooks ran (rc={rc}){held}; Libation has {asin or 'n/a'}: {owned}")
-            if owned or owned is None or not job:
+            add_log(f"Update Audiobooks ran (rc={rc}){held}" +
+                    (f"; {job.get('series', '')} {job.get('n')} downloaded: {said}" if job else ""))
+            if downloaded or downloaded is None or not job:
                 break
             time.sleep(BUY_BAT_RETRY_GAP_S)
         prog.finished = True
@@ -680,9 +995,20 @@ def _run_update_audiobooks(job=None, delay=None):
             except Exception:
                 pass
         if job:
-            _release_card_line(job.get("series_id"), job.get("n"),
-                               "🗂️ filed into the library — complete ✔" if rc in (0, 2)
-                               else "❌ download/filing failed — see autobuy-bat.log", replace_last=True)
+            if downloaded is False:
+                line = "❌ bought, but Libation couldn't download it — see below"
+            elif rc in (0, 2):
+                line = "🗂️ filed into the library — complete ✔"
+            else:
+                line = "❌ download/filing failed — see autobuy-bat.log"
+            _release_card_line(job.get("series_id"), job.get("n"), line, replace_last=True)
+            if downloaded is False:
+                head = (f"⚠️ {job.get('series', '')} — book {job.get('n')} is bought, but Libation couldn't "
+                        f"download it after {BUY_BAT_RETRIES} tries (usually Audible's licence service right after "
+                        f"a purchase).")
+                _notify_with_button(head + " Try the download again:",
+                                    [("Download again", f"rr:download:{job['id']}")],
+                                    fallback=head + " Send `!download` later, or hit Liberate in Libation.")
         if editor.url:
             editor.push(prog.render(), force=True)      # the live message becomes the summary
         else:

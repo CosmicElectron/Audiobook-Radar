@@ -443,7 +443,8 @@ def _ext_seen():
     if _ext_alerted:
         _ext_alerted = False
         add_log("extension is back")
-        _discord_notify(_fmt_line("recovered", what="The browser extension is checking in again."))
+        # edits the warning into the all-clear; gone an hour later
+        _alert_resolve("ext_silent", _fmt_line("recovered", what="The browser extension is checking in again."))
 
 
 def _maybe_report_unconfirmed_releases():
@@ -494,9 +495,118 @@ def _ext_watchdog():
         _ext_alerted = True
         h = int(quiet.total_seconds() // 3600)
         add_log(f"extension has been silent for {h} h")
-        _discord_notify(_fmt_line("watchdog",
-                                  what=f"The browser extension hasn't checked in for {h} hours — no release dates are being read.",
-                                  detail="Is Floorp open, and is the Release Radar add-on enabled? Reinstalling the .xpi over the top fixes a dead add-on."))
+        _alert_post("ext_silent", _fmt_line("watchdog",
+                                            what=f"The browser extension hasn't checked in for {h} hours — no release dates are being read.",
+                                            detail="Is Floorp open, and is the Release Radar add-on enabled? Reinstalling the .xpi over the top fixes a dead add-on."))
+
+
+# ---- problems: things only a person can fix ------------------------------
+# Every scheduled job used to fail into the in-app activity log and nowhere
+# else: the nightly AI research died for four nights in Sep 2026 (the Claude
+# CLI had signed itself out) and nobody heard. A problem is raised by key,
+# told to Discord ONCE, repeated daily while it persists, and announced when it
+# clears. Persisted, so a restart neither re-alerts nor forgets.
+PROBLEM_REMIND_H = 24
+
+
+def _problem(key, what, detail="", notify=True):
+    """Raise (or refresh) a problem. Returns True when it was announced."""
+    what, detail = _no_secrets(what), _no_secrets(detail)      # this text travels far (tunnel included)
+    now = datetime.now()
+    stamp = now.isoformat(timespec="seconds")
+    with _lock:
+        probs = _state.setdefault("problems", {})
+        p = probs.get(key)
+        if p:
+            p["what"], p["detail"] = what, detail
+            p["count"] = int(p.get("count") or 0) + 1
+            try:
+                recent = now - datetime.fromisoformat(p.get("last_alert") or "") < timedelta(hours=PROBLEM_REMIND_H)
+            except ValueError:
+                recent = False
+            if recent:
+                return False
+            p["last_alert"] = stamp
+        else:
+            probs[key] = {"what": what, "detail": detail, "count": 1, "since": stamp, "last_alert": stamp}
+        save_state()
+    add_log(f"PROBLEM ({key}): {what} {detail}".rstrip())
+    if notify:
+        _alert_post(f"problem:{key}", _fmt_line("watchdog", what=what, detail=detail))
+    return True
+
+
+def _problem_clear(key, what=None, notify=True):
+    """Drop a problem; announces the all-clear only if it was actually open."""
+    with _lock:
+        p = (_state.get("problems") or {}).pop(key, None)
+        if p:
+            save_state()
+    if not p:
+        return False
+    add_log(f"resolved ({key}): {what or p.get('what', '')}")
+    # the warning becomes the all-clear and disappears an hour later; a silent
+    # clear (notify=False) still takes the stale warning down, just posts nothing new
+    _alert_resolve(f"problem:{key}", _fmt_line("recovered", what=what or (p.get("what", "") + " That's fixed now.")),
+                   fallback=notify)
+    return True
+
+
+def _problems_list():
+    with _lock:
+        probs = _state.get("problems") or {}
+        return [dict(v, key=k) for k, v in sorted(probs.items(), key=lambda kv: kv[1].get("since", ""))]
+
+
+# A polling extension that never reads a page is as blind as a dead one, and
+# the poll watchdog above can't see it: Sep 2026 had three days of healthy
+# 20-second polls and not one Amazon read (the daily refresh only ever ran
+# when Floorp was restarted). Self-heal first — ask for a forced refresh — and
+# if that changes nothing, say so.
+READ_QUIET_NUDGE_H = 30       # the refresh runs daily; this much silence is abnormal
+READ_QUIET_ALERT_H = 6        # a nudge that yields nothing within this -> Discord
+_read_nudged_at = None
+
+
+def _read_watchdog():
+    global _read_nudged_at
+    now = datetime.now()
+    if now - _ext_last_poll > timedelta(minutes=10):
+        # not polling at all: _ext_watchdog owns that story - and time spent
+        # away must not count against a nudge it never received
+        _read_nudged_at = None
+        return
+    with _lock:
+        if not _state.get("series"):
+            return
+        # last_read is stamped by every accepted page read; last_ingest only by
+        # reads that CHANGED something, which a healthy quiet library never does
+        last = _state.get("last_read") or _state.get("last_ingest") or ""
+        pending = any(c.get("type") == "refresh" for c in _state.get("ext_commands", []))
+        open_problem = "no_reads" in (_state.get("problems") or {})
+    try:
+        quiet = now - datetime.fromisoformat(last)
+    except (TypeError, ValueError):
+        return                                  # never ingested anything: nothing to compare against
+    if quiet < timedelta(hours=READ_QUIET_NUDGE_H):
+        if _read_nudged_at is not None or open_problem:
+            _read_nudged_at = None
+            _problem_clear("no_reads", what="The extension is reading Amazon pages again.")
+        return
+    h = int(quiet.total_seconds() // 3600)
+    if _read_nudged_at is None or now - _read_nudged_at >= timedelta(hours=24):
+        _read_nudged_at = now
+        if not pending:
+            _push_command(type="refresh")
+        add_log(f"no page reads for {h} h although the extension is polling — asked it for a forced refresh")
+        return
+    if now - _read_nudged_at >= timedelta(hours=READ_QUIET_ALERT_H):
+        _problem("no_reads",
+                 what=f"The extension is alive but hasn't read a single Amazon page in {h} hours, and a forced refresh changed nothing.",
+                 detail="Open the Release Radar add-on popup: read its log, try 'Reset if stuck', or restart Floorp. "
+                        "Release days can't be detected until it reads pages again.")
+
+
 COVERFILL_CAP = 20        # backfill page-reads per round; the extension paces them
 COVERFILL_EVERY_HOURS = 24  # cover art is cosmetic — trickle it, don't hammer
 COVERFILL_MAX_TRIES = 3   # after this many reads with no yield, the page simply
@@ -632,8 +742,11 @@ def _maybe_send_daily_digest():
     ok, err = _send_digest(wh)
     if not ok:
         add_log(f"Daily digest failed: {err}")
+        _problem("digest", what=f"The forecast digest didn't send ({err}).",
+                 detail="Check the webhook in Settings → Discord.")
     else:
         add_log("Sent the daily forecast digest to Discord")
+        _problem_clear("digest", what="The forecast digest is sending again.")
 
 
 _digest_thread_started = False
@@ -669,6 +782,14 @@ def _start_daily_digest():
             except Exception as e:
                 add_log(f"extension watchdog error: {e}")
             try:
+                _read_watchdog()
+            except Exception as e:
+                add_log(f"read watchdog error: {e}")
+            try:
+                _discord_tidy_tick()
+            except Exception as e:
+                add_log(f"Discord tidy error: {e}")
+            try:
                 _maybe_report_unconfirmed_releases()
             except Exception as e:
                 add_log(f"unconfirmed-release check error: {e}")
@@ -684,6 +805,10 @@ def _start_daily_digest():
                 _abs_refresh_progress()
             except Exception as e:
                 add_log(f"Audiobookshelf progress error: {e}")
+            try:
+                _abs_sync_status()
+            except Exception as e:
+                add_log(f"Audiobookshelf status write error: {e}")
             try:
                 _ai_tick()
             except Exception as e:
@@ -712,6 +837,7 @@ def build_state_payload():
         "show_estimates": get_settings().get("show_estimates", True),
         "show_estimates_novel": get_settings().get("show_estimates_novel", True),
         "log": log_rows,
+        "problems": _problems_list(),
         "counts": {
             "total": len(views),
             "out": sum(1 for v in views if v["status_class"] == "released"),

@@ -78,6 +78,13 @@ function confChip(c){
     ? `${c.level} confidence — based on ${c.n} past gap${c.n===1?'':'s'} that varied by about ±${c.spread_days} days${drop}`
     : `${c.level} confidence — only ${c.n} past release to go on, so the spread is unknown${drop}`;
   return ` <span title="${esc(basis)}" style="font:600 9px/1 var(--mono,monospace);letter-spacing:.04em;text-transform:uppercase;padding:1px 5px;border:1px solid ${m[3]};background:${m[2]};color:${m[1]};border-radius:6px;vertical-align:middle">${m[0]}${pm}</span>`;}
+// An estimate that is the author's own date (found by the research) wears an
+// asterisk; hovering it shows who said it, where and when.
+function srcStar(src){
+  if(!src) return '';
+  const tip=[src.said?`"${src.said}"`:'', src.source||'AI research', src.expected?`(${src.expected})`:'', src.at?`found ${String(src.at).slice(0,10)}`:''].filter(Boolean).join(' · ');
+  return ` <span class="src" title="${attrEsc(tip)}">*</span>`;
+}
 function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML;}
 function attrEsc(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
 
@@ -152,6 +159,15 @@ async function refresh(){
     dot.className='extdot '+(s2<120?'ok':(s2<21600?'warn':'bad'));
     dot.title=s2<120?('Extension: checking in ('+s2+'s ago)')
       :('Extension silent for '+(s2<7200?Math.round(s2/60)+' min':Math.round(s2/3600)+' h')+' — is Floorp open and the add-on enabled?');
+  }
+  const pb=$('#problems');
+  if(pb){
+    const ps=STATE.problems||[];
+    pb.hidden=!ps.length;
+    // `code` spans in a detail line are the only markup allowed through
+    const fmt=t=>esc(t).replace(/`([^`]+)`/g,'<code>$1</code>');
+    pb.innerHTML=ps.map(p=>'<div class="prob">⚠️ <b>'+fmt(p.what)+'</b>'+(p.detail?' '+fmt(p.detail):'')
+      +'<span class="since">since '+esc(String(p.since||'').slice(0,16).replace('T',' '))+'</span></div>').join('');
   }
   const lc=$('#lastCheck');
   if(lc) lc.textContent = STATE.last_ingest
@@ -274,7 +290,7 @@ function renderHero(){
     else countHtml=`<div class="count">${u.countdown_days}<small>${u.countdown_days===1?'day':'days'}</small></div>`;
     el.innerHTML=`<div>${countHtml}</div>
       <div><div class="t">${esc(u.title)}</div>
-      <div class="d">${fmtDate(u.date)} · <span class="kind ${kindCls} ${u.estimate?'est':''}">${kindLbl}${u.estimate?' · est':''}</span>${conf}${note}</div></div>`;
+      <div class="d">${fmtDate(u.date)}${srcStar(u.source)} · <span class="kind ${kindCls} ${u.estimate?'est':''}">${kindLbl}${u.estimate?' · est':''}</span>${conf}${note}</div></div>`;
     hero.appendChild(el);
   });
 }
@@ -324,7 +340,7 @@ function timelineHtml(s){
       cover2:(e.cover&&s.cover_url&&e.cover!==s.cover_url)?s.cover_url:null,
       narr:e.narr||null,nN:e.nN??null,aN:e.aN??null,est:isEst,
       estN:isEst?(s.predicted_book_n??null):null,
-      estWhy:isEst?(s.predicted_queued
+      estWhy:isEst?(s.predicted_audio_source?('author: '+(s.predicted_audio_source.said||s.predicted_audio_source.expected||'')+(s.predicted_audio_source.source?' — '+s.predicted_audio_source.source:'')):s.predicted_queued
         ? (s.predicted_after_n!=null?`queued behind book ${s.predicted_after_n}'s audiobook, at this series' usual pace`:'next in this series’ audio queue')
         : 'projected from this series’ past novel→audio gaps'):null};
     const attrs=`class="mark ${cls}" style="left:${left.toFixed(1)}%" aria-label="${esc(title)}" data-tip="${attrEsc(JSON.stringify(tip))}"`;
@@ -367,7 +383,9 @@ function sortedSeries(){
   const mode=$('#sortSel')?$('#sortSel').value:'manual';
   if(mode==='title') arr.sort((a,b)=>(a.name||'').localeCompare(b.name||''));
   else if(mode==='next') arr.sort((a,b)=>{
-    const x=a.next_date||'9999',y=b.next_date||'9999';return x<y?-1:x>y?1:0;});
+    // undated series sink to the bottom; ties fall back to the title so the order is stable
+    const x=a.next_date||'9999',y=b.next_date||'9999';
+    return x<y?-1:x>y?1:(a.name||'').localeCompare(b.name||'');});
   else if(mode==='status'){const rank={announced:0,none:1,unknown:1,released:2};
     arr.sort((a,b)=>(rank[a.status_class||a.audiobook_status]??1)-(rank[b.status_class||b.audiobook_status]??1));}
   return arr; // 'manual' keeps stored order
@@ -390,7 +408,9 @@ function renderGrid(){
     let predict='';
     if(mode==='novel'){
       if(STATE.show_estimates_novel && s.predicted_novel_date){
-        predict=`<div class="predict">Likely next novel <span class="mono">~ ${fmtDate(s.predicted_novel_date)}</span> · ${s.novel_history_count} past gap${s.novel_history_count===1?'':'s'} (${s.avg_novel_gap_label})${confChip(s.predicted_novel_confidence)}</div>`;
+        const nsrc=s.predicted_novel_source;
+        const nbasis=nsrc?`author’s own timing`:`${s.novel_history_count} past gap${s.novel_history_count===1?'':'s'} (${s.avg_novel_gap_label})${confChip(s.predicted_novel_confidence)}`;
+        predict=`<div class="predict">Likely next novel <span class="mono">~ ${fmtDate(s.predicted_novel_date)}</span>${srcStar(nsrc)} · ${nbasis}</div>`;
       }
     }else{
       if(st==='none'||st==='unknown'){
@@ -402,10 +422,11 @@ function renderGrid(){
           const bk=s.predicted_book_n!=null?` book ${s.predicted_book_n}`:'';
           // say what the guess is built on: the audio queue when a confirmed date
           // ahead of it sets the pace, the novel→audio gap history otherwise
-          const basis=s.predicted_queued
+          const asrc=s.predicted_audio_source;
+          const basis=asrc?`author’s own timing`:(s.predicted_queued
             ? (s.predicted_after_n!=null?`queued after book ${s.predicted_after_n}'s audio`:'next in the audio queue')
-            : `${s.history_count} past gap${s.history_count===1?'':'s'} (${s.avg_gap_label})`;
-          predict=`<div class="predict">Likely audiobook${bk} <span class="mono">~ ${fmtDate(s.predicted_date)}</span> · ${basis}${confChip(s.predicted_confidence)}</div>`;
+            : `${s.history_count} past gap${s.history_count===1?'':'s'} (${s.avg_gap_label})`)+confChip(s.predicted_confidence);
+          predict=`<div class="predict">Likely audiobook${bk} <span class="mono">~ ${fmtDate(s.predicted_date)}</span>${srcStar(asrc)} · ${basis}</div>`;
         }
       }
     }
@@ -429,7 +450,6 @@ function renderGrid(){
           ${s.narrator?`<div class="fact"><div class="k">Narrator</div><div class="v">${esc(s.narrator)}</div></div>`:''}
           ${s.listening?`<div class="fact"><div class="k">Listening</div><div class="v listening" title="From Audiobookshelf">🎧 book ${s.listening.n??'?'} · ${Math.round(s.listening.pct)}%</div></div>`:''}
         </div>
-        ${s.intel?`<div class="intel" title="AI web research · ${attrEsc((s.intel.at||'').slice(0,16).replace('T',' '))} · confidence: ${attrEsc(s.intel.confidence||'?')}">🔎 ${esc(s.intel.summary||s.intel.status||'')}${(s.intel.next_book&&s.intel.next_book.expected)?` · next: book ${esc(String(s.intel.next_book.n??'?'))} ~${esc(s.intel.next_book.expected)}`:''}</div>`:''}
         <span class="pill ${s.status_class||st}">${esc(s.status_label)}</span>
         ${predict}${chg}${err}
         ${timelineHtml(s)}
@@ -768,23 +788,38 @@ async function loadIntegrations(){
       const st=s.bot_running?'Bot online.':'Bot offline'+(s.bot_err?' — '+s.bot_err:' (starting, or restart the app after a token change).');
       $('#intBotHint').innerHTML=st+(s.bot_invite?' <a href="'+s.bot_invite+'" target="_blank" rel="noopener">Invite it to your server</a> (one-time; needs Manage Server).':'');
     } else $('#intBotHint').textContent='Discord → Developer Portal → New Application → Bot → Reset Token.';
-    $('#intAiHint').textContent=($('#intAiProvider').value==='claude-code')?'No key needed — uses the Claude Code CLI installed on this PC (your subscription; its usage limits apply).':(s.ai_api_key_set?'A key is saved. Type a new one to replace it.':'Not set yet.');
+    $('#intAiHint').textContent=($('#intAiProvider').value==='claude-code')
+      ?((s.ai_signed_out?'⚠️ The Claude Code CLI on this PC is SIGNED OUT — open a terminal and run: claude auth login   ':'')
+        +'Uses the Claude Code CLI on this PC (your subscription; its usage limits apply). Optional: run `claude setup-token` and paste the token here'
+        +(s.ai_api_key_set?' (one is saved)':'')+' so research keeps working even when the CLI signs itself out.')
+      :(s.ai_api_key_set?'A key is saved. Type a new one to replace it.':'Not set yet.');
     $('#intAbsHint').textContent=s.abs_token_set?'A token is saved. Type a new one to replace it.':'ABS → Settings → Users → your user → API token.';
-    ['#intBotToken','#intAiProvider','#intAiKey','#intAiModel','#intAbsUrl','#intAbsToken'].forEach(sel=>{const el=$(sel); if(el) el.disabled=!!s.remote_readonly;});
+    $('#intAbsWrite').checked=!!s.abs_write_status;
+    if(s.abs_written_count) $('#intAbsSyncHint').textContent='Lines in Audiobookshelf right now: '+s.abs_written_count+'. Refreshed hourly; removed when there is nothing to say.';
+    ['#intBotToken','#intAiProvider','#intAiKey','#intAiModel','#intAbsUrl','#intAbsToken','#intAbsWrite','#intAbsSyncBtn'].forEach(sel=>{const el=$(sel); if(el) el.disabled=!!s.remote_readonly;});
   }catch(_){}
 }
 async function saveIntegrations(){
   if(REMOTE_RO) return;
-  const body={ai_provider:$('#intAiProvider').value,ai_model:$('#intAiModel').value.trim(),abs_url:$('#intAbsUrl').value.trim()};
+  const body={ai_provider:$('#intAiProvider').value,ai_model:$('#intAiModel').value.trim(),abs_url:$('#intAbsUrl').value.trim(),
+              abs_write_status:$('#intAbsWrite').checked};
   const bt=$('#intBotToken').value.trim(); if(bt) body.bot_token=bt;
   const ak=$('#intAiKey').value.trim(); if(ak) body.ai_api_key=ak;
   const at=$('#intAbsToken').value.trim(); if(at) body.abs_token=at;
   try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
       if(bt||ak||at){$('#intBotToken').value='';$('#intAiKey').value='';$('#intAbsToken').value='';loadIntegrations();}}catch(_){}
 }
-['#intBotToken','#intAiProvider','#intAiKey','#intAiModel','#intAbsUrl','#intAbsToken'].forEach(sel=>{
+['#intBotToken','#intAiProvider','#intAiKey','#intAiModel','#intAbsUrl','#intAbsToken','#intAbsWrite'].forEach(sel=>{
   const el=$(sel); if(el) el.addEventListener('change',saveIntegrations);
 });
+$('#intAbsSyncBtn').onclick=async()=>{
+  if(REMOTE_RO) return;
+  const h=$('#intAbsSyncHint'); h.textContent='Writing…';
+  try{
+    const r=await api('/api/abs/sync-now',{method:'POST'});
+    h.textContent=r.ok?('Done: '+r.written+' written, '+r.cleared+' removed'+(r.left_alone?', '+r.left_alone+' left alone (not our text)':'')+(r.failed?', '+r.failed+' failed':'')+'.'):(r.error||'Failed.');
+  }catch(e){ h.textContent='Failed: '+(e&&e.message||e); }
+};
 function openSettings(){ loadDiscordSettings(); loadBuySettings(); loadIntegrations(); loadHolds(); $('#settingsScrim').classList.add('open'); }
 function closeSettings(){$('#settingsScrim').classList.remove('open');}
 $('#settingsBtn').onclick=openSettings;
@@ -833,7 +868,16 @@ $('#extCrawlBtn').onclick=()=>askExtension('/api/ext/crawl','Asked the extension
 $('#settingsScrim').onclick=e=>{if(e.target===$('#settingsScrim'))$('#settingsScrim').classList.remove('open');};
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModal();closeSettings();}});
 
-if($('#sortSel')) $('#sortSel').onchange=renderGrid;
+// Sort: "Next release" unless you chose otherwise - and a choice survives reloads
+// (the page reloads itself on every new build, which used to snap it back).
+if($('#sortSel')){
+  const sel=$('#sortSel');
+  try{
+    const saved=localStorage.getItem('rr.sort');
+    if(saved&&Array.from(sel.options).some(o=>o.value===saved)) sel.value=saved;
+  }catch(e){}
+  sel.onchange=()=>{try{localStorage.setItem('rr.sort',sel.value);}catch(e){} renderGrid();};
+}
 
 refresh();
 setInterval(refresh,60000);

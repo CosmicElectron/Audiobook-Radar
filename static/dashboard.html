@@ -38,6 +38,7 @@
     <span><span id="extDot" class="extdot ok" title="Extension status"></span> <span id="lastCheck">waiting for the extension…</span></span>
     <span id="countLine" class="mono"></span>
   </div>
+  <div id="problems" class="problems" hidden></div>
   </div>
 
   <div id="overdueWrap" style="display:none">
@@ -62,8 +63,8 @@
     <div class="left">
       <span class="lbl">Sort</span>
       <select id="sortSel">
-        <option value="manual">Manual (drag to reorder)</option>
         <option value="next">Next release</option>
+        <option value="manual">Manual (drag to reorder)</option>
         <option value="title">Title A–Z</option>
         <option value="status">Status</option>
       </select>
@@ -245,6 +246,11 @@
     <div class="two">
       <div><label>Audiobookshelf URL</label><input id="intAbsUrl" type="text" placeholder="http://your-server:13378" autocomplete="off" spellcheck="false"></div>
       <div><label>Audiobookshelf API token</label><input id="intAbsToken" type="password" placeholder="ABS → Settings → Users → API token" autocomplete="new-password"><div class="hint" id="intAbsHint" style="margin:2px 0 0"></div></div>
+    </div>
+    <label class="chk"><input type="checkbox" id="intAbsWrite" style="width:auto;margin:0"> Write the radar's line into Audiobookshelf</label>
+    <div style="display:flex;align-items:center;gap:10px;margin:4px 0 0">
+      <button class="small ghost" type="button" id="intAbsSyncBtn">Sync now</button>
+      <span class="hint" id="intAbsSyncHint" style="margin:0">One plain line per tracked series ("Audio 2 overdue by 10 days") in the series' own description field, refreshed hourly, removed when there is nothing to say. Only a client that shows series descriptions displays it.</span>
     </div>
     <div style="border-bottom:1px solid var(--line);margin:16px 0"></div>
 

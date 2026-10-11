@@ -7,17 +7,38 @@ import pytest
 
 from test_app import radar, series, d   # shared harness (module already loaded, tmp data dir)
 
+REAL_NOTIFY_WITH_BUTTON = radar._notify_with_button    # the fixture replaces it; one test needs the real one
+
+
+class _FakeLive:
+    """Stands in for the live Discord purchase message: records every text."""
+    last = None
+
+    def __init__(self, text):
+        self.texts, self.final = [text], False
+        _FakeLive.last = self
+
+    def set(self, text, final=False):
+        self.texts.append(text)
+        self.final = self.final or final
+
 
 @pytest.fixture
 def env(monkeypatch):
-    sent = {"discord": [], "email": [], "bat": []}
+    sent = {"discord": [], "email": [], "bat": [], "buttons": []}
+    monkeypatch.setattr(radar, "_BuyLive", _FakeLive)
+    monkeypatch.setattr(radar, "_buy_live", {})
+    _FakeLive.last = None
+    # bot-or-webhook messages: record the webhook wording + the buttons the bot would carry
+    monkeypatch.setattr(radar, "_notify_with_button",
+                        lambda text, buttons, fallback: (sent["discord"].append(fallback), sent["buttons"].append(buttons)))
     monkeypatch.setattr(radar, "save_state", lambda: None)
     monkeypatch.setattr(radar, "add_log", lambda m: None)
     monkeypatch.setattr(radar, "_discord_notify", lambda text, *a, **k: sent["discord"].append(text))
     monkeypatch.setattr(radar, "_send_email", lambda subj, text: (sent["email"].append((subj, text)) or (True, "sent")))
     monkeypatch.setattr(radar, "_EMAIL_ASYNC", False)
     monkeypatch.setattr(radar, "_run_update_audiobooks", lambda job=None, delay=None: sent["bat"].append(job and job["id"]))
-    monkeypatch.setattr(radar, "_libation_owns", lambda asin: False)
+    monkeypatch.setattr(radar, "_libation_owns", lambda asin, **k: False)
     s = series([{"n": 15, "novel": d(-140), "audiobook": d(0), "audio_pre": None}])
     s["id"] = "sid1"
     s["asins_audio"] = {"15": "B0AUDIO015"}
@@ -76,7 +97,7 @@ def test_no_job_when_off_or_master_off_or_old_or_owned(env):
     live_read(c); assert radar._state["buy_jobs"] == []
     # Libation already has it: recorded, nothing pushed
     radar._state["buy_ledger"] = {}
-    radar._libation_owns = lambda asin: True
+    radar._libation_owns = lambda asin, **k: True
     live_read(c)
     assert job()["status"] == "owned" and cmds() == []
 
@@ -290,6 +311,40 @@ def test_token_page_approve_over_tunnel_single_use(env):
     assert c.post("/buy/nope/approve", headers=via_cf).status_code == 410
 
 
+def test_approval_page_posts_back_to_itself_like_a_browser(env):
+    """29 Sep 2026: Approve on the tunnel page answered 'cross-site request
+    refused'. A browser stamps the form POST with the page's own Origin (the
+    public hostname), which the cross-site gate took for a foreign site; the
+    test above never sent an Origin, so it never saw it."""
+    c, s, sent = env
+    s["buy_mode"] = "verify"
+    radar._state["settings"]["buy_public_base"] = "https://radar.example.org"
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=True, price=7.47)
+    token = [ln for ln in sent["email"][0][1].splitlines() if "/buy/" in ln][0].strip().rsplit("/buy/", 1)[1]
+    browser = {"Cf-Connecting-Ip": "203.0.113.9", "Origin": "https://radar.example.org",
+               "Host": "127.0.0.1:8765"}                     # cloudflared may forward the local host
+    # a foreign page still can't drive it, even holding the token
+    evil = dict(browser, Origin="https://evil.example")
+    assert c.post(f"/buy/{token}/approve", headers=evil).status_code == 403
+    assert j["status"] == "awaiting_approval"
+    # our own public origin is allowed - only on the token-gated /buy/ routes
+    assert c.post("/api/quit", headers=browser).status_code == 403
+    r = c.post(f"/buy/{token}/approve", headers=browser)
+    assert r.status_code == 200 and j["status"] == "running" and len(cmds("execute")) == 1
+
+
+def test_own_origin_matches_the_host_it_was_addressed_to(env):
+    c, s, sent = env
+    s["buy_mode"] = "verify"
+    radar._state["settings"]["buy_public_base"] = ""
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=True, price=7.47)
+    token = [ln for ln in sent["email"][0][1].splitlines() if "/buy/" in ln][0].strip().rsplit("/buy/", 1)[1]
+    hdrs = {"Cf-Connecting-Ip": "203.0.113.9", "Origin": "https://radar.example.org", "Host": "radar.example.org"}
+    assert c.post(f"/buy/{token}/deny", headers=hdrs).status_code == 200 and j["status"] == "denied"
+
+
 def test_token_deny_and_expiry(env):
     c, s, sent = env
     s["buy_mode"] = "verify"
@@ -423,7 +478,7 @@ def test_bat_progress_parser_renders_the_run():
     # partial lines across chunks parse once complete
     p2 = radar._BatProgress()
     p2.feed("Total proc"); p2.feed("essed: 5\nNew: 0\n")
-    assert "5 titles, 0 new" in p2.render() and "Nothing new to download" in p2.render()
+    assert "5 titles, 0 new" in p2.render() and "Nothing new from the series you track" in p2.render()
 
 
 def test_live_editor_throttles_and_dedupes(monkeypatch):
@@ -482,9 +537,9 @@ def test_buy_for_book_from_timeline(env):
     radar._state["buy_ledger"]["B0AUDIO003"] = {"at": radar._buy_now()}
     assert "already bought" in c.post("/api/buy/for-book", json={"series_id": "sid1", "n": 3}).get_json()["error"]
     radar._state["buy_ledger"] = {}
-    radar._libation_owns = lambda asin: True
+    radar._libation_owns = lambda asin, **k: True
     assert "Libation" in c.post("/api/buy/for-book", json={"series_id": "sid1", "n": 3}).get_json()["error"]
-    radar._libation_owns = lambda asin: False
+    radar._libation_owns = lambda asin, **k: False
     assert "no store page" in c.post("/api/buy/for-book", json={"series_id": "sid1", "n": 9}).get_json()["error"]
     radar._state["settings"]["buy_master"] = False
     assert "master switch" in c.post("/api/buy/for-book", json={"series_id": "sid1", "n": 3}).get_json()["error"]
@@ -712,9 +767,9 @@ def test_claude_code_ai_provider(env, monkeypatch):
     no API key required, configured iff the CLI exists, output passed through."""
     import shutil, subprocess as sp
     radar._state["settings"].update({"ai_provider": "claude-code", "ai_api_key": ""})
-    monkeypatch.setattr(shutil, "which", lambda n: r"C:\fake\claude.CMD" if n == "claude" else None)
+    monkeypatch.setattr(shutil, "which", lambda n: r"C:\fake\claude.exe" if n == "claude" else None)
     conf = radar._ai_conf()
-    assert conf and conf["provider"] == "claude-code" and conf["model"] == "sonnet"
+    assert conf and conf["provider"] == "claude-code" and conf["model"] == "opus"   # research quality over speed
     calls = {}
     class R: returncode = 0; stdout = "Research says: book 9 due March."; stderr = ""
     def fake_run(args, **kw):
@@ -722,7 +777,7 @@ def test_claude_code_ai_provider(env, monkeypatch):
     monkeypatch.setattr(radar.subprocess, "run", fake_run)
     out = radar._ai_call("what about book 9?")
     assert out == "Research says: book 9 due March."
-    assert calls["args"][0].endswith("claude.CMD") and "-p" in calls["args"]
+    assert calls["args"][0].endswith("claude.exe") and "-p" in calls["args"]
     assert "WebSearch" in calls["args"] and "--model" in calls["args"]
     # CLI failure surfaces as an error (e.g. usage limit reached)
     class F: returncode = 1; stdout = ""; stderr = "5-hour limit reached"
@@ -739,7 +794,7 @@ def test_research_endpoint_is_async_and_deduped(env, monkeypatch):
     thread and a second click while one is running says so instead of stacking."""
     import shutil
     c, s, sent = env
-    monkeypatch.setattr(shutil, "which", lambda n: r"C:\fake\claude.CMD" if n == "claude" else None)
+    monkeypatch.setattr(shutil, "which", lambda n: r"C:\fake\claude.exe" if n == "claude" else None)
     radar._state["settings"].update({"ai_provider": "claude-code", "ai_api_key": ""})
     started = []
     monkeypatch.setattr(radar, "_ai_research_series", lambda sid, manual=False: started.append(sid) or (True, "ok"))
@@ -756,3 +811,322 @@ def test_research_endpoint_is_async_and_deduped(env, monkeypatch):
     assert "already researching" in r2["message"]
     radar._ai_running.discard("sid1")
     assert c.post("/api/series/nope/research").status_code == 404
+
+
+# ---------------------------------------------------------------- Retry after signing back in
+# 29 Sep 2026: Riftside 4's auto-buy parked on "Firefox is signed out of
+# Amazon"; the only way on was to wait up to 3 h for the next probe. The alert
+# now carries a Discord button (and !retry) that re-checks right away.
+
+class _Sync:
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self.t, self.a, self.k = target, args, kwargs or {}
+
+    def start(self):
+        self.t(*self.a, **self.k)
+
+
+def test_signin_alert_carries_a_retry_button(env):
+    c, s, sent = env
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=False, ok=False)
+    assert sent["buttons"] == [[("I've signed in \u2014 retry now", f"rr:retry:{j['id']}")]]
+    assert "Retry on the dashboard" in sent["discord"][-1]          # the no-bot wording says where Retry lives
+
+
+def test_retry_button_rechecks_now_and_realerts_if_still_signed_out(env):
+    c, s, sent = env
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=False, ok=False)
+    n = len(cmds("probe"))
+    reply = radar.handle_bot_button(f"rr:retry:{j['id']}", who="the user")
+    assert "checking Amazon again" in reply
+    assert j["status"] == "probing" and len(cmds("probe")) == n + 1 and j["probes"] == 1
+    assert "signin_notified" not in j and j["window_start"]
+    probe(c, j["id"], signed_in=False, ok=False)                     # still signed out: say so again
+    assert len(sent["buttons"]) == 2 and j["status"] == "needs_signin"
+    radar.handle_bot_button(f"rr:retry:{j['id']}")
+    probe(c, j["id"], signed_in=True, price=7.47)                    # signed in: straight through to the decision
+    assert j["status"] == "running" and len(cmds("execute")) == 1
+
+
+def test_retry_button_refuses_live_unknown_and_foreign(env):
+    c, s, sent = env
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=True, price=7.47)
+    assert j["status"] == "running"
+    assert "nothing to retry" in radar.handle_bot_button(f"rr:retry:{j['id']}")
+    assert j["status"] == "running"
+    assert "no longer exists" in radar.handle_bot_button("rr:retry:nope")
+    assert "isn't one of mine" in radar.handle_bot_button("someone-elses:button")
+
+
+def test_retry_command_matches_the_button(env):
+    c, s, sent = env
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=False, ok=False)
+    assert "checking Amazon again" in radar.handle_bot_command("!retry test")
+    assert j["status"] == "probing"
+    assert "!retry" in radar.handle_bot_command("!help")
+
+
+def test_retry_restarts_the_probe_window(env):
+    c, s, sent = env
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=False, ok=False)
+    j["created"] = (radar.datetime.now() - timedelta(days=5)).isoformat(timespec="seconds")
+    j["probes"] = radar.BUY_PROBE_MAX
+    radar.handle_bot_button(f"rr:retry:{j['id']}")
+    probe(c, j["id"], signed_in=False, ok=False)
+    radar._buy_tick()                                                # an old job must not fail on the spot
+    assert j["status"] == "needs_signin"
+
+
+def test_notify_with_button_uses_the_bot_else_the_webhook(env, monkeypatch):
+    c, s, sent = env
+    monkeypatch.setattr(radar.threading, "Thread", _Sync)
+    posted = []
+    monkeypatch.setattr(radar, "_bot_post", lambda text, buttons=(): (posted.append((text, buttons)) or True))
+    REAL_NOTIFY_WITH_BUTTON("with button", [("Retry", "rr:retry:x")], fallback="plain")
+    assert posted == [("with button", [("Retry", "rr:retry:x")])] and "plain" not in sent["discord"]
+    monkeypatch.setattr(radar, "_bot_post", lambda text, buttons=(): False)   # no bot / bot offline
+    REAL_NOTIFY_WITH_BUTTON("with button", [("Retry", "rr:retry:x")], fallback="plain")
+    assert sent["discord"][-1] == "plain"
+
+
+def test_bot_post_is_a_noop_without_a_running_bot(monkeypatch):
+    monkeypatch.setattr(radar, "_bot_state", {"running": False, "err": ""})
+    assert radar._bot_post("hi", [("Retry", "rr:retry:x")]) is False
+
+
+# ---------------------------------------------------------------- live purchase message
+# 29 Sep 2026: a purchase stopped mid-way and the only trace was the dashboard
+# card. Every run now keeps one Discord message current: each step's result,
+# what it is trying right now, then the outcome.
+
+def _approved(c, s):
+    s["buy_mode"] = "verify"
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=True, price=7.47)
+    assert c.post(f"/api/buy/{j['id']}/approve").get_json()["ok"]
+    return j
+
+
+def report(c, jid, phase, ok, **detail):
+    return c.post("/api/buy/report", json={"job_id": jid, "phase": phase, "ok": ok, "detail": detail})
+
+
+def test_live_purchase_message_tracks_every_step(env):
+    c, s, sent = env
+    j = _approved(c, s)
+    lv = _FakeLive.last
+    assert lv and "handed to the browser extension" in lv.texts[0] and "$7.47" in lv.texts[0]
+    report(c, j["id"], "progress", True, info="looking for the Kindle Unlimited borrow button")
+    assert "now: looking for the Kindle Unlimited borrow button" in lv.texts[-1]
+    report(c, j["id"], "execute", True, step="borrow",
+           info="already in your Kindle library ('Read Now') - no borrow needed - looking for the audiobook offer")
+    report(c, j["id"], "execute", True, step="offer on Kindle page", info="not here: no audiobook offer on this page")
+    report(c, j["id"], "execute", True, step="offer on audiobook page", info="offer: 'Buy Now' (buy-button) at $7.47")
+    report(c, j["id"], "progress", True, info="pressing Buy on the $7.47 audiobook offer")
+    t = lv.texts[-1]
+    assert "\u2705 Kindle Unlimited borrow \u2014 already in your Kindle library" in t
+    assert "\u2796 Audiobook offer on the Kindle page" in t             # a miss reads as "looked, moved on"
+    assert "\u2705 Audiobook offer on the audiobook page" in t
+    assert t.strip().endswith("now: pressing Buy on the $7.47 audiobook offer") and not lv.final
+    report(c, j["id"], "execute", True, step="buy-click", info="clicked 'Buy Now' at $7.47", clicked=True)
+    report(c, j["id"], "execute", True, step="confirm", info="confirmation page, mentions the audiobook")
+    report(c, j["id"], "execute", True, step="return", info="nothing to return (the borrow was not mine)")
+    assert j["status"] == "done" and lv.final
+    assert "Bought" in lv.texts[-1] and "now:" not in lv.texts[-1]
+    assert sent["buttons"] == []                                          # success: no Retry button
+
+
+def test_failed_purchase_finishes_the_message_and_offers_retry(env):
+    c, s, sent = env
+    j = _approved(c, s)
+    lv = _FakeLive.last
+    report(c, j["id"], "execute", False, step="borrow",
+           info="NO borrow / Add-to-library button found; audiobook offer expected AFTER the borrow")
+    assert j["status"] == "failed" and lv.final
+    assert "\u274c Kindle Unlimited borrow" in lv.texts[-1] and "nothing was bought" in lv.texts[-1]
+    assert sent["buttons"][-1] == [("Retry", f"rr:retry:{j['id']}")]
+    assert "rr:retry" not in "".join(sent["discord"])                   # webhook wording has no button id
+    assert j["id"] not in radar._buy_live                                 # the run is closed
+    # a late report after the end changes nothing and doesn't crash
+    report(c, j["id"], "progress", True, info="stray")
+
+
+def test_dry_run_gets_a_live_message_too(env):
+    c, s, sent = env
+    radar._state["settings"]["buy_dry_run"] = True
+    live_read(c); j = job()
+    probe(c, j["id"], signed_in=True, price=7.47)
+    assert j["status"] == "running" and _FakeLive.last and "dry run" in _FakeLive.last.texts[0]
+    report(c, j["id"], "dry", True, step="dry", info="DRY RUN OK: would click 'Buy Now' on the audiobook page", final=True)
+    assert j["status"] == "dry_done" and _FakeLive.last.final and "Dry run finished" in _FakeLive.last.texts[-1]
+
+
+# ---------------------------------------------------------------- Libation: match by series + number, check DOWNLOADED
+# 29 Sep 2026: Audible lists Riftside 4 as B0HJ9CQDHW, the radar knows the Amazon
+# listing B0HJ9DX4S2 - an ID-only check never saw the book it had just bought,
+# and "in the library" isn't "downloaded" (the licence request had failed).
+
+def test_libation_match_by_series_and_number_and_downloaded(tmp_path, monkeypatch):
+    from test_pick_downloads import libation
+    lib = libation(tmp_path, [("B0HJ9CQDHW", "Riftside 4", "Riftside", "4", 0),
+                              ("B0RIFT0003", "Riftside 3", "Riftside", "3", 1),
+                              ("B0UNFALLEN", "The Unfallen", "The Unfallen Series", "1", 1)])
+    monkeypatch.setattr(radar, "_libation_files_dir", lambda: lib)
+    assert radar._libation_match("B0HJ9DX4S2", "Riftside", 4) == {"in_library": True, "downloaded": False}
+    assert radar._libation_match("B0HJ9DX4S2") == {"in_library": False, "downloaded": False}   # the old ID-only view
+    assert radar._libation_match(None, "Riftside", 3) == {"in_library": True, "downloaded": True}
+    assert radar._libation_match(None, "The Unfallen", "1")["downloaded"] is True               # "Series" suffix
+    assert radar._libation_owns("B0HJ9DX4S2", series="Riftside", n=4) is True
+    monkeypatch.setattr(radar, "_libation_files_dir", lambda: None)
+    assert radar._libation_match("B0HJ9DX4S2", "Riftside", 4) is None                           # can't tell
+
+
+def test_download_again_button_reruns_update_audiobooks(env, monkeypatch):
+    c, s, sent = env
+    live_read(c); j = job()
+    monkeypatch.setattr(radar, "_bat_path", lambda: "C:/x/Update Audiobooks.bat")
+    reply = radar.handle_bot_button(f"rr:download:{j['id']}")
+    assert "running Update Audiobooks again" in reply and sent["bat"][-1] == j["id"]
+    monkeypatch.setattr(radar, "_bat_path", lambda: None)
+    assert "not found" in radar.handle_bot_button(f"rr:download:{j['id']}")
+
+
+# ---------------------------------------------------------------- progress: the picker's count, per-book bars, honest ticks
+# the user (7 Oct 2026): the bar sat at 1/2 under a green tick - Libation's
+# "New: 2" was the total, but the tracked-series picker let one through. And
+# a bar that only counts finished books is no progress bar for a 20-hour title.
+
+def test_progress_total_is_what_the_picker_let_through():
+    p = radar._BatProgress()
+    p.feed(" 1/3  Scanning Audible library...\nTotal processed: 327\nNew: 2\n 2/3  Downloading new audiobooks (tracked series only)...\n")
+    p.feed(" Download (tracked): Loopbreaker: Book 1 [B0GNTXK9NN] - Loopbreaker\n"
+           " Not downloading (not in a tracked series): Real Crime (Real Crime); The Owl Field (The Owl Field); Spell Breaker (no series)\n")
+    r = p.render()
+    assert "2 new \u00b7 1 tracked" in r and "0/1" in r and "3 skipped, not tracked" in r
+    p.feed("DownloadDecryptBook Begin: 7/10/2026 [B0GNTXK9NN] Loopbreaker: Book 1: A Time Loop LitRPG\n")
+    assert p.current_asin == "B0GNTXK9NN" and "\u2b07\ufe0f Download" in p.render()
+    p.feed("DownloadDecryptBook Completed: 7/10/2026 [B0GNTXK9NN] Loopbreaker: Book 1: A Time Loop LitRPG\n 3/3  Filing new books into AudioBooks...\n")
+    p.finished = True; p.rc = 0
+    r = p.render()
+    assert "\u2705 Download" in r and "1/1" in r and "**Done.**" in r
+
+
+def test_progress_nothing_tracked_and_failed_downloads_are_honest():
+    p = radar._BatProgress()
+    p.feed("Total processed: 327\nNew: 2\n 2/3  Downloading new audiobooks (tracked series only)...\n"
+           " Not downloading (not in a tracked series): A (a); B (b)\n Nothing new from the series Release Radar tracks.\n")
+    assert "Nothing new from the series you track (2 skipped, not tracked)" in p.render()
+    p = radar._BatProgress()
+    p.feed("Total processed: 327\nNew: 1\n 2/3  Downloading new audiobooks (tracked series only)...\n Download (tracked): Riftside 4 [B0HJ9CQDHW] - Riftside\n"
+           "DownloadDecryptBook Begin: 29/09/2026 [B0HJ9CQDHW] Riftside 4\nDownloadDecryptBook Completed: 29/09/2026 [B0HJ9CQDHW] Riftside 4\n"
+           "Error processing book. Skipping. This book will be tried again on next attempt.\n 3/3  Filing new books into AudioBooks...\n")
+    p.finished = True; p.rc = 0
+    r = p.render()
+    assert "\u26a0\ufe0f Download" in r and "0/1" in r and "1 failed (Libation will retry)" in r and "\u2705 Download" not in r
+
+
+def test_progress_shows_the_current_books_own_bar():
+    p = radar._BatProgress()
+    p.feed("Total processed: 327\nNew: 2\n 2/3  Downloading new audiobooks (tracked series only)...\n"
+           " Download (tracked): A [B0AAAAAAA1] - A\n Download (tracked): B [B0BBBBBBB2] - B\n"
+           "DownloadDecryptBook Begin: 7/10/2026 [B0AAAAAAA1] A: Book 1\n")
+    p.book_pct = 50
+    r = p.render()
+    assert "*A: Book 1*" in r and "50%" in r and "\u25b0\u25b0\u25b0\u25b0\u25b1\u25b1\u25b1\u25b1 50%" in r
+    assert "\u25b0\u25b0\u25b0\u25b1\u25b1\u25b1\u25b1\u25b1\u25b1\u25b1\u25b1\u25b1  0/2" in r      # half a book of two moves the big bar a quarter
+    p.feed("DownloadDecryptBook Completed: 7/10/2026 [B0AAAAAAA1] A: Book 1\n")
+    assert p.book_pct is None and "1/2" in p.render()
+
+
+def test_libation_download_pct_reads_the_in_progress_file(tmp_path, monkeypatch):
+    d = tmp_path / "Temp" / "Libation-User" / "DownloadsInProgress"
+    d.mkdir(parents=True)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(radar, "_libation_length_minutes", lambda asin: 100 if asin == "B0GNTXK9NN" else None)
+    assert radar._libation_download_pct("B0GNTXK9NN") is None                       # nothing in flight
+    (d / "B0GNTXK9NN.aaxc").write_bytes(b"\0" * int(45.5 * 1048576))                # 45.5 MB of ~91 expected
+    assert radar._libation_download_pct("B0GNTXK9NN") == 50
+    (d / "B0GNTXK9NN.aaxc").write_bytes(b"\0" * int(200 * 1048576))                 # never claims done
+    assert radar._libation_download_pct("B0GNTXK9NN") == 99
+    assert radar._libation_download_pct("B0NOLENGTH") is None and radar._libation_download_pct(None) is None
+
+
+def test_libation_match_knows_a_series_less_book_by_its_author(tmp_path, monkeypatch):
+    """7 Oct 2026: Arcane Academy 5's audiobook arrived titled 'Spell Breaker'
+    with no series on Audible's record; the app's own check must see it the
+    way the download picker now does, given the radar's series record."""
+    from test_pick_downloads import libation, ARCANE, SPELL_BREAKER_5
+    lib = libation(tmp_path, [SPELL_BREAKER_5])
+    monkeypatch.setattr(radar, "_libation_files_dir", lambda: lib)
+    assert radar._libation_match("B0HLTXRTJB", "Arcane Academy", 5) == {"in_library": False, "downloaded": False}   # name + number alone: no series line
+    assert radar._libation_match("B0HLTXRTJB", "Arcane Academy", 5, srs=ARCANE) == {"in_library": True, "downloaded": False}
+    assert radar._libation_match(None, "Arcane Academy", 6, srs=ARCANE) == {"in_library": False, "downloaded": False}
+    assert radar._libation_owns("B0HLTXRTJB", series="Arcane Academy", n=5, srs=ARCANE) is True
+
+
+def test_libation_match_downloaded_follows_the_strongest_match(tmp_path, monkeypatch):
+    """A liberated sibling with the same title must never make a failed
+    download look complete: Audible's own series number outranks a guess."""
+    from test_pick_downloads import libation, ARCANE, SPELL_BREAKER_5
+    twin = dict(ARCANE, timeline=[dict(e, audiobook="2026-10-02") if e["n"] == 6 else e for e in ARCANE["timeline"]])
+    lib = libation(tmp_path, [dict(SPELL_BREAKER_5, asin="B0BOOK0006", series="Arcane Academy", order="6", status=0),   # book 6: licence failed
+                              dict(SPELL_BREAKER_5, status=1)])                                                          # book 5: liberated, same title, same day
+    monkeypatch.setattr(radar, "_libation_files_dir", lambda: lib)
+    assert radar._libation_match(None, "Arcane Academy", 6, srs=twin) == {"in_library": True, "downloaded": False}
+    assert radar._libation_match(None, "Arcane Academy", 5, srs=ARCANE) == {"in_library": True, "downloaded": True}
+    monkeypatch.setattr(radar, "pick_downloads", None)                                   # the module missing: can't tell
+    assert radar._libation_match(None, "Arcane Academy", 5, srs=ARCANE) is None
+
+
+def test_bat_progress_remembers_the_pickers_ids():
+    p = radar._BatProgress()
+    p.feed(" Download (tracked): Spell Breaker [B0HLV5JPC9] - Arcane Academy (by author + title)\n"
+           " Download (tracked): Riftside 4 [B0HJ9CQDHW] - Riftside\n")
+    assert p.picked_ids == {"B0HLV5JPC9": "Arcane Academy (by author + title)", "B0HJ9CQDHW": "Riftside"}
+
+
+def test_post_purchase_run_trusts_the_pickers_own_id(monkeypatch):
+    """The picker took Spell Breaker by author + title, but the app's per-book
+    check is stricter (the date must agree) and said 'not yet' - the bat's
+    own 'Download (tracked): ... [ID] - Series' line settles it, with no
+    pointless retries or false failure alert."""
+    import types
+
+    class SyncThread:
+        def __init__(self, target=None, daemon=None, **k):
+            self._t = target
+
+        def start(self):
+            self._t()
+
+    monkeypatch.setattr(radar, "threading", types.SimpleNamespace(Thread=SyncThread))
+    for name, val in {"_bat_path": lambda: "C:/x/Update Audiobooks.bat", "save_state": lambda: None, "add_log": lambda m: None,
+                      "_discord_notify": lambda *a, **k: None, "_discord_live_start": lambda text, embeds=None: "http://edit/1",
+                      "_discord_live_edit": lambda url, text: True, "BUY_BAT_RETRY_GAP_S": 0,
+                      "_find": lambda sid: {"name": "Arcane Academy", "author": "by A.P. Gore"}}.items():
+        monkeypatch.setattr(radar, name, val)
+
+    def fake_bat(bat, on_output=None, on_tick=None):
+        on_output(" Download (tracked): Spell Breaker [B0HLV5JPC9] - Arcane Academy (by author + title)\n"
+                  "DownloadDecryptBook Begin: 7/10/2026 [B0HLV5JPC9] Spell Breaker\n"
+                  "DownloadDecryptBook Completed: 7/10/2026 [B0HLV5JPC9] Spell Breaker\n")
+        return 0, "ok"
+    monkeypatch.setattr(radar, "_run_bat_once", fake_bat)
+    asked = []
+
+    def fake_match(asin=None, series=None, n=None, srs=None):
+        asked.append((asin, series, n))
+        if asin == "B0HLV5JPC9" and n is None:
+            return {"in_library": True, "downloaded": True}
+        return {"in_library": False, "downloaded": False}
+    monkeypatch.setattr(radar, "_libation_match", fake_match)
+    job = {"id": "j1", "series": "Arcane Academy", "series_id": "sid", "n": 5, "audio_asin": "B0HLTXRTJB", "steps": []}
+    radar._run_update_audiobooks(job, delay=0)
+    assert asked[0] == ("B0HLTXRTJB", "Arcane Academy", 5) and ("B0HLV5JPC9", None, None) in asked
+    assert len([a for a in asked if a[1] == "Arcane Academy"]) == 1                      # one attempt, no retries
+    assert job["steps"][-1]["ok"] is True and "downloaded: yes" in job["steps"][-1]["detail"]

@@ -72,6 +72,30 @@ def api_ext_refresh():
     return jsonify({"ok": True})
 
 
+@app.post("/api/rr-notes")
+def api_rr_notes():
+    """The extension's harvest of the author's own words on Royal Road
+    (announcement chapters, author's notes, replies in the comments), kept on
+    the series for the research to quote."""
+    body = request.get_json(force=True, silent=True) or {}
+    items = []
+    for it in (body.get("items") or [])[:40]:
+        if isinstance(it, dict) and str(it.get("text") or "").strip():
+            items.append({"chapter": str(it.get("chapter") or "")[:120], "date": str(it.get("date") or "")[:25],
+                          "kind": str(it.get("kind") or "")[:16], "text": str(it.get("text") or "")[:1200]})
+    with _lock:
+        srs = _find(str(body.get("sid") or ""))
+        if not srs:
+            return jsonify({"ok": False, "error": "unknown series"}), 404
+        srs["rr_notes"] = {"at": _buy_now(), "url": str(body.get("url") or "")[:300],
+                           "author": str(body.get("author") or "")[:80], "items": items}
+        srs.pop("rr_requested_at", None)
+        name = srs.get("name", "")
+        save_state()
+    add_log(f"Royal Road notes for {name}: {len(items)} item(s)")
+    return jsonify({"ok": True, "items": len(items)})
+
+
 @app.post("/api/ext/crawl-series")
 def api_ext_crawl_series():
     """Ask the extension to re-crawl a SINGLE series (find new/updated books for it),
@@ -178,8 +202,11 @@ def api_get_settings():
                     "ai_provider": s.get("ai_provider", "openrouter"),
                     "ai_api_key_set": bool(s.get("ai_api_key")),
                     "ai_model": s.get("ai_model", ""),
+                    "ai_signed_out": "ai_auth" in (_state.get("problems") or {}),
                     "abs_url": ("" if remote else s.get("abs_url", "")),
                     "abs_token_set": bool(s.get("abs_token")),
+                    "abs_write_status": bool(s.get("abs_write_status", True)),
+                    "abs_written_count": len(_state.get("abs_written") or {}),
                     "buy_libation_found": _libation_files_dir() or ""})
 
 
@@ -197,7 +224,13 @@ def api_set_settings():
             if m in ("audiobook", "novel"):
                 s["upcoming_mode"] = m
         if "discord_webhook" in body:
-            s["discord_webhook"] = (body.get("discord_webhook") or "").strip()
+            new_wh = (body.get("discord_webhook") or "").strip()
+            if new_wh != s.get("discord_webhook", ""):
+                # a different (or no) webhook: the old one's failures are history
+                for key in ("discord", "digest"):
+                    (_state.get("problems") or {}).pop(key, None)
+                _discord_fail["n"] = 0
+            s["discord_webhook"] = new_wh
         for k in ("buy_master", "buy_dry_run"):
             if k in body:
                 s[k] = bool(body.get(k))
@@ -211,6 +244,7 @@ def api_set_settings():
         if body.get("buy_smtp_pass_clear"):
             s["buy_smtp_pass"] = ""
         # integration secrets: same write-only rules
+        ai_before = (s.get("ai_provider"), s.get("ai_api_key"))
         for sec in ("bot_token", "ai_api_key", "abs_token"):
             if sec in body and (body.get(sec) or "").strip():
                 s[sec] = body[sec].strip()
@@ -218,10 +252,23 @@ def api_set_settings():
                 s[sec] = ""
         if body.get("ai_provider") in ("openrouter", "anthropic", "openai", "grok", "claude-code"):
             s["ai_provider"] = body["ai_provider"]
+        if (s.get("ai_provider"), s.get("ai_api_key")) != ai_before:
+            # a new provider/key: whatever the old one's problem was, it's gone,
+            # and a cached sign-in verdict must not outlive the config it judged
+            for key in ("ai_auth", "ai_key", "ai_failing"):
+                (_state.get("problems") or {}).pop(key, None)
+            _ai_cli_auth.update({"ok": None, "at": 0.0})
         if "ai_model" in body:
             s["ai_model"] = (body.get("ai_model") or "").strip()
         if "abs_url" in body:
             s["abs_url"] = (body.get("abs_url") or "").strip().rstrip("/")
+        if "abs_write_status" in body:
+            want = bool(body.get("abs_write_status"))
+            if want != bool(s.get("abs_write_status", True)):
+                s["abs_write_status"] = want
+                # off: take the radar's lines back out of ABS; on: put them in now
+                threading.Thread(target=_abs_clear_status if not want else (lambda: _abs_sync_status(force=True)),
+                                 daemon=True).start()
         if "buy_cap_default" in body:
             s["buy_cap_default"] = _clean_buy_cap(body.get("buy_cap_default")) or BUY_DEFAULT_CAP
         if "buy_weekly_max" in body:
@@ -262,6 +309,8 @@ def api_discord_test():
     if not wh:
         return jsonify({"ok": False, "message": "No webhook URL set."})
     ok, err = _discord_post(wh, _fmt_line("test"))
+    if ok:
+        _problem_clear("discord", notify=False)
     return jsonify({"ok": ok, "message": "Sent! Check your Discord channel." if ok else f"Failed: {err}"})
 
 
@@ -275,6 +324,8 @@ def api_discord_digest_now():
     ok, err = _send_digest(wh)
     if ok:
         add_log("Sent a forecast digest to Discord (manual)")
+        _problem_clear("digest", notify=False)
+        _problem_clear("discord", notify=False)
     return jsonify({"ok": ok, "message": "Sent! Go see what she has to say." if ok else f"Failed: {err}"})
 
 

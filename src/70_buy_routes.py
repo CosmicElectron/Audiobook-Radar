@@ -16,6 +16,7 @@ def api_buy_report():
         if not job:
             return jsonify({"ok": False, "error": "unknown job"}), 404
         _buy_handle_report(job, str(body.get("phase") or ""), bool(body.get("ok")), body.get("detail") or {})
+        _buy_live_update(job)
         save_state()
         status = job["status"]
     return jsonify({"ok": True, "status": status})
@@ -35,9 +36,7 @@ def api_buy_action(jid, action):
         elif action == "deny" and job["status"] in ("awaiting_approval", "probing", "waiting_offer", "running", "retry_later"):
             _buy_deny(job, who="dashboard")
         elif action == "retry":
-            job["dry_run"] = bool(get_settings().get("buy_dry_run", True))
-            _job_set(job, "probing", "retry from dashboard")
-            _buy_push_probe(job)
+            _buy_retry(job, who="dashboard")
         elif action == "cancel":
             _job_set(job, "cancelled", "cancelled from dashboard")
         elif action == "returnku":
@@ -87,7 +86,7 @@ def _buy_for_book(sid, n, source="the timeline"):
         existing = _buy_job_for(sid, n)
         if existing:
             return False, f"a job for this book already exists ({existing['status']})"
-        if audio and _libation_owns(audio):
+        if audio and _libation_owns(audio, series=srs.get("name"), n=n, srs=srs):
             return False, "Libation already has this audiobook"
         ent = next((e for e in srs.get("timeline", []) if _entry_n(e) == n), {}) or {}
         if ent.get("ku") is False:

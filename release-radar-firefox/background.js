@@ -60,7 +60,28 @@ var _pending = { refresh: false, release: false, crawl: false };
 // Bumped by the popup's "Reset if stuck": running loops compare against it and
 // bail out, so freeing the lock cannot leave two unpaced loops fetching at once.
 var _gen = 0;
-function acquire() { if (_busy) return false; _busy = true; return true; }
+var _progressAt = 0;                     // last moment a job demonstrably moved (a page read)
+function acquire() { if (_busy) return false; _busy = true; _progressAt = Date.now(); return true; }
+// Belt and braces for the lock: whatever hangs a job (a stalled response body,
+// a thrown finally, a bug in a future path), a worker that has not read a page
+// in this long is stuck, and a stuck lock silently starves every scheduled read
+// until the browser is restarted. Progress-based on purpose: a full forced
+// re-acquire of a big library legitimately runs for a long time, but never
+// goes this long between pages (one page is bounded by PAGE_TIMEOUT + retries).
+var STALL_MAX_MS = 15 * 60 * 1000;
+function lockWatchdog() {
+  if (!_busy || Date.now() - _progressAt < STALL_MAX_MS) return;
+  var min = Math.round((Date.now() - _progressAt) / 60000);
+  _gen++;                                   // running loops bail at their next iteration
+  _busy = false; endP();
+  // the stuck job may be the one drainPending is awaiting: that drain is a
+  // zombie now (its finally only runs if the await ever settles), so the flag
+  // it holds must be taken from it or nothing deferred would ever run again
+  _draining = false;
+  logLine("worker stuck (no page read for " + min + " min) - reset automatically; running the deferred work");
+  setTimeout(drainPending, 0);
+}
+setInterval(lockWatchdog, 60 * 1000);
 // Pass the generation captured at acquire() time. A loop cancelled by Reset must
 // NOT clear _busy on its way out: Reset already freed the lock, so a new job may
 // legitimately hold it and releasing here would let a second loop start.
@@ -77,15 +98,18 @@ var _draining = false;
 async function drainPending() {
   if (_draining) return;
   _draining = true;
+  // generation-aware: a drain whose job was cancelled by Reset/lockWatchdog
+  // must neither keep dispatching nor clear the flag a newer drain now owns
+  var g = _gen;
   try {
-    for (var guard = 0; guard < 8 && !_busy; guard++) {
+    for (var guard = 0; guard < 8 && !_busy && g === _gen; guard++) {
       if (_seedQueue.length) { await runSeedWorker(); continue; }
       if (_pending.release) { _pending.release = false; await checkReleasingToday(); continue; }
-      if (_pending.refresh) { _pending.refresh = false; await refreshKnown(true); continue; }
+      if (_pending.refresh) { var f = _pending.refresh === "force"; _pending.refresh = false; await refreshKnown(f); continue; }
       if (_pending.crawl) { _pending.crawl = false; await recrawlAll(false); continue; }
       break;
     }
-  } finally { _draining = false; }
+  } finally { if (g === _gen) _draining = false; }
 }
 
 // ---- log ----
@@ -108,7 +132,18 @@ function endP() { P.running = false; P.current = ""; P.finishedAt = Date.now(); 
 function fetchTimeout(url, opts, ms) {
   var ctrl = new AbortController();
   var t = setTimeout(function () { ctrl.abort(); }, ms || PAGE_TIMEOUT);
-  return fetch(url, Object.assign({}, opts, { signal: ctrl.signal })).finally(function () { clearTimeout(t); });
+  // The timer must outlive the headers. fetch() resolves as soon as headers
+  // arrive; a body that then stalled would hang text()/json() forever with the
+  // abort already disarmed, and a hung read holds the worker lock (see
+  // lockWatchdog for what that costs). The abort is disarmed only once the body
+  // has been read (or the fetch failed).
+  return fetch(url, Object.assign({}, opts, { signal: ctrl.signal })).then(function (r) {
+    ["text", "json"].forEach(function (m) {
+      var orig = r[m].bind(r);
+      r[m] = function () { return orig().finally(function () { clearTimeout(t); }); };
+    });
+    return r;
+  }, function (e) { clearTimeout(t); throw e; });
 }
 
 function postRadar(data) {
@@ -209,8 +244,46 @@ async function remember(data, url, ok) {
 // Fetch one page, with one retry after a pause if it looks blocked/timed-out.
 // opts.backfill marks the ingest as aux-only (app fills missing dates but never
 // overwrites existing ones — protects hand edits from backfill re-reads).
+// ---- discovery: pages linked from a read that we've never read ----
+// Only the 3-day crawl used to follow a page's links, and it skips pages the
+// daily refresh already read that day - which, with the crawl running later in
+// the day, was always. A brand-new audiobook listing linked from a Kindle page
+// the refresh reads daily (Riftside 4, Sep 2026) was therefore never visited.
+// Now every successful read remembers the series/format links it saw, and the
+// job holding the worker reads the ones not in the registry before it finishes.
+var DISCOVER_CAP = 25;                    // new pages per job (each is read once, then known)
+var DISCOVER_RETRY_MS = 20 * 3600 * 1000; // a failed discovery isn't retried every job
+var _discovered = {};                     // asin -> { origin, series }
+var _attempted = {};                      // asin -> last read attempt (ms)
+function noteDiscovered(url, related, series) {
+  if (!related) return;
+  var origin = originOf(url);
+  (related.formats || []).concat(related.siblings || []).forEach(function (x) {
+    if (x && !_discovered[x]) _discovered[x] = { origin: origin, series: series || "" };
+  });
+}
+async function readDiscovered(gen) {
+  var asins = Object.keys(_discovered);
+  if (!asins.length) return;
+  var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
+  var known = {};
+  Object.keys(urls).forEach(function (k) { var x = (urls[k] && urls[k].asin) || asinOf(k); if (x) known[x] = 1; });
+  var bad = await loadBad(), n = 0;
+  for (var i = 0; i < asins.length && n < DISCOVER_CAP && gen === _gen; i++) {
+    var x = asins[i], d = _discovered[x];
+    delete _discovered[x];
+    if (known[x] || isBad(x, bad) || (_attempted[x] && Date.now() - _attempted[x] < DISCOVER_RETRY_MS)) continue;
+    logLine("new page linked from " + (d.series || "a read") + ": /dp/" + x);
+    await readPage(d.origin + "/dp/" + x, false, d.series);
+    known[x] = 1; n++;
+    await sleep(MIN_GAP + Math.random() * JITTER);
+  }
+}
+
 async function readPage(url, force, seriesHint, opts) {
   var started = Date.now(), out = { ok: false }, tries = 0;
+  _progressAt = started;                    // feeds lockWatchdog
+  if (asinOf(url)) _attempted[asinOf(url)] = started;
   while (true) {
     tries++;
     var status = null, reason = null, blocked = false;
@@ -229,6 +302,7 @@ async function readPage(url, force, seriesHint, opts) {
           P.current = data.series + " \u00b7 Book " + data.book.n + " (" + (data._isAudio ? "audio" : "novel") + ")";
           await remember(data, url, out.ok);
           await clearBad(asinOf(url));
+          noteDiscovered(url, out.related, data.series);
           logLine((out.ok ? "OK   " : "SENT?") + data.series + " #" + data.book.n + " " + (data._isAudio ? "audio" : "novel") +
                   " " + (data._date || "?") + "  " + shortUrl(url) + "  (" + (Date.now() - started) + "ms)" + (res && res.created ? "  [new series]" : ""));
         } else { reason = "no book details"; blocked = true; }
@@ -255,8 +329,11 @@ async function readPage(url, force, seriesHint, opts) {
   return out;
 }
 
-async function crawlSeries(seedUrl, visited, urls, idx, force, bad) {
-  var gen = _gen;
+async function crawlSeries(seedUrl, visited, urls, idx, force, bad, gen) {
+  // the generation that guards this loop is the one captured at acquire() time
+  // by the caller; re-reading _gen here would let a job cancelled during the
+  // caller's earlier awaits run to completion beside its replacement
+  gen = (gen === undefined) ? _gen : gen;
   visited = visited || {}; urls = urls || {}; idx = idx || {}; bad = bad || {};
   var origin = originOf(seedUrl), queue = [seedUrl], local = 0, first = true, skippedBad = 0, skippedToday = 0;
   var seriesHint = (urls[seedUrl] && urls[seedUrl].series) || "";
@@ -302,20 +379,42 @@ async function runSeedWorker() {
       if (a && visited[a]) continue;      // same series already covered this run
       logLine("series from " + shortUrl(url) + (_seedQueue.length ? ("  (" + _seedQueue.length + " more queued)") : ""));
       var o = await browser.storage.local.get("urls"); var urls = o.urls || {}; var idx = settledIndex(urls);
-      await crawlSeries(url, visited, urls, idx, false, bad);
+      await crawlSeries(url, visited, urls, idx, false, bad, gen);
     }
-  } finally { endP(); release(gen); }
+    await readDiscovered(gen);
+  } finally { if (gen === _gen) endP(); release(gen); }
   logLine("crawl worker finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   try { await browser.storage.local.set({ lastCrawl: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
   // no self-restart here: release() already scheduled drainPending(), which picks
   // up seeds that arrived late without racing for the lock
 }
 
+// ---- release day first ----
+// The daily refresh, Refresh dates and Crawl all read ~30-300 pages at ~4 s
+// each. A book coming out today must not wait behind them: its pages are read
+// first, so the flip from pre-order to buyable - and the "out now" ping - lands
+// a minute after the job starts, not at the end of it. Same window as the hourly
+// release watch: today, or up to RELEASE_WATCH_DAYS back while still not
+// confirmed live (a US title on the AU store can flip late). Returns how many
+// days ago the release was, or null when the page isn't due.
+function releaseDue(u) {
+  if (!u || u.live === true) return null;
+  var dd = daysSince(u.date);
+  return (dd !== null && dd >= 0 && dd <= RELEASE_WATCH_DAYS) ? dd : null;
+}
+function releaseDayFirst(keys, urls) {
+  var due = keys.filter(function (k) { return releaseDue(urls[k]) !== null; })
+                .sort(function (a, b) { return releaseDue(urls[a]) - releaseDue(urls[b]); });
+  return { due: due, all: due.concat(keys.filter(function (k) { return releaseDue(urls[k]) === null; })) };
+}
+
 async function refreshKnown(force) {
   if (!force && await ranWithin("lastRefresh", REFRESH_MIN_MS)) {
     logLine("refresh skipped (already ran within the day)"); return { skipped: true };
   }
-  if (!acquire()) { _pending.refresh = true; logLine("refresh deferred (worker busy)"); return { busy: true }; }
+  // remember HOW it was asked for: a deferred daily refresh replayed as forced
+  // would re-read every page the blocking crawl just fetched
+  if (!acquire()) { _pending.refresh = force ? "force" : "auto"; logLine("refresh deferred (worker busy)"); return { busy: true }; }
   var gen = _gen;
   startP("refresh", 0);
   try {
@@ -328,34 +427,49 @@ async function refreshKnown(force) {
       // honour the same cooldowns the other paths do — this is the highest
       // frequency path, so it must not be the one that hammers a dead page
       if (u.asin && isBad(u.asin, bad)) { skippedBad++; return false; }
-      if (!force && readToday(u)) { skippedToday++; return false; }
+      // a release-day page is re-read even if something read it earlier today
+      if (!force && readToday(u) && releaseDue(u) === null) { skippedToday++; return false; }
       return true;
     });
+    var ord = releaseDayFirst(list, urls);
+    list = ord.all;
     P.total = list.length; saveP();
+    if (ord.due.length) logLine("release day: " + ord.due.length + " page(s) read first");
     logLine("refresh started: " + list.length + " due of " + Object.keys(urls).length + " known pages" +
             (skippedToday ? (", " + skippedToday + " already read today") : "") +
             (skippedBad ? (", " + skippedBad + " on the needs-a-check list") : ""));
     for (var i = 0; i < list.length && gen === _gen; i++) { await readPage(list[i], false, (urls[list[i]] || {}).series || ""); await sleep(MIN_GAP + Math.random() * JITTER); }
-  } finally { endP(); release(gen); }
+    await readDiscovered(gen);
+  } finally { if (gen === _gen) endP(); release(gen); }
   logLine("refresh finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   try { await browser.storage.local.set({ lastRefresh: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
   return { checked: P.checked, sent: P.sent, failed: P.failed };
 }
 
 // inner re-crawl (assumes lock held + startP already called)
-async function _recrawlInner(force) {
-  var gen = _gen;
+async function _recrawlInner(force, gen) {
+  gen = (gen === undefined) ? _gen : gen;
   var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
   var idx = settledIndex(urls);
   var seeds = {};
   Object.keys(urls).forEach(function (k) { var u = urls[k], s = u.series || ""; if (!seeds[s] || (u.n || 0) > (seeds[s].n || 0)) seeds[s] = { url: k, n: u.n || 0 }; });
   var visited = {}, names = Object.keys(seeds), bad = await loadBad();
   logLine((force ? "re-acquire (full): " : "re-crawl: ") + names.length + " series, " + Object.keys(urls).length + " known pages");
+  // release day first (see releaseDue), before any series crawl. Marked read
+  // today in this snapshot so a carousel or the safety net doesn't fetch it
+  // again; a series SEED is still read, because its links drive the crawl.
+  var due = releaseDayFirst(Object.keys(urls), urls).due.filter(function (k) { var x = asinOf(k); return !(x && isBad(x, bad)); });
+  if (due.length) logLine("release day: " + due.length + " page(s) read first");
+  for (var r = 0; r < due.length && gen === _gen; r++) {
+    await readPage(due[r], true, (urls[due[r]] || {}).series || "");
+    if (urls[due[r]]) urls[due[r]].lastChecked = Date.now();
+    await sleep(MIN_GAP + Math.random() * JITTER);
+  }
   for (var i = 0; i < names.length && gen === _gen; i++) {
     var su = seeds[names[i]].url, a = asinOf(su);
     if (a && visited[a]) continue;
     logLine("series seed [" + (i + 1) + "/" + names.length + "] " + (names[i] || "?") + "  " + shortUrl(su));
-    await crawlSeries(su, visited, urls, idx, force, bad);
+    await crawlSeries(su, visited, urls, idx, force, bad, gen);
   }
   var leftover = Object.keys(urls).filter(function (k) {
     var x = asinOf(k); if (!x || visited[x]) return false;
@@ -366,6 +480,7 @@ async function _recrawlInner(force) {
     logLine("safety net: " + leftover.length + " known page(s) not reached via carousels; fetching directly");
     for (var j = 0; j < leftover.length && gen === _gen; j++) { var lu = leftover[j]; await readPage(lu, force); var la = asinOf(lu); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
   }
+  await readDiscovered(gen);
 }
 
 // On and just after a book's release day, re-check that book's page every hour so
@@ -399,7 +514,8 @@ async function checkReleasingToday() {
       await readPage(k, true, (u && u.series) || "");
       await sleep(MIN_GAP + Math.random() * JITTER);
     }
-  } finally { endP(); release(gen); }
+    await readDiscovered(gen);
+  } finally { if (gen === _gen) endP(); release(gen); }
   logLine("release watch done: fetched " + P.checked + ", sent " + P.sent);
 }
 
@@ -408,8 +524,12 @@ async function recrawlAll(force, auto) {
     logLine("crawl skipped (one already ran inside the crawl interval)"); return { skipped: true };
   }
   if (!acquire()) { _pending.crawl = true; logLine("re-crawl deferred (worker busy)"); return { busy: true }; }
+  // `gen` was never declared here: the finally threw ReferenceError before
+  // release() ran and every crawl-all left the lock held for good (the
+  // three-day "deferred (worker busy)" outage of Sep 2026).
+  var gen = _gen;
   startP("crawl", 0);
-  try { await _recrawlInner(force); } finally { endP(); release(gen); }
+  try { await _recrawlInner(force, gen); } finally { if (gen === _gen) endP(); release(gen); }
   logLine("finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : "") + "  (" + Math.round((Date.now() - (P.startedAt || Date.now())) / 1000) + "s)");
   try { await browser.storage.local.set({ lastCrawl: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
   return { checked: P.checked, sent: P.sent, failed: P.failed };
@@ -421,6 +541,7 @@ async function recrawlAll(force, auto) {
 // series, matched by normalized name (with ASINs as a fallback), like forgetSeries.
 async function crawlOneSeries(name, asins) {
   if (!acquire()) { logLine("check-one skipped (worker busy)"); return { busy: true }; }
+  var gen = _gen;
   startP("crawl", 0);
   try {
     var o = await browser.storage.local.get("urls"); var urls = o.urls || {};
@@ -434,14 +555,15 @@ async function crawlOneSeries(name, asins) {
     if (!seed) { logLine("check \"" + (name || "?") + "\": no pages known for it yet \u2014 open one of its Amazon pages once so I learn a URL"); return { ok: false, reason: "no-known-pages" }; }
     var idx = settledIndex(urls), bad = await loadBad(), visited = {};
     logLine("check one series: \"" + (name || "?") + "\" (" + matched + " known page(s))  seed " + shortUrl(seed));
-    await crawlSeries(seed, visited, urls, idx, false, bad);
+    await crawlSeries(seed, visited, urls, idx, false, bad, gen);
     // safety net: this series' unsettled pages not reached via the seed's carousel
     var leftover = Object.keys(urls).filter(function (k) {
       var u = urls[k], mine = (target && norm(u.series) === target) || (u.asin && asinList.indexOf(u.asin) >= 0);
       if (!mine) return false; var x = asinOf(k); if (!x || visited[x]) return false; return !pageIsSettled(u, idx);
     });
-    for (var j = 0; j < leftover.length; j++) { await readPage(leftover[j], false, name || ""); var la = asinOf(leftover[j]); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
-  } finally { endP(); release(gen); }
+    for (var j = 0; j < leftover.length && gen === _gen; j++) { await readPage(leftover[j], false, name || ""); var la = asinOf(leftover[j]); if (la) visited[la] = 1; await sleep(MIN_GAP + Math.random() * JITTER); }
+    await readDiscovered(gen);
+  } finally { if (gen === _gen) endP(); release(gen); }
   logLine("check finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   return { checked: P.checked, sent: P.sent, failed: P.failed };
 }
@@ -464,13 +586,15 @@ async function coverFill(list) {
       await readPage(list[i], true, "", { backfill: true });
       await sleep(MIN_GAP + Math.random() * JITTER);
     }
-  } finally { endP(); release(gen); }
+    await readDiscovered(gen);
+  } finally { if (gen === _gen) endP(); release(gen); }
   logLine("backfill finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
   return { checked: P.checked, sent: P.sent, failed: P.failed };
 }
 
 async function wipeAndCrawl() {
   if (!acquire()) return { busy: true };
+  var gen = _gen;
   logLine("WIPE requested: clearing app series, then full re-acquire");
   try {
     try {
@@ -478,11 +602,11 @@ async function wipeAndCrawl() {
       if (!r.ok) { logLine("wipe failed: app returned " + r.status); return { ok: false, error: "app returned " + r.status }; }
     } catch (e) { logLine("wipe failed: app not reachable"); return { ok: false, error: "Radar app not reachable" }; }
     startP("crawl", 0);
-    try { await _recrawlInner(true); } finally { endP(); }
+    try { await _recrawlInner(true, gen); } finally { if (gen === _gen) endP(); }
     logLine("re-acquire finished: fetched " + P.checked + ", sent " + P.sent + (P.failed ? (", failed " + P.failed) : ""));
     try { await browser.storage.local.set({ lastCrawl: { at: Date.now(), checked: P.checked, sent: P.sent } }); } catch (e) {}
     return { ok: true, wiped: true, checked: P.checked, sent: P.sent };
-  } finally { release(); }
+  } finally { release(gen); }
 }
 
 function appPing() {
@@ -516,6 +640,104 @@ async function forgetSeries(c) {
   logLine("app deleted \"" + (c.series || "?") + "\" \u2014 forgot " + removed + " registered page(s)");
 }
 
+// ---- Royal Road: the author's own words, for the app's research ----------
+// Search engines don't index them and the research tool gets a 403 from Royal
+// Road, but the browser reads it fine. Announcement chapters ("Book 10 is out",
+// "Audiobook update"), author's notes, and the author's replies in the chapter
+// comments are where "the audiobooks land in November, then back to back" gets
+// said. Collected on the app's request (command "rrnotes") and posted back.
+var RR_NOTES_ANNOUNCE = /release|announce|update|audiobook|audio book|book \d+|kindle|amazon|audible|patreon|hiatus|schedule|news|out now|is live|delay/i;
+var RR_NOTES_STORY = 3, RR_NOTES_ANNOUNCEMENTS = 6, RR_NOTES_COMMENT_PAGES = 2;
+
+function RR_rrChapters(html) {
+  var m = (html || "").match(/window\.chapters\s*=\s*(\[[\s\S]*?\]);/);
+  try { return m ? JSON.parse(m[1]) : []; } catch (e) { return []; }
+}
+function RR_rrAuthor(html) {
+  var m = (html || "").match(/<h4[^>]*>[\s\S]*?<a href="\/profile\/(\d+)"[^>]*>\s*([^<]+?)\s*<\/a>/);
+  return m ? { id: m[1], name: m[2] } : null;
+}
+function RR_rrIsAnnouncement(title) { return RR_NOTES_ANNOUNCE.test(title || "") && !/^chapter \d+/i.test(title || ""); }
+// which chapters to read: the newest announcement posts, plus the newest story chapters
+function RR_rrPick(chapters) {
+  var ann = chapters.filter(function (c) { return RR_rrIsAnnouncement(c.title); }).slice(-RR_NOTES_ANNOUNCEMENTS);
+  var story = chapters.filter(function (c) { return !RR_rrIsAnnouncement(c.title); }).slice(-RR_NOTES_STORY);
+  var seen = {}, out = [];
+  ann.concat(story).forEach(function (c) {
+    if (seen[c.id]) return; seen[c.id] = 1;
+    out.push({ id: c.id, url: c.url, title: c.title, date: c.date, announcement: RR_rrIsAnnouncement(c.title) });
+  });
+  return out;
+}
+function _rrText(el) { return (el ? (el.textContent || "") : "").replace(/\s+/g, " ").trim(); }
+function _rrByClass(root, needle) {
+  var all = root.querySelectorAll("div"), out = [];
+  for (var i = 0; i < all.length; i++) { var cn = all[i].className || ""; if (typeof cn === "string" && cn.indexOf(needle) >= 0) out.push(all[i]); }
+  return out;
+}
+function RR_rrNotesFromChapter(doc, ch) {
+  var items = [];
+  if (ch.announcement) {
+    var body = _rrByClass(doc, "chapter-content")[0] || _rrByClass(doc, "chapter-inner")[0];
+    var t = _rrText(body); if (t) items.push({ chapter: ch.title, date: ch.date, kind: "announcement", text: t.slice(0, 1200) });
+  }
+  var notes = _rrByClass(doc, "author-note");
+  for (var i = 0; i < notes.length; i++) {
+    if (notes[i].parentElement && (notes[i].parentElement.className || "").indexOf("author-note") >= 0) continue;   // inner box of a portlet already taken
+    var nt = _rrText(notes[i]); if (nt) items.push({ chapter: ch.title, date: ch.date, kind: "note", text: nt.slice(0, 800) });
+  }
+  return items;
+}
+function RR_rrRepliesFromComments(doc, authorId, ch) {
+  var items = [], cms = doc.querySelectorAll(".comment");
+  for (var i = 0; i < cms.length; i++) {
+    var head = cms[i].querySelector(".media-heading"); if (!head) continue;
+    var links = head.querySelectorAll("a"), mine = false;
+    for (var j = 0; j < links.length; j++) if (links[j].getAttribute("href") === "/profile/" + authorId) mine = true;
+    if (!mine) continue;
+    var body = cms[i].querySelector(".comment-body"), tm = head.querySelector("time");
+    var txt = _rrText(body); if (!txt) continue;
+    items.push({ chapter: ch.title, date: (tm && tm.getAttribute("datetime")) || ch.date, kind: "reply", text: txt.slice(0, 600) });
+  }
+  return items;
+}
+async function rrNotes(c) {
+  if (!acquire()) { logLine("Royal Road notes deferred (worker busy)"); return { busy: true }; }
+  var gen = _gen, items = [], url = c.url, fetched = 0, author = null;
+  startP("rrnotes", 0);
+  try {
+    var origin = originOf(url);
+    var fr = await fetchTimeout(url, { credentials: "include" }, PAGE_TIMEOUT); var fhtml = await fr.text(); fetched++;
+    var chapters = RR_rrChapters(fhtml); author = RR_rrAuthor(fhtml);
+    var pick = RR_rrPick(chapters);
+    logLine("Royal Road notes: " + shortUrl(url) + " - " + chapters.length + " chapters, author " + (author ? author.name : "?") + ", reading " + pick.length);
+    for (var i = 0; i < pick.length && gen === _gen; i++) {
+      var ch = pick[i];
+      _progressAt = Date.now();
+      try {
+        var r = await fetchTimeout(origin + ch.url, { credentials: "include" }, PAGE_TIMEOUT); fetched++;
+        var doc = new DOMParser().parseFromString(await r.text(), "text/html");
+        items = items.concat(RR_rrNotesFromChapter(doc, ch));
+        if (author) for (var p = 1; p <= RR_NOTES_COMMENT_PAGES && gen === _gen; p++) {
+          await sleep(MIN_GAP);
+          var cr = await fetchTimeout(origin + "/fiction/chapter/" + ch.id + "/commentsLegacy/" + p + "?fiction=&sorting=newest", { credentials: "include" }, PAGE_TIMEOUT); fetched++;
+          var cdoc = new DOMParser().parseFromString(await cr.text(), "text/html");
+          items = items.concat(RR_rrRepliesFromComments(cdoc, author.id, ch));
+          if (!cdoc.querySelectorAll(".comment").length) break;
+        }
+      } catch (e) { logLine("Royal Road notes: " + shortUrl(ch.url) + " failed: " + String(e)); }
+      await sleep(MIN_GAP + Math.random() * JITTER);
+    }
+  } catch (e) { logLine("Royal Road notes failed: " + String(e)); }
+  finally { if (gen === _gen) endP(); release(gen); }
+  try {
+    await fetchTimeout(RADAR_BASE + "/api/rr-notes", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid: c.sid, url: url, author: author ? author.name : null, items: items.slice(0, 40) }) }, APP_TIMEOUT);
+  } catch (e) { logLine("Royal Road notes: could not reach the app: " + String(e)); }
+  logLine("Royal Road notes: " + items.length + " item(s) from " + fetched + " page(s) sent to the app");
+  return { ok: true, items: items.length };
+}
+
 // ---- app watchdog: the app watches this extension; this is the mirror.
 // If ReleaseRadar.exe stops answering for hours, nothing else can say so -
 // so the extension posts to the Discord webhook itself (cached daily from
@@ -534,21 +756,50 @@ async function _cacheWebhook() {
   } catch (e) {}
 }
 
+// Posts to the cached webhook. Returns the message's edit URL (so the warning
+// can later be turned into its all-clear and removed), true if posted but not
+// addressable, false if nothing was posted.
 async function _discordDirect(text) {
   try {
     var o = await browser.storage.local.get("cachedWebhook");
     if (!o.cachedWebhook) return false;
-    await fetch(o.cachedWebhook, { method: "POST", headers: { "Content-Type": "application/json" },
-                                   body: JSON.stringify({ content: text }) });
+    var wh = o.cachedWebhook;
+    var r = await fetch(wh + (wh.indexOf("?") >= 0 ? "&" : "?") + "wait=true",
+                        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: text }) });
+    try { var j = await r.json(); if (j && j.id) return wh.split("?")[0] + "/messages/" + j.id; } catch (e) {}
     return true;
   } catch (e) { return false; }
 }
+// A warning that clears must not leave two messages behind: the all-clear
+// EDITS the warning, and an hour later the message is deleted (same rule as
+// the app's own alerts). The deletion is remembered in storage so a browser
+// restart doesn't lose it.
+var ALERT_TIDY_MS = 3600 * 1000;
+async function _discordTidy() {
+  var o = await browser.storage.local.get("discordTidy"); var list = o.discordTidy || [];
+  if (!list.length) return;
+  var keep = [], now = Date.now();
+  for (var i = 0; i < list.length; i++) {
+    var it = list[i];
+    if (it.at > now) { keep.push(it); continue; }
+    var ok = false;
+    try { var r = await fetch(it.url, { method: "DELETE" }); ok = r.ok || r.status === 404; } catch (e) {}
+    if (!ok && (it.tries || 0) < 2) { it.tries = (it.tries || 0) + 1; keep.push(it); }
+  }
+  await browser.storage.local.set({ discordTidy: keep });
+}
+setInterval(_discordTidy, 60 * 1000);
 
 async function _appSeen() {
   if (_appAlerted) {
     _appAlerted = false;
     logLine("app is answering again");
-    await _discordDirect("✅ ReleaseRadar app is answering again.");
+    var text = "✅ ReleaseRadar app is answering again.";
+    var o = await browser.storage.local.get(["appAlert", "discordTidy"]);
+    if (o.appAlert && o.appAlert.url) {
+      try { await fetch(o.appAlert.url, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: text }) }); } catch (e) {}
+      await browser.storage.local.set({ appAlert: null, discordTidy: (o.discordTidy || []).concat([{ url: o.appAlert.url, at: Date.now() + ALERT_TIDY_MS }]) });
+    } else await _discordDirect(text);
   }
   _appLastOk = Date.now();
   _cacheWebhook();
@@ -559,9 +810,10 @@ async function _appMissing() {
     _appAlerted = true;
     var h = Math.round((Date.now() - _appLastOk) / 3600000);
     logLine("app unreachable for " + h + "h - telling Discord directly");
-    await _discordDirect("⚠️ The ReleaseRadar app hasn't answered the extension for " + h +
-                         " hours - release dates are still being read, but nothing is being recorded. " +
-                         "Is ReleaseRadar.exe running on the PC?");
+    var posted = await _discordDirect("⚠️ The ReleaseRadar app hasn't answered the extension for " + h +
+                                      " hours - release dates are still being read, but nothing is being recorded. " +
+                                      "Is ReleaseRadar.exe running on the PC?");
+    if (typeof posted === "string") { try { await browser.storage.local.set({ appAlert: { url: posted } }); } catch (e) {} }
   }
 }
 
@@ -585,6 +837,7 @@ async function pollCommands() {
         else if (c.type === "recrawl") { if (_busy) { logLine("app asked to crawl \u2014 waiting, worker busy"); } else { logLine("app requested: crawl all"); done.push(c.id); markHandled(c.id); recrawlAll(false); } }
         else if (c.type === "crawlSeries") { if (_busy) { logLine("app asked to check a series \u2014 waiting, worker busy"); } else { logLine("app requested: check series \"" + (c.series || "?") + "\""); done.push(c.id); markHandled(c.id); crawlOneSeries(c.series, c.asins); } }
         else if (c.type === "coverfill") { if (_busy) { logLine("app asked for cover backfill \u2014 waiting, worker busy"); } else { done.push(c.id); markHandled(c.id); coverFill(c.urls); } }
+        else if (c.type === "rrnotes") { if (_busy) { logLine("app asked for Royal Road notes \u2014 waiting, worker busy"); } else { done.push(c.id); markHandled(c.id); rrNotes(c); } }
         else if (c.type === "buy") { done.push(c.id); markHandled(c.id); RR_buyEnqueue(c); }   // serialised in buy.js; reports back itself
         else { done.push(c.id); }   // unknown type: drop it
       } catch (e) { _appMissing(); /* leave unacked; retry next poll */ }
@@ -670,6 +923,7 @@ browser.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     // bump the generation FIRST: running loops check it each iteration and bail,
     // so freeing the lock cannot leave two unpaced loops fetching in parallel
     _gen++; _seedQueue = []; _pending.refresh = _pending.release = _pending.crawl = false;
+    _draining = false;                       // see lockWatchdog
     release(); endP(); logLine("manual reset (running work cancelled, queue cleared)");
     sendResponse({ ok: true }); return true;
   }

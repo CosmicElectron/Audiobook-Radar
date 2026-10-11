@@ -28,6 +28,28 @@ def _origin_kind(origin):
     return "web"                           # a real website — treat as hostile
 
 
+def _is_own_origin(origin):
+    """The app's own public origin: buy_public_base, or the host this request
+    was addressed to. The approval page posts back to itself over the tunnel,
+    and the browser stamps that POST with the public hostname as its Origin,
+    which _origin_kind calls "a real website" (29 Sep 2026: Approve answered
+    'cross-site request refused'). Only consulted for the token-gated /buy/
+    routes; a foreign page can't forge Origin, and the token is still needed."""
+    try:
+        o = urlparse(origin or "")
+    except Exception:
+        return False
+    if o.scheme not in ("http", "https") or not o.netloc:
+        return False
+    own = set()
+    base = (get_settings().get("buy_public_base") or "").strip()
+    if base:
+        own.add(urlparse(base).netloc.lower())
+    if request.host:
+        own.add(request.host.lower())
+    return o.netloc.lower() in own
+
+
 def _is_remote():
     """True when the request did NOT come from this machine - i.e. it arrived
     through the Cloudflare tunnel (Cf-* headers) or was addressed to any host
@@ -56,7 +78,8 @@ def _refuse_cross_site_writes():
        the Discord webhook (it is masked for remote readers below)."""
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
-    if _origin_kind(request.headers.get("Origin")) == "web":
+    origin = request.headers.get("Origin")
+    if _origin_kind(origin) == "web" and not (request.path.startswith("/buy/") and _is_own_origin(origin)):
         add_log(f"refused a cross-site {request.method} to {request.path}")
         return jsonify({"error": "cross-site request refused"}), 403
     if _is_remote() and not request.path.startswith("/buy/"):
@@ -273,6 +296,7 @@ def api_ingest():
     if not series or n is None or (not nd and not ad):
         return jsonify({"ok": False, "message": "Need a series, a book number, and a date."})
     with _lock:
+        _state["last_read"] = datetime.now().isoformat(timespec="seconds")   # a page was read, changed or not
         s = _match_tracked_series(series)
         created = False
         if not s:
@@ -387,7 +411,7 @@ def api_ingest():
                 if key not in notified and get_settings().get("discord_on_release", True):
                     notified.add(key)
                     _state["discord_notified"] = list(notified)[-500:]
-                    released_msgs.append(_release_live_message(s.get("name", ""), n, kind))
+                    released_msgs.append((_release_live_message(s.get("name", ""), n, kind), kind))
         if nd and not (backfill and ent.get("novel")):
             ent["novel"] = nd                 # Amazon is authoritative for this field
         if ad and not (backfill and ent.get("audiobook")):
@@ -405,15 +429,18 @@ def api_ingest():
             for e2 in tl:
                 n2 = _entry_n(e2)
                 if (n2 is not None and n is not None and n2 < n
-                        and (e2.get("narrator") or "").strip()):
+                        and clean_narrator(e2.get("narrator"))):
                     if prev is None or n2 > prev[0]:
-                        prev = (n2, e2["narrator"].strip())
+                        prev = (n2, clean_narrator(e2["narrator"]))
             was_new = (ent.get("narrator") or "").strip() != narr
             ent["narrator"] = narr
             adt_n = parse_date(ent.get("audiobook"))
             # today-or-later only — backfilling an old catalogue must not spam a
-            # ping per historical swap (same guard as _new_date_messages)
-            if was_new and prev and _norm(prev[1]) != _norm(narr) and adt_n and adt_n >= today():
+            # ping per historical swap (same guard as _new_date_messages). Judged
+            # on the cleaned LEAD narrator: stored credits may carry old page
+            # furniture, and a full cast is listed differently read to read.
+            if (was_new and prev and _norm(lead_narrator(prev[1])) != _norm(lead_narrator(narr))
+                    and adt_n and adt_n >= today()):
                 key = f"narrator:{s['id']}:{n}:{_norm(narr)}"
                 notified = set(_state.get("discord_notified", []))
                 if key not in notified and get_settings().get("discord_on_new", True):
@@ -475,14 +502,14 @@ def api_ingest():
         series_name = s.get("name", "")
         sid_for_card = s.get("id")
         save_state()
-    for m in new_date_msgs + narrator_msgs:
-        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping)])
-    for m in released_msgs:
+    for m, kind in new_date_msgs + [(m, "audiobook") for m in narrator_msgs]:
+        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping, kind)])
+    for m, kind in released_msgs:
         # audiobook releases get a LIVING card: later stages (approval, bought,
         # downloaded, filed) edit this same message instead of new pings
-        if ad and _release_card_create(sid_for_card, n, m, _book_embed(series_name, n, cover_for_ping)):
+        if ad and kind == "audiobook" and _release_card_create(sid_for_card, n, m, _book_embed(series_name, n, cover_for_ping, kind)):
             continue
-        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping)])
+        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping, kind)])
     bits = " ".join(filter(None, [f"novel {nd}" if nd else "", f"audiobook {ad}" if ad else ""]))
     add_log(f"Ingested from Amazon: {series} book {n} ({bits})")
     return jsonify({"ok": True, "created": created, "series": s["name"], "n": n,

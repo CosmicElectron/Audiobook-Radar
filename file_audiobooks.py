@@ -778,7 +778,23 @@ def file_all(src: str = DEFAULT_SRC, dst: str = DEFAULT_DST,
         author = aliases["authors"].get(norm(author), author)
         if series is not None:
             series = aliases["series"].get(norm(series), series)
+        # The folder shape is Libation's template filled from its own database;
+        # when Audible's library record carried no series (Arcane Academy 5,
+        # 7 Oct 2026: "A.P. Gore, Patricia Jones\Spell Breaker - Book"), the
+        # files inside still know: metadata.json said "Arcane Academy #5".
+        meta_note = ""
+        if series is None or parse_folder(book)[1] is None:
+            meta = book_metadata(path)
+            if meta and meta.get("series") and series is None:
+                series = aliases["series"].get(norm(meta["series"]), meta["series"])
+                meta_note = f"series from {meta['source']}"
+            if meta and meta.get("n") and parse_folder(book)[1] is None:
+                title_part, _ = parse_folder(book)
+                book = ILLEGAL_RE.sub("", f"{title_part or series or meta.get('title') or book} - Book {meta['n']}").strip(" .")
+                meta_note = (meta_note + ", " if meta_note else "") + f"number from {meta['source']}"
         d = decide(author, series, book, dst, authors, lib)
+        if meta_note and d.action != "HELD":
+            d.reason += f"; {meta_note}"
         if d.action != "HELD":
             # apply the schema name on arrival, so Libation's
             # "Series 12 - Book 12" lands as "Series - Book 12"

@@ -160,7 +160,7 @@ def _norm(s):
 
 
 _NARRATOR_TAIL = re.compile(
-    r"\s*(?:,\s*)?(?:see all|see more|and others?|et al\.?|,)\s*$", re.I)
+    r"\s*(?:,\s*)?(?:see all|see more|and others?|et al\.?|(?:&|and|\+)\s*\d+\s*more|,)\s*$", re.I)
 
 
 def clean_narrator(s):
@@ -175,6 +175,24 @@ def clean_narrator(s):
         prev = s
         s = _NARRATOR_TAIL.sub("", s).strip()
     return s or None
+
+
+def lead_narrator(s):
+    """The first-billed narrator. Full-cast productions list a different
+    subset of the cast depending on which page area was read ('X' on one
+    visit, 'X, Y, Z' on the next), so a swap is judged on the lead only."""
+    s = clean_narrator(s) or ""
+    return re.split(r"\s*(?:,|&|\band\b)\s*", s, maxsplit=1)[0].strip() or None
+
+
+def _clean_stored_narrators():
+    """Credits captured before clean_narrator existed carry page furniture
+    ('X, see all'); compared against a clean read they pinged a narrator
+    'change' that never happened (Riftside 4, Sep 2026). Idempotent."""
+    for srs in _state.get("series", []):
+        for e in srs.get("timeline") or []:
+            if e.get("narrator"):
+                e["narrator"] = clean_narrator(e["narrator"])
 
 
 def _entry_n(e):

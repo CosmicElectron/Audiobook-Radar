@@ -127,6 +127,33 @@ def _audio_lag_is_reliable(series):
                 and c["spread_days"] <= AUDIO_LAG_TIGHT)
 
 
+# ---- author-stated dates from the AI research -------------------------------
+# A date the author or publisher gave (found by the research) beats the gap
+# maths for THAT book: it becomes the estimate, and carries its source so the
+# card shows it on hover. Once it has passed by more than a grace period it is
+# ignored again - the series is overdue, and gets re-researched.
+INTEL_DATE_GRACE_DAYS = 14
+
+
+def _intel_when(series, kind, n):
+    """(date, record) for one book's author-stated date, or None."""
+    if n is None:
+        return None
+    rec = (series.get("intel_dates") or {}).get(f"{kind}:{n}")
+    d = parse_date(rec.get("date")) if isinstance(rec, dict) else None
+    if not d or (today() - d).days > INTEL_DATE_GRACE_DAYS:
+        return None
+    return d, rec
+
+
+def _next_novel_n(series):
+    """The book after the latest known NOVEL (an audio-only row with a higher
+    number must not shift it)."""
+    ns = [_entry_n(e) for e in series.get("timeline", []) if _entry_n(e) is not None and e.get("novel")]
+    base = max(ns) if ns else series.get("novel_n")
+    return (base + 1) if base is not None else None
+
+
 def _audio_schedule(series):
     """Projected audiobook dates for every book still missing one, in book order:
     [{n, date, novel, queued, after_n}, ...].
@@ -168,16 +195,19 @@ def _audio_schedule(series):
             else:
                 step = max(cadence if cadence is not None else 0, AUDIO_MIN_SEPARATION)
                 queue = _safe_add_days(last_audio, step)
-        if prod is None and queue is None:
+        hit = _intel_when(series, "audiobook", _entry_n(e))
+        if hit:
+            est, queued = hit[0], False          # the author's word anchors the queue from here
+        elif prod is None and queue is None:
             continue
-        if prod is None:
+        elif prod is None:
             est, queued = queue, True
         elif queue is None:
             est, queued = prod, False
         else:
             est, queued = (queue, True) if queue > prod else (prod, False)
         out.append({"n": _entry_n(e), "date": est, "novel": nd,
-                    "queued": queued, "after_n": last_n})
+                    "queued": queued, "after_n": last_n, "source": hit[1] if hit else None})
         if est < today():
             # This book's window has passed with nothing announced, and the next
             # volume cannot possibly come out before it — so how late this one
@@ -210,6 +240,8 @@ def _audio_schedule_usable(series):
     sched = _audio_schedule(series)
     if not sched:
         return []
+    if sched[0].get("source"):
+        return sched                         # the author said when: no pattern to doubt
     # Don't keep projecting a pattern the series itself has broken: count novels
     # whose audiobook is well overdue by the novel→audio model (novel + gap + 60d
     # grace, still nothing). When the contradictions match or outnumber the real
@@ -328,10 +360,23 @@ def predicted_novel_date(series):
     nd = parse_date(series.get("novel_date"))
     if nd is None or nd >= today():
         return None
+    hit = _intel_when(series, "novel", _next_novel_n(series))
+    if hit:
+        return hit[0]
     avg = predicted_gap_days(novel_gap_days_list(series))
     if avg is None:
         return None
     return nd + timedelta(days=avg)
+
+
+def predicted_novel_source(series):
+    """The author-stated record behind predicted_novel_date, or None when the
+    prediction is gap maths."""
+    nd = parse_date(series.get("novel_date"))
+    if nd is None or nd >= today():
+        return None
+    hit = _intel_when(series, "novel", _next_novel_n(series))
+    return hit[1] if hit else None
 
 
 def _estimate_confidence(gaps):

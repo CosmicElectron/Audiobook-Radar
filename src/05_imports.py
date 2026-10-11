@@ -37,6 +37,7 @@ from email.utils import format_datetime
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+from http.client import InvalidURL
 
 from flask import Flask, request, jsonify, Response
 

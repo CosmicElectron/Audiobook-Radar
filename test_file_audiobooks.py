@@ -335,3 +335,47 @@ def test_alias_save_and_load(tmp_path):
     assert d["authors"][fa.norm("Somebody Else")] == "Craig Alanson"
     assert d["series"][fa.norm("Ascendant Saga")] == "Ascendant"
     assert fa.load_aliases(str(tmp_path / "missing.json")) == {"authors": {}, "series": {}}
+
+
+# ---------------------------------------------------------------- the files know what the folder doesn't (7 Oct 2026)
+# Arcane Academy 5 came out of Libation as "A.P. Gore, Patricia Jones\Spell
+# Breaker - Book": Audible's library record carried no series, so Libation's
+# folder template had nothing to fill in. Its metadata.json said
+# "Arcane Academy #5" all along, and the filer never looked.
+
+def test_embedded_metadata_names_the_series_and_number(lib):
+    import json
+    src, dst = lib
+    mk(dst, "A.P. Gore, Patricia Jones", "Arcane Academy", "Spell Breaker - Book 4")
+    p = mk(src, "A.P. Gore, Patricia Jones", "Spell Breaker - Book", files=("Spell Breaker - Book.m4b",))
+    with open(os.path.join(p, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump({"title": "Spell Breaker - Book", "subtitle": "A Progression Fantasy Adventure (Arcane Academy, Book 5)",
+                   "authors": ["A.P. Gore", "Patricia Jones"], "series": ["Arcane Academy #5"], "asin": "B0HLV5JPC9"}, f)
+    res, out = run(src, dst)
+    assert res[0].action == "FILED"
+    assert res[0].target == os.path.join(dst, "A.P. Gore, Patricia Jones", "Arcane Academy", "Spell Breaker - Book 5")
+    assert os.path.isfile(os.path.join(res[0].target, "Spell Breaker - Book 5.m4b"))
+    assert "series from metadata.json, number from metadata.json" in res[0].reason
+
+
+def test_embedded_number_fills_an_unnumbered_series_folder(lib):
+    import json
+    src, dst = lib
+    p = mk(src, "Zogarth", "The Primal Hunter", "The Primal Hunter - Book", files=("The Primal Hunter - Book.m4b",))
+    with open(os.path.join(p, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump({"title": "The Primal Hunter", "series": ["The Primal Hunter #15"]}, f)
+    res, _ = run(src, dst)
+    assert res[0].action == "FILED" and res[0].target.endswith(os.path.join("The Primal Hunter", "The Primal Hunter - Book 15"))
+    assert "number from metadata.json" in res[0].reason
+
+
+def test_metadata_that_matches_a_book_already_there_is_held(lib):
+    import json
+    src, dst = lib
+    mk(dst, "A.P. Gore, Patricia Jones", "Arcane Academy", "Spell Breaker - Book 4")
+    p = mk(src, "A.P. Gore, Patricia Jones", "Spell Breaker - Book", files=("Spell Breaker - Book.m4b",))
+    with open(os.path.join(p, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump({"title": "Spell Breaker", "series": ["Arcane Academy #4"]}, f)
+    res, _ = run(src, dst)
+    assert res[0].action == "HELD" and "already in library" in res[0].reason
+    assert os.path.isdir(p)                                               # nothing moved

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Release Radar — Amazon reader",
-  "version": "1.25",
+  "version": "1.33",
   "description": "Reads book and audiobook release dates from Amazon pages — live when you visit, and on a background schedule with no tabs open — and sends them to your local Release Radar app. Can buy the companion audiobook of a Kindle Unlimited title when you tell the app to.",
   "browser_specific_settings": {
     "gecko": {
@@ -23,6 +23,7 @@
     "https://www.amazon.com/*",
     "https://www.amazon.co.uk/*",
     "http://127.0.0.1/*",
+    "https://www.royalroad.com/*",
     "https://discord.com/*",
     "http://localhost/*"
   ],

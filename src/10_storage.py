@@ -45,6 +45,7 @@ def load_state():
                 _state.setdefault("settings", {})
                 _state.setdefault("buy_jobs", [])
                 _state.setdefault("buy_ledger", {})
+                _clean_stored_narrators()
             except Exception as e:
                 log.exception("Could not read data file: %s", e)
                 _state = default_state()

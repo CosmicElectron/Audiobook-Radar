@@ -36,6 +36,30 @@ the extension.
   if either goes quiet, and releases that pass without ever being seen buyable
   get flagged instead of slipping by silently.
 
+**Since 1.4.0**:
+
+- **Downloads only what you track**: `pick_downloads.py` decides which new
+  Audible books Libation may download — by series name and number, by a
+  recorded product ID, or by author plus a title the radar knows, so a brand-new
+  release whose Audible record carries no series yet is still recognised, and
+  nothing outside your tracked series is ever fetched. The Discord progress
+  message shows each book's own download bar and only ticks green when every
+  tracked book came through.
+- **The filer reads the files**: when Libation's folder carries no series,
+  `file_audiobooks.py` takes the series and number from the book's own
+  metadata.json, audio tags or .nfo instead of filing it under the author.
+- **Author-sourced estimates**: the AI research (which can run on the local
+  Claude Code CLI) and a Royal Road harvester read the author's own words on
+  timing and feed them straight into the estimate, marked with an asterisk
+  whose hover shows the source. No prose to read.
+- **Audiobookshelf gets the radar's line**: one plain sentence per tracked series
+  ("Audio 2 overdue by 10 days", "Audiobook 3 Nov") is written into the series'
+  own description field through the ABS API, refreshed hourly and removed when
+  there is nothing to say (Settings toggle). The extension shows the same line
+  as a small chip on ABS series and item pages. For the phone, a one-patch build
+  of the ABS Android app that displays series descriptions lives at
+  [audiobookshelf-app-series](https://github.com/CosmicElectron/audiobookshelf-app-series).
+
 ---
 
 ## How it gets its data

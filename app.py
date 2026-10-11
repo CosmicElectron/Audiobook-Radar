@@ -40,6 +40,7 @@ from email.utils import format_datetime
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+from http.client import InvalidURL
 
 from flask import Flask, request, jsonify, Response
 
@@ -110,6 +111,7 @@ def load_state():
                 _state.setdefault("settings", {})
                 _state.setdefault("buy_jobs", [])
                 _state.setdefault("buy_ledger", {})
+                _clean_stored_narrators()
             except Exception as e:
                 log.exception("Could not read data file: %s", e)
                 _state = default_state()
@@ -377,6 +379,33 @@ def _audio_lag_is_reliable(series):
                 and c["spread_days"] <= AUDIO_LAG_TIGHT)
 
 
+# ---- author-stated dates from the AI research -------------------------------
+# A date the author or publisher gave (found by the research) beats the gap
+# maths for THAT book: it becomes the estimate, and carries its source so the
+# card shows it on hover. Once it has passed by more than a grace period it is
+# ignored again - the series is overdue, and gets re-researched.
+INTEL_DATE_GRACE_DAYS = 14
+
+
+def _intel_when(series, kind, n):
+    """(date, record) for one book's author-stated date, or None."""
+    if n is None:
+        return None
+    rec = (series.get("intel_dates") or {}).get(f"{kind}:{n}")
+    d = parse_date(rec.get("date")) if isinstance(rec, dict) else None
+    if not d or (today() - d).days > INTEL_DATE_GRACE_DAYS:
+        return None
+    return d, rec
+
+
+def _next_novel_n(series):
+    """The book after the latest known NOVEL (an audio-only row with a higher
+    number must not shift it)."""
+    ns = [_entry_n(e) for e in series.get("timeline", []) if _entry_n(e) is not None and e.get("novel")]
+    base = max(ns) if ns else series.get("novel_n")
+    return (base + 1) if base is not None else None
+
+
 def _audio_schedule(series):
     """Projected audiobook dates for every book still missing one, in book order:
     [{n, date, novel, queued, after_n}, ...].
@@ -418,16 +447,19 @@ def _audio_schedule(series):
             else:
                 step = max(cadence if cadence is not None else 0, AUDIO_MIN_SEPARATION)
                 queue = _safe_add_days(last_audio, step)
-        if prod is None and queue is None:
+        hit = _intel_when(series, "audiobook", _entry_n(e))
+        if hit:
+            est, queued = hit[0], False          # the author's word anchors the queue from here
+        elif prod is None and queue is None:
             continue
-        if prod is None:
+        elif prod is None:
             est, queued = queue, True
         elif queue is None:
             est, queued = prod, False
         else:
             est, queued = (queue, True) if queue > prod else (prod, False)
         out.append({"n": _entry_n(e), "date": est, "novel": nd,
-                    "queued": queued, "after_n": last_n})
+                    "queued": queued, "after_n": last_n, "source": hit[1] if hit else None})
         if est < today():
             # This book's window has passed with nothing announced, and the next
             # volume cannot possibly come out before it — so how late this one
@@ -460,6 +492,8 @@ def _audio_schedule_usable(series):
     sched = _audio_schedule(series)
     if not sched:
         return []
+    if sched[0].get("source"):
+        return sched                         # the author said when: no pattern to doubt
     # Don't keep projecting a pattern the series itself has broken: count novels
     # whose audiobook is well overdue by the novel→audio model (novel + gap + 60d
     # grace, still nothing). When the contradictions match or outnumber the real
@@ -578,10 +612,23 @@ def predicted_novel_date(series):
     nd = parse_date(series.get("novel_date"))
     if nd is None or nd >= today():
         return None
+    hit = _intel_when(series, "novel", _next_novel_n(series))
+    if hit:
+        return hit[0]
     avg = predicted_gap_days(novel_gap_days_list(series))
     if avg is None:
         return None
     return nd + timedelta(days=avg)
+
+
+def predicted_novel_source(series):
+    """The author-stated record behind predicted_novel_date, or None when the
+    prediction is gap maths."""
+    nd = parse_date(series.get("novel_date"))
+    if nd is None or nd >= today():
+        return None
+    hit = _intel_when(series, "novel", _next_novel_n(series))
+    return hit[1] if hit else None
 
 
 def _estimate_confidence(gaps):
@@ -771,7 +818,7 @@ def _norm(s):
 
 
 _NARRATOR_TAIL = re.compile(
-    r"\s*(?:,\s*)?(?:see all|see more|and others?|et al\.?|,)\s*$", re.I)
+    r"\s*(?:,\s*)?(?:see all|see more|and others?|et al\.?|(?:&|and|\+)\s*\d+\s*more|,)\s*$", re.I)
 
 
 def clean_narrator(s):
@@ -786,6 +833,24 @@ def clean_narrator(s):
         prev = s
         s = _NARRATOR_TAIL.sub("", s).strip()
     return s or None
+
+
+def lead_narrator(s):
+    """The first-billed narrator. Full-cast productions list a different
+    subset of the cast depending on which page area was read ('X' on one
+    visit, 'X, Y, Z' on the next), so a swap is judged on the lead only."""
+    s = clean_narrator(s) or ""
+    return re.split(r"\s*(?:,|&|\band\b)\s*", s, maxsplit=1)[0].strip() or None
+
+
+def _clean_stored_narrators():
+    """Credits captured before clean_narrator existed carry page furniture
+    ('X, see all'); compared against a clean read they pinged a narrator
+    'change' that never happened (Riftside 4, Sep 2026). Idempotent."""
+    for srs in _state.get("series", []):
+        for e in srs.get("timeline") or []:
+            if e.get("narrator"):
+                e["narrator"] = clean_narrator(e["narrator"])
 
 
 def _entry_n(e):
@@ -921,6 +986,10 @@ def series_view(s):
         "novel_history_count": len(novel_gap_days_list(s)),
         "predicted_novel_date": iso(n_pred),
         "predicted_novel_confidence": n_pred and novel_conf,
+        # who said so, when an estimate is the author's own date (hover asterisk)
+        "predicted_novel_source": predicted_novel_source(s),
+        "predicted_audio_source": (audio_fc or {}).get("source"),
+        "next_est_source": (audio_next or {}).get("source"),
         "next_date": None,
         "next_kind": None,
         "next_estimate": False,
@@ -965,6 +1034,8 @@ def _audio_estimate(series):
     if not f:
         return None
     pred = f["date"]
+    if f.get("source"):
+        return pred, _intel_note(f["source"])
     if f["queued"]:
         # the audio queue, not the novel, is what's holding this one back — say so
         after = f" book {f['after_n']}'s" if f.get("after_n") is not None else " the previous"
@@ -982,11 +1053,20 @@ def _audio_estimate(series):
     return pred, note
 
 
+def _intel_note(src):
+    """The estimate's basis when it is the author's own word."""
+    said = (src.get("said") or src.get("expected") or "").strip()
+    return f"author: {said}" if said else "author's stated timing"
+
+
 def _novel_estimate(series):
     """(predicted_date, note) for the next-novel forecast, or None."""
     pred = predicted_novel_date(series)
     if not pred or pred < today():
         return None
+    src = predicted_novel_source(series)
+    if src:
+        return pred, _intel_note(src)
     avg = predicted_gap_days(novel_gap_days_list(series))
     if avg is None:
         note = "estimated from past releases"
@@ -1062,6 +1142,7 @@ def upcoming_of_kind(kind, include_estimates):
             ent = None
             n = None
             fc = None
+            source = predicted_novel_source(s) if kind == "novel" else None
             if kind == "novel":
                 # The predicted novel doesn't exist as a timeline entry yet — it's
                 # the book AFTER the latest known NOVEL (the estimate anchors on
@@ -1077,6 +1158,7 @@ def upcoming_of_kind(kind, include_estimates):
                 # number straight from the same row that produced the date.
                 fc = _audio_next_forecast(s)
                 n = fc.get("n") if fc else None
+                source = fc.get("source") if fc else None
                 ent = next((e for e in s.get("timeline", []) if _entry_n(e) == n), None) if n is not None else None
             if n is not None and n in seen:
                 continue                      # this book already has a real date listed
@@ -1103,7 +1185,9 @@ def upcoming_of_kind(kind, include_estimates):
                 "kind": kind,
                 "estimate": True,
                 "note": note,
-                "confidence": _estimate_confidence(gaps),
+                # an author-stated date needs no confidence chip: the asterisk says who said it
+                "confidence": None if source else _estimate_confidence(gaps),
+                "source": source,
                 "countdown_days": (nd - t).days,
                 "cover": (ent.get("cover") if ent else None) or s.get("cover_url") or None,
             })
@@ -1210,6 +1294,15 @@ KIND_COLOR = {"novel": 0x9D8CFF, "audiobook": 0xE7B14C,   # dashboard violet / a
               "both": 0xC29BA6}                           # day-and-date blend
 
 
+def _no_secrets(s):
+    """Error text can echo the webhook URL (urllib: "unknown url type: '<the
+    whole string>'"). It reaches the activity log, the dashboard and, via
+    /api/state, the read-only tunnel - so it must never carry the token."""
+    s = re.sub(r"https?://\S+", "<url>", s or "")
+    s = re.sub(r"webhooks/\S+", "webhooks/<redacted>", s)
+    return re.sub(r"'[^']*'", "'<redacted>'", s)[:200]      # urllib quotes the offending input verbatim
+
+
 def _discord_post(webhook, text, embeds=None, fallback_text=None):
     """Blocking POST to a Discord webhook. Returns (ok, error_str). If an embed
     payload is rejected, retries once as plain text (fallback_text when given, so
@@ -1228,19 +1321,30 @@ def _discord_post(webhook, text, embeds=None, fallback_text=None):
         payload["embeds"] = embeds[:10]
     try:
         _send(payload)
-        return True, ""
     except HTTPError as e:
         if embeds:
             try:
                 _send({"content": ((fallback_text or text) or "")[:1900]})
+                with _lock:
+                    _discord_fail["n"] = 0
                 return True, ""
             except Exception:
                 pass
         return False, f"HTTP {e.code}"
+    except (ValueError, InvalidURL):
+        # both echo the pasted string in their message: say nothing of it
+        return False, "not a valid webhook URL — it must start with https://discord.com/api/webhooks/"
     except URLError as e:
-        return False, str(getattr(e, "reason", e))
+        return False, _no_secrets(str(getattr(e, "reason", e)))
     except Exception as e:
-        return False, str(e)
+        return False, _no_secrets(f"{type(e).__name__}: {e}")
+    with _lock:
+        _discord_fail["n"] = 0          # any good post, whoever sent it, ends a failure streak
+    return True, ""
+
+
+_discord_fail = {"n": 0}          # consecutive failed posts (any thread)
+DISCORD_FAILS_TO_REPORT = 2       # one blip is weather; two in a row is a problem
 
 
 def _discord_notify(text, embeds=None):
@@ -1250,19 +1354,131 @@ def _discord_notify(text, embeds=None):
         return
 
     def _go():
-        ok, err = _discord_post(wh, text, embeds)
-        if not ok:
-            add_log(f"Discord notify failed: {err}")
+        try:
+            ok, err = _discord_post(wh, text, embeds)
+            with _lock:
+                _discord_fail["n"] = 0 if ok else _discord_fail["n"] + 1
+                n = _discord_fail["n"]
+            if not ok:
+                add_log(f"Discord notify failed: {err}")
+                if n >= DISCORD_FAILS_TO_REPORT:
+                    # Discord can't be told that Discord is broken: the dashboard banner carries it
+                    _problem("discord", what=f"Discord messages are failing ({err}).",
+                             detail="Check the webhook in Settings → Discord — was it rotated or deleted?",
+                             notify=False)
+            else:
+                _problem_clear("discord", what="Discord messages are going through again.")
+        except Exception as e:                  # noqa: BLE001 - a state write can fail; never die silently
+            add_log(f"Discord notify error: {e}")
 
     threading.Thread(target=_go, daemon=True).start()
 
 
-def _book_embed(series, n, cover):
-    """Small embed that puts the book's cover art beside a ping (None if no art)."""
+def _book_embed(series, n, cover, kind="audiobook"):
+    """Small embed that puts the book's cover art beside a ping (None if no art).
+    The stripe colour says what the ping is about: violet for a novel, amber
+    for an audiobook - the dashboard's own colours."""
     if not cover:
         return None
     title = f"{series} — Book {n}" if n is not None else (series or "")
-    return {"title": title[:256], "thumbnail": {"url": cover}, "color": KIND_COLOR["audiobook"]}
+    return {"title": title[:256], "thumbnail": {"url": cover}, "color": KIND_COLOR.get(kind, KIND_COLOR["audiobook"])}
+
+
+# ---- alerts that clean up after themselves ---------------------------------
+# A warning that later clears ("extension silent" -> "back", a problem -> fixed)
+# used to leave two messages behind for good. The warning is now posted as an
+# editable message; the all-clear EDITS it, and an hour later it is deleted, so
+# a transient outage leaves no clutter. Persisted, so a restart still tidies up.
+ALERT_TIDY_S = 3600
+_alert_inflight = {}          # key -> Event, set once the post has stored its message URL
+
+
+def _alert_post(key, text):
+    """Post an editable alert under a key (several per key: daily reminders).
+    Falls back to a plain message when there is nothing to edit later."""
+    if not (get_settings().get("discord_webhook") or "").strip():
+        _discord_notify(text)              # nothing to edit later; stays a plain (no-op) message
+        return
+    ev = threading.Event()
+    _alert_inflight[key] = ev
+
+    def _go():
+        try:
+            url = _discord_live_start(text)
+            if url:
+                with _lock:
+                    _state.setdefault("alerts", {}).setdefault(key, []).append(url)
+                    save_state()
+            else:
+                _discord_notify(text)
+        except Exception as e:  # noqa: BLE001
+            add_log(f"Discord alert error: {e}")
+        finally:
+            ev.set()
+            _alert_inflight.pop(key, None)
+
+    threading.Thread(target=_go, daemon=True).start()
+
+
+def _alert_resolve(key, text, fallback=True):
+    """Turn the alert into its all-clear and schedule its removal. With nothing
+    to edit (older build, no webhook) the all-clear is a plain message, unless
+    fallback is False (a silent clear: the warning still goes away)."""
+    ev = _alert_inflight.get(key)
+    if ev:
+        ev.wait(timeout=8)                 # the alert may have been raised seconds ago
+    with _lock:
+        urls = (_state.get("alerts") or {}).pop(key, None) or []
+        if urls:
+            due = (datetime.now() + timedelta(seconds=ALERT_TIDY_S)).isoformat(timespec="seconds")
+            _state.setdefault("discord_tidy", []).extend({"url": u, "at": due} for u in urls)
+        save_state()
+    if not urls:
+        if fallback:
+            _discord_notify(text)
+        return False
+    threading.Thread(target=_discord_live_edit, args=(urls[-1], text), daemon=True).start()
+    return True
+
+
+def _discord_delete(edit_url):
+    """Delete a webhook message; 'already gone' counts as done."""
+    try:
+        with urlopen(Request(edit_url, method="DELETE", headers={"User-Agent": APP_NAME}), timeout=10) as r:
+            r.read()
+        return True
+    except HTTPError as e:
+        return e.code == 404
+    except Exception:           # noqa: BLE001
+        return False
+
+
+def _discord_tidy_tick():
+    """Delete resolved alerts whose hour is up; a failed delete is retried on
+    later ticks, a few times."""
+    now = datetime.now()
+    with _lock:
+        items = list(_state.get("discord_tidy") or [])
+    if not items:
+        return
+    keep, changed = [], False
+    for it in items:
+        try:
+            due = datetime.fromisoformat(it.get("at") or "")
+        except ValueError:
+            changed = True
+            continue
+        if due > now:
+            keep.append(it)
+            continue
+        changed = True
+        it["tries"] = int(it.get("tries") or 0) + 1
+        if not _discord_delete(it["url"]) and it["tries"] < 3:
+            keep.append(it)
+    if changed:
+        with _lock:
+            _state["discord_tidy"] = keep
+            save_state()
 
 
 def _discord_ts(iso_str, style="D"):
@@ -1277,8 +1493,8 @@ def _discord_ts(iso_str, style="D"):
 
 
 def _new_date_messages(s, n, old_novel, new_novel, old_audio, new_audio):
-    """Discord lines for dates that were just added or changed (today or later only,
-    so backfilling a series' old catalogue doesn't spam)."""
+    """[(line, kind)] for dates that were just added or changed (today or later
+    only, so backfilling a series' old catalogue doesn't spam)."""
     if not get_settings().get("discord_on_new", True):
         return []
     name = s.get("name", "")
@@ -1292,11 +1508,11 @@ def _new_date_messages(s, n, old_novel, new_novel, old_audio, new_audio):
             continue
         when = f"**{_discord_ts(new, 'D')}** ({_discord_ts(new, 'R')})"
         if old:
-            msgs.append(_fmt_line("date_changed", icon=icon[kind], series=name, n=n,
-                                  kind=kind, when=when, was=_discord_ts(old, 'D')))
+            msgs.append((_fmt_line("date_changed", icon=icon[kind], series=name, n=n,
+                                   kind=kind, when=when, was=_discord_ts(old, 'D')), kind))
         else:
-            msgs.append(_fmt_line("new_date", icon=icon[kind], series=name, n=n,
-                                  kind=kind, when=when))
+            msgs.append((_fmt_line("new_date", icon=icon[kind], series=name, n=n,
+                                   kind=kind, when=when), kind))
     return msgs
 
 
@@ -1754,7 +1970,8 @@ def _ext_seen():
     if _ext_alerted:
         _ext_alerted = False
         add_log("extension is back")
-        _discord_notify(_fmt_line("recovered", what="The browser extension is checking in again."))
+        # edits the warning into the all-clear; gone an hour later
+        _alert_resolve("ext_silent", _fmt_line("recovered", what="The browser extension is checking in again."))
 
 
 def _maybe_report_unconfirmed_releases():
@@ -1805,9 +2022,118 @@ def _ext_watchdog():
         _ext_alerted = True
         h = int(quiet.total_seconds() // 3600)
         add_log(f"extension has been silent for {h} h")
-        _discord_notify(_fmt_line("watchdog",
-                                  what=f"The browser extension hasn't checked in for {h} hours — no release dates are being read.",
-                                  detail="Is Floorp open, and is the Release Radar add-on enabled? Reinstalling the .xpi over the top fixes a dead add-on."))
+        _alert_post("ext_silent", _fmt_line("watchdog",
+                                            what=f"The browser extension hasn't checked in for {h} hours — no release dates are being read.",
+                                            detail="Is Floorp open, and is the Release Radar add-on enabled? Reinstalling the .xpi over the top fixes a dead add-on."))
+
+
+# ---- problems: things only a person can fix ------------------------------
+# Every scheduled job used to fail into the in-app activity log and nowhere
+# else: the nightly AI research died for four nights in Sep 2026 (the Claude
+# CLI had signed itself out) and nobody heard. A problem is raised by key,
+# told to Discord ONCE, repeated daily while it persists, and announced when it
+# clears. Persisted, so a restart neither re-alerts nor forgets.
+PROBLEM_REMIND_H = 24
+
+
+def _problem(key, what, detail="", notify=True):
+    """Raise (or refresh) a problem. Returns True when it was announced."""
+    what, detail = _no_secrets(what), _no_secrets(detail)      # this text travels far (tunnel included)
+    now = datetime.now()
+    stamp = now.isoformat(timespec="seconds")
+    with _lock:
+        probs = _state.setdefault("problems", {})
+        p = probs.get(key)
+        if p:
+            p["what"], p["detail"] = what, detail
+            p["count"] = int(p.get("count") or 0) + 1
+            try:
+                recent = now - datetime.fromisoformat(p.get("last_alert") or "") < timedelta(hours=PROBLEM_REMIND_H)
+            except ValueError:
+                recent = False
+            if recent:
+                return False
+            p["last_alert"] = stamp
+        else:
+            probs[key] = {"what": what, "detail": detail, "count": 1, "since": stamp, "last_alert": stamp}
+        save_state()
+    add_log(f"PROBLEM ({key}): {what} {detail}".rstrip())
+    if notify:
+        _alert_post(f"problem:{key}", _fmt_line("watchdog", what=what, detail=detail))
+    return True
+
+
+def _problem_clear(key, what=None, notify=True):
+    """Drop a problem; announces the all-clear only if it was actually open."""
+    with _lock:
+        p = (_state.get("problems") or {}).pop(key, None)
+        if p:
+            save_state()
+    if not p:
+        return False
+    add_log(f"resolved ({key}): {what or p.get('what', '')}")
+    # the warning becomes the all-clear and disappears an hour later; a silent
+    # clear (notify=False) still takes the stale warning down, just posts nothing new
+    _alert_resolve(f"problem:{key}", _fmt_line("recovered", what=what or (p.get("what", "") + " That's fixed now.")),
+                   fallback=notify)
+    return True
+
+
+def _problems_list():
+    with _lock:
+        probs = _state.get("problems") or {}
+        return [dict(v, key=k) for k, v in sorted(probs.items(), key=lambda kv: kv[1].get("since", ""))]
+
+
+# A polling extension that never reads a page is as blind as a dead one, and
+# the poll watchdog above can't see it: Sep 2026 had three days of healthy
+# 20-second polls and not one Amazon read (the daily refresh only ever ran
+# when Floorp was restarted). Self-heal first — ask for a forced refresh — and
+# if that changes nothing, say so.
+READ_QUIET_NUDGE_H = 30       # the refresh runs daily; this much silence is abnormal
+READ_QUIET_ALERT_H = 6        # a nudge that yields nothing within this -> Discord
+_read_nudged_at = None
+
+
+def _read_watchdog():
+    global _read_nudged_at
+    now = datetime.now()
+    if now - _ext_last_poll > timedelta(minutes=10):
+        # not polling at all: _ext_watchdog owns that story - and time spent
+        # away must not count against a nudge it never received
+        _read_nudged_at = None
+        return
+    with _lock:
+        if not _state.get("series"):
+            return
+        # last_read is stamped by every accepted page read; last_ingest only by
+        # reads that CHANGED something, which a healthy quiet library never does
+        last = _state.get("last_read") or _state.get("last_ingest") or ""
+        pending = any(c.get("type") == "refresh" for c in _state.get("ext_commands", []))
+        open_problem = "no_reads" in (_state.get("problems") or {})
+    try:
+        quiet = now - datetime.fromisoformat(last)
+    except (TypeError, ValueError):
+        return                                  # never ingested anything: nothing to compare against
+    if quiet < timedelta(hours=READ_QUIET_NUDGE_H):
+        if _read_nudged_at is not None or open_problem:
+            _read_nudged_at = None
+            _problem_clear("no_reads", what="The extension is reading Amazon pages again.")
+        return
+    h = int(quiet.total_seconds() // 3600)
+    if _read_nudged_at is None or now - _read_nudged_at >= timedelta(hours=24):
+        _read_nudged_at = now
+        if not pending:
+            _push_command(type="refresh")
+        add_log(f"no page reads for {h} h although the extension is polling — asked it for a forced refresh")
+        return
+    if now - _read_nudged_at >= timedelta(hours=READ_QUIET_ALERT_H):
+        _problem("no_reads",
+                 what=f"The extension is alive but hasn't read a single Amazon page in {h} hours, and a forced refresh changed nothing.",
+                 detail="Open the Release Radar add-on popup: read its log, try 'Reset if stuck', or restart Floorp. "
+                        "Release days can't be detected until it reads pages again.")
+
+
 COVERFILL_CAP = 20        # backfill page-reads per round; the extension paces them
 COVERFILL_EVERY_HOURS = 24  # cover art is cosmetic — trickle it, don't hammer
 COVERFILL_MAX_TRIES = 3   # after this many reads with no yield, the page simply
@@ -1943,8 +2269,11 @@ def _maybe_send_daily_digest():
     ok, err = _send_digest(wh)
     if not ok:
         add_log(f"Daily digest failed: {err}")
+        _problem("digest", what=f"The forecast digest didn't send ({err}).",
+                 detail="Check the webhook in Settings → Discord.")
     else:
         add_log("Sent the daily forecast digest to Discord")
+        _problem_clear("digest", what="The forecast digest is sending again.")
 
 
 _digest_thread_started = False
@@ -1980,6 +2309,14 @@ def _start_daily_digest():
             except Exception as e:
                 add_log(f"extension watchdog error: {e}")
             try:
+                _read_watchdog()
+            except Exception as e:
+                add_log(f"read watchdog error: {e}")
+            try:
+                _discord_tidy_tick()
+            except Exception as e:
+                add_log(f"Discord tidy error: {e}")
+            try:
                 _maybe_report_unconfirmed_releases()
             except Exception as e:
                 add_log(f"unconfirmed-release check error: {e}")
@@ -1995,6 +2332,10 @@ def _start_daily_digest():
                 _abs_refresh_progress()
             except Exception as e:
                 add_log(f"Audiobookshelf progress error: {e}")
+            try:
+                _abs_sync_status()
+            except Exception as e:
+                add_log(f"Audiobookshelf status write error: {e}")
             try:
                 _ai_tick()
             except Exception as e:
@@ -2023,6 +2364,7 @@ def build_state_payload():
         "show_estimates": get_settings().get("show_estimates", True),
         "show_estimates_novel": get_settings().get("show_estimates_novel", True),
         "log": log_rows,
+        "problems": _problems_list(),
         "counts": {
             "total": len(views),
             "out": sum(1 for v in views if v["status_class"] == "released"),
@@ -2178,6 +2520,28 @@ def _origin_kind(origin):
     return "web"                           # a real website — treat as hostile
 
 
+def _is_own_origin(origin):
+    """The app's own public origin: buy_public_base, or the host this request
+    was addressed to. The approval page posts back to itself over the tunnel,
+    and the browser stamps that POST with the public hostname as its Origin,
+    which _origin_kind calls "a real website" (29 Sep 2026: Approve answered
+    'cross-site request refused'). Only consulted for the token-gated /buy/
+    routes; a foreign page can't forge Origin, and the token is still needed."""
+    try:
+        o = urlparse(origin or "")
+    except Exception:
+        return False
+    if o.scheme not in ("http", "https") or not o.netloc:
+        return False
+    own = set()
+    base = (get_settings().get("buy_public_base") or "").strip()
+    if base:
+        own.add(urlparse(base).netloc.lower())
+    if request.host:
+        own.add(request.host.lower())
+    return o.netloc.lower() in own
+
+
 def _is_remote():
     """True when the request did NOT come from this machine - i.e. it arrived
     through the Cloudflare tunnel (Cf-* headers) or was addressed to any host
@@ -2206,7 +2570,8 @@ def _refuse_cross_site_writes():
        the Discord webhook (it is masked for remote readers below)."""
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
-    if _origin_kind(request.headers.get("Origin")) == "web":
+    origin = request.headers.get("Origin")
+    if _origin_kind(origin) == "web" and not (request.path.startswith("/buy/") and _is_own_origin(origin)):
         add_log(f"refused a cross-site {request.method} to {request.path}")
         return jsonify({"error": "cross-site request refused"}), 403
     if _is_remote() and not request.path.startswith("/buy/"):
@@ -2423,6 +2788,7 @@ def api_ingest():
     if not series or n is None or (not nd and not ad):
         return jsonify({"ok": False, "message": "Need a series, a book number, and a date."})
     with _lock:
+        _state["last_read"] = datetime.now().isoformat(timespec="seconds")   # a page was read, changed or not
         s = _match_tracked_series(series)
         created = False
         if not s:
@@ -2537,7 +2903,7 @@ def api_ingest():
                 if key not in notified and get_settings().get("discord_on_release", True):
                     notified.add(key)
                     _state["discord_notified"] = list(notified)[-500:]
-                    released_msgs.append(_release_live_message(s.get("name", ""), n, kind))
+                    released_msgs.append((_release_live_message(s.get("name", ""), n, kind), kind))
         if nd and not (backfill and ent.get("novel")):
             ent["novel"] = nd                 # Amazon is authoritative for this field
         if ad and not (backfill and ent.get("audiobook")):
@@ -2555,15 +2921,18 @@ def api_ingest():
             for e2 in tl:
                 n2 = _entry_n(e2)
                 if (n2 is not None and n is not None and n2 < n
-                        and (e2.get("narrator") or "").strip()):
+                        and clean_narrator(e2.get("narrator"))):
                     if prev is None or n2 > prev[0]:
-                        prev = (n2, e2["narrator"].strip())
+                        prev = (n2, clean_narrator(e2["narrator"]))
             was_new = (ent.get("narrator") or "").strip() != narr
             ent["narrator"] = narr
             adt_n = parse_date(ent.get("audiobook"))
             # today-or-later only — backfilling an old catalogue must not spam a
-            # ping per historical swap (same guard as _new_date_messages)
-            if was_new and prev and _norm(prev[1]) != _norm(narr) and adt_n and adt_n >= today():
+            # ping per historical swap (same guard as _new_date_messages). Judged
+            # on the cleaned LEAD narrator: stored credits may carry old page
+            # furniture, and a full cast is listed differently read to read.
+            if (was_new and prev and _norm(lead_narrator(prev[1])) != _norm(lead_narrator(narr))
+                    and adt_n and adt_n >= today()):
                 key = f"narrator:{s['id']}:{n}:{_norm(narr)}"
                 notified = set(_state.get("discord_notified", []))
                 if key not in notified and get_settings().get("discord_on_new", True):
@@ -2625,14 +2994,14 @@ def api_ingest():
         series_name = s.get("name", "")
         sid_for_card = s.get("id")
         save_state()
-    for m in new_date_msgs + narrator_msgs:
-        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping)])
-    for m in released_msgs:
+    for m, kind in new_date_msgs + [(m, "audiobook") for m in narrator_msgs]:
+        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping, kind)])
+    for m, kind in released_msgs:
         # audiobook releases get a LIVING card: later stages (approval, bought,
         # downloaded, filed) edit this same message instead of new pings
-        if ad and _release_card_create(sid_for_card, n, m, _book_embed(series_name, n, cover_for_ping)):
+        if ad and kind == "audiobook" and _release_card_create(sid_for_card, n, m, _book_embed(series_name, n, cover_for_ping, kind)):
             continue
-        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping)])
+        _discord_notify(m, embeds=[_book_embed(series_name, n, cover_for_ping, kind)])
     bits = " ".join(filter(None, [f"novel {nd}" if nd else "", f"audiobook {ad}" if ad else ""]))
     add_log(f"Ingested from Amazon: {series} book {n} ({bits})")
     return jsonify({"ok": True, "created": created, "series": s["name"], "n": n,
@@ -2692,6 +3061,12 @@ def api_ext_commands_ack():
 #                    Ledger-marked so it can never be retried automatically.
 #   owned/failed/denied/expired/cancelled/needs_signin   terminal, with a note
 # ---------------------------------------------------------------------------
+
+try:
+    import pick_downloads      # the ONE definition of "a tracked book", shared with Update Audiobooks.bat
+except ImportError:            # a copy without the file next to app.py: Libation checks answer "can't tell"
+    pick_downloads = None
+
 
 def _clean_buy_mode(v):
     v = (v or "off") if isinstance(v, str) else "off"
@@ -2784,6 +3159,11 @@ def _job_set(job, status, note=None):
 
 
 # ---- ownership: Libation's own library db is the truth for "already have it"
+def _libation_ro_uri(files_dir):
+    db = os.path.join(files_dir, "LibationContext.db")
+    return pick_downloads.ro_uri(db) if pick_downloads else f"file:{db}?mode=ro"
+
+
 def _libation_files_dir():
     cands = [get_settings().get("buy_libation_files") or "",
              os.path.join(os.path.expanduser("~"), "Libation"),
@@ -2795,20 +3175,54 @@ def _libation_files_dir():
     return None
 
 
-def _libation_owns(asin):
-    """True/False from Libation's library, None when it can't be checked."""
+def _series_key(name):
+    """Series names as Audible and Amazon spell them differently ('The Unfallen
+    Series' / 'The Unfallen'); same rule as pick_downloads.py."""
+    s = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    s = re.sub(r"^(?:the|a|an) ", "", s)
+    return re.sub(r" (?:series|saga|trilogy|cycle)$", "", s).strip()
+
+
+def _libation_match(asin=None, series=None, n=None, srs=None):
+    """Libation's record of one book: {"in_library": bool, "downloaded": bool},
+    or None when it can't be told. Recognition is pick_downloads' (series
+    name + number, a recorded product ID, author + title with the date
+    agreeing): Audible's ID is not the Amazon listing ASIN the radar knows
+    (Riftside 4: B0HJ9CQDHW vs B0HJ9DX4S2), and a brand-new release can arrive
+    with no series on Audible's record at all (Arcane Academy 5, 2 Oct 2026).
+    srs: the radar's series record (author, the book's title, its audiobook
+    date). "downloaded" follows the strongest match: Audible's own series
+    number or a recorded ID outrank an author+title guess, so a liberated
+    sibling can never make a failed download look complete."""
     d = _libation_files_dir()
-    if not d or not asin:
+    if not d or pick_downloads is None or not (asin or ((srs or series) and n is not None)):
+        if d and pick_downloads is None:
+            log.warning("pick_downloads.py is missing next to app.py - Libation checks can't tell")
         return None
     try:
-        con = sqlite3.connect(f"file:{os.path.join(d, 'LibationContext.db')}?mode=ro", uri=True, timeout=2)
-        try:
-            row = con.execute("select 1 from Books where AudibleProductId = ? limit 1", (asin,)).fetchone()
-        finally:
-            con.close()
-        return bool(row)
+        books = pick_downloads.library_books(d, pending_only=False)
+        rec = dict(srs) if isinstance(srs, dict) else {}
+        rec.setdefault("name", series or "")
+        ent = pick_downloads.series_entry(rec, n=n) if n is not None else pick_downloads.series_entry({"name": ""})
+        if asin:
+            ent["asins"].add(asin)
+        hits = []
+        for b in books:
+            m = pick_downloads.match_book(b, [ent])
+            if m:
+                hits.append((m[1] in (ent["name"], "matched by ID"), b["status"]))
     except Exception:
         return None
+    strong = [st for sure, st in hits if sure]
+    use = strong or [st for _, st in hits]
+    return {"in_library": bool(hits),
+            "downloaded": bool(use) and all(st == pick_downloads.LIBERATED for st in use)}
+
+
+def _libation_owns(asin, series=None, n=None, srs=None):
+    """True/False from Libation's library, None when it can't be checked."""
+    m = _libation_match(asin, series, n, srs=srs)
+    return None if m is None else m["in_library"]
 
 
 # ---- creation (called from ingest, under the lock)
@@ -2837,7 +3251,7 @@ def _maybe_create_buy_job(s, n, ent, audio_date):
            "dry_run": bool(st.get("buy_dry_run", True)), "status": "probing", "price": None,
            "created": _buy_now(), "updated": _buy_now(), "probes": 0, "last_probe": None,
            "steps": [], "note": ""}
-    owned = _libation_owns(audio_asin)
+    owned = _libation_owns(audio_asin, series=s.get("name"), n=n, srs=s)
     if owned:
         _job_set(job, "owned", "Libation already has this audiobook")
     _state.setdefault("buy_jobs", []).append(job)
@@ -2853,6 +3267,26 @@ def _buy_push_probe(job):
     job["probes"] = int(job.get("probes") or 0) + 1
     job["last_probe"] = _buy_now()
     _push_command(type="buy", phase="probe", job=_job_cmd(job))
+
+
+# a job parked or stopped for a reason a person can clear (signed back in, the
+# store now sells it) - what the dashboard's Retry, !retry and the Discord
+# button accept
+BUY_RETRYABLE = ("needs_signin", "retry_later", "failed", "expired")
+
+
+def _buy_retry(job, who):
+    """Re-check a parked job NOW instead of at the next 3-hourly probe. It gets
+    a fresh probe window, and a still-signed-out answer is announced again
+    (with a new button). Caller holds _lock."""
+    job["dry_run"] = bool(get_settings().get("buy_dry_run", True))
+    job["probes"] = 0
+    job["window_start"] = _buy_now()
+    job.pop("signin_notified", None)
+    job.pop("signin_button_at", None)
+    _job_step(job, "retry", True, f"retry from {who}")
+    _job_set(job, "probing", f"retry from {who}")
+    _buy_push_probe(job)
 
 
 def _buy_week_count():
@@ -2874,6 +3308,7 @@ def _buy_decide(job):
     if job.get("dry_run"):
         _job_set(job, "running", "dry run: borrows on KU, finds the audiobook offer, returns the borrow - buys nothing")
         _push_command(type="buy", phase="dry", job=_job_cmd(job))
+        _buy_live_begin(job)
         return
     if job.get("mode") == "auto" and price is not None and price <= _job_cap(job):
         if _buy_week_count() >= int(st.get("buy_weekly_max", BUY_WEEKLY_MAX)):
@@ -2920,6 +3355,7 @@ def _buy_approve(job, who="link"):
     job["approved_at"] = _buy_now()
     _push_command(type="buy", phase="execute", job=_job_cmd(job))
     _job_set(job, "running", f"approved by {who}; extension is working")
+    _buy_live_begin(job)
 
 
 def _buy_deny(job, who="link"):
@@ -2970,6 +3406,9 @@ def _buy_handle_report(job, phase, ok, detail):
     """Apply one report from the extension to a job. Runs under the lock."""
     detail = detail if isinstance(detail, dict) else {"info": str(detail)}
     info = str(detail.get("info") or "")[:300]
+    if phase == "progress":
+        job["now"] = info                     # what it is trying right now: the live message, not a step
+        return
     if phase == "probe":
         job["probes_ok"] = int(job.get("probes_ok") or 0) + (1 if ok else 0)
         if detail.get("buybox_html"):
@@ -3086,10 +3525,16 @@ def _buy_needs_signin(job):
     if job.get("signin_notified"):
         return
     job["signin_notified"] = _buy_now()
-    msg = (f"\U0001f511 Firefox is signed out of Amazon, so I can't buy {job.get('series', '')} — book {job.get('n')}. "
-           f"Sign in again on the PC (any Amazon page); I'll keep checking for {BUY_PROBE_DAYS} days and carry on by myself.")
-    _discord_notify(msg)
-    _send_email_async(job["id"], f"Release Radar: sign in to Amazon to buy {job.get('title', '')}", msg)
+    job["signin_button_at"] = _buy_now()
+    head = (f"\U0001f511 Firefox is signed out of Amazon, so I can't buy {job.get('series', '')} — book {job.get('n')}. "
+            f"Sign in again on the PC (any Amazon page)")
+    tail = f"; otherwise I re-check every {BUY_PROBE_GAP_H} h for {BUY_PROBE_DAYS} days and carry on by myself."
+    # the bot posts it with a Retry button (a webhook can't carry one); without
+    # the bot, the webhook says where the Retry lives instead
+    _notify_with_button(head + ", then hit the button" + tail,
+                        [("I've signed in — retry now", f"rr:retry:{job['id']}")],
+                        fallback=head + ", then hit Retry on the dashboard's purchase card" + tail)
+    _send_email_async(job["id"], f"Release Radar: sign in to Amazon to buy {job.get('title', '')}", head + tail)
 
 
 def _buy_after_purchase(job):
@@ -3156,7 +3601,13 @@ class _BatProgress:
         self.total = 0
         self.begun = 0
         self.done_dl = 0
+        self.failed_dl = 0
+        self.picked = None          # what the tracked-series picker let through (None: picker not seen)
+        self.skipped = 0            # ...and what it refused
+        self.picked_ids = {}        # Audible product ID -> why the picker took it
         self.current = ""
+        self.current_asin = None
+        self.book_pct = None        # how far the current book's download is (sampled from Libation's temp file)
         self.filed = []
         self.finished = False
         self.rc = None
@@ -3187,14 +3638,34 @@ class _BatProgress:
         m = re.match(r"New:\s*(\d+)", l)
         if m:
             self.new = int(m.group(1))
-            self.total = max(self.total, self.new)
-        m = re.match(r"DownloadDecryptBook Begin:\s*\S+\s*\[[A-Z0-9]+\]\s*(.+)", l)
+            if self.picked is None:
+                self.total = max(self.total, self.new)
+        # the tracked-series picker decides what is actually downloaded: its
+        # count is the bar's total, not Libation's "New: N" (a 1/2 bar that
+        # never filled, 7 Oct 2026, was one tracked book out of two new ones)
+        if l.startswith("Download (tracked):"):
+            self.picked = (self.picked or 0) + 1
+            self.total = self.picked
+            m = re.search(r"\[([A-Z0-9]+)\]\s*-\s*(.+?)\s*$", l)
+            if m:
+                self.picked_ids[m.group(1)] = m.group(2)
+        elif l.startswith("Not downloading (not in a tracked series):"):
+            self.skipped = len([x for x in l.split(":", 1)[1].split(";") if x.strip()])
+        elif l.startswith("Nothing new from the series Release Radar tracks"):
+            self.picked = 0
+            self.total = 0
+        m = re.match(r"DownloadDecryptBook Begin:\s*\S+\s*\[([A-Z0-9]+)\]\s*(.+)", l)
         if m:
             self.begun += 1
             self.total = max(self.total, self.begun)
-            self.current = m.group(1).strip()
+            self.current_asin, self.current = m.group(1), m.group(2).strip()
+            self.book_pct = None
         if re.match(r"DownloadDecryptBook Completed:", l):
             self.done_dl += 1
+            self.book_pct = None
+        if l.startswith("Error processing book"):
+            self.failed_dl += 1
+            self.done_dl = max(0, self.done_dl - 1)       # Libation says Completed before it says Error
         if re.match(r"(FILED|NEW|ADOPT|HOLD)\b", l) and not re.match(r"New:", l):
             self.filed.append(l[:120])
 
@@ -3202,13 +3673,22 @@ class _BatProgress:
         if not self.total:
             return ""
         done = min(self.done_dl, self.total)
-        f = int(self.BAR_W * done / self.total)
+        # the book in flight moves the bar too, by how far its download is
+        partial = (self.book_pct or 0) / 100 if (done < self.total and self.book_pct) else 0
+        f = int(self.BAR_W * (done + partial) / self.total)
         return "\u25b0" * f + "\u25b1" * (self.BAR_W - f) + f"  {done}/{self.total}"
+
+    def book_bar(self):
+        if self.book_pct is None:
+            return ""
+        f = int(8 * self.book_pct / 100)
+        return " " + "\u25b0" * f + "\u25b1" * (8 - f) + f" {self.book_pct}%"
 
     def render(self):
         rows = ["\U0001f4e6 **Update Audiobooks**" + (f" (attempt {self.attempt})" if self.attempt > 1 else "")]
         if self.processed is not None:
-            rows.append(f"\u2705 Scan: {self.processed} titles, {self.new or 0} new")
+            tracked = f" \u00b7 {self.picked} tracked" if self.picked is not None and self.new else ""
+            rows.append(f"\u2705 Scan: {self.processed} titles, {self.new or 0} new{tracked}")
         elif self.phase == "starting":
             rows.append("\u23f3 starting\u2026")
         else:
@@ -3216,12 +3696,18 @@ class _BatProgress:
                         + (f" ({self.accounts} accounts)" if self.accounts else ""))
         if self.processed is not None:
             if self.total == 0:
-                rows.append("\U0001f4a4 Nothing new to download")
+                rows.append("\U0001f4a4 Nothing new from the series you track"
+                            + (f" ({self.skipped} skipped, not tracked)" if self.skipped else ""))
             else:
-                downloading = self.phase == "download" and not self.finished and self.done_dl < self.total
-                icon = "\u2b07\ufe0f" if downloading else "\u2705"
-                cur = f" \u00b7 *{self.current}*" if downloading and self.current else ""
-                rows.append(f"{icon} Download  {self.bar()}{cur}")
+                # a tick only when every book came through; a download that
+                # Libation gave up on is a warning, not a tick
+                all_done = self.done_dl >= self.total and not self.failed_dl
+                downloading = self.phase == "download" and not self.finished and not all_done and not self.failed_dl
+                icon = "\u2b07\ufe0f" if downloading else ("\u2705" if all_done else "\u26a0\ufe0f")
+                cur = f" \u00b7 *{self.current}*{self.book_bar()}" if downloading and self.current else ""
+                fail = f" \u00b7 {self.failed_dl} failed (Libation will retry)" if self.failed_dl else ""
+                skip = f" \u00b7 {self.skipped} skipped, not tracked" if self.skipped else ""
+                rows.append(f"{icon} Download  {self.bar()}{cur}{fail}{skip}")
         if self.phase == "file" and not self.finished:
             rows.append("\U0001f5c2\ufe0f Filing into the library\u2026")
         for l in self.filed[-6:]:
@@ -3252,6 +3738,119 @@ class _LiveEditor:
             self._last_text = text
 
 
+# ---- live Discord progress for a purchase run ------------------------------
+# The outcome alone wasn't enough (29 Sep 2026: a purchase stopped mid-way and
+# the only trace was the dashboard card). One message per run, edited in place
+# as the extension reports: each step's result, what it is trying right now,
+# then the outcome. A failure also gets a Retry button (bot) of its own.
+BUY_STEP_TEXT = {"approve": "Approved", "retry": "Retry", "borrow": "Kindle Unlimited borrow",
+                 "borrow-ajax": "Borrow (fallback)", "borrow-verify": "Borrow confirmed",
+                 "buy-click": "Pressed Buy", "payment": "Payment method", "review": "Review page",
+                 "checkout": "Checkout", "confirm": "Order confirmation", "return": "Kindle Unlimited return",
+                 "offer": "Audiobook offer"}
+BUY_RUN_STATES = ("probing", "awaiting_approval", "approved", "running")
+_BUY_OUTCOME = {
+    "done": "✅ Bought — Update Audiobooks runs next.",
+    "done_unreturned": "✅ Bought — but return the KU borrow by hand.",
+    "failed": "❌ Stopped — nothing was bought.",
+    "uncertain": "⚠️ A Buy click happened but I couldn't see a confirmation — check your Amazon orders before retrying.",
+    "retry_later": "⏳ Amazon refused the checkout — I'll try again automatically.",
+    "dry_done": "\U0001f9ea Dry run finished — nothing was bought.",
+}
+_buy_live = {}
+
+
+def _buy_step_text(name):
+    if name.startswith("offer on "):
+        return "Audiobook offer on the " + name[len("offer on "):]
+    return BUY_STEP_TEXT.get(name, name)
+
+
+def _buy_live_render(job):
+    price = job.get("price")
+    ptxt = f"${price:.2f}" if isinstance(price, (int, float)) else "price ?"
+    lines = [f"\U0001f6d2 **{job.get('series', '')} — book {job.get('n')}** · {ptxt}"
+             + (" · dry run" if job.get("dry_run") else "")]
+    since = job.get("run_started") or ""
+    for st in job.get("steps") or []:
+        if (st.get("at") or "") < since:
+            continue
+        name, detail = str(st.get("step") or ""), str(st.get("detail") or "")
+        mark = "✅" if st.get("ok") else "❌"
+        if name.startswith("offer on ") and detail.startswith("not here"):
+            mark = "➖"                   # looked, not on this page: the search moves on
+        lines.append(f"{mark} {_buy_step_text(name)} — {detail[:150]}")
+    status = job.get("status")
+    if status in BUY_RUN_STATES:
+        if job.get("now"):
+            lines.append(f"⏳ now: {str(job['now'])[:160]}")
+    else:
+        out = _BUY_OUTCOME.get(status, f"Finished: {status}.")
+        if status in ("failed", "uncertain") and job.get("note"):
+            out += f"\n({str(job['note'])[:200]})"
+        lines.append(out)
+    return "\n".join(lines)[:1900]
+
+
+class _BuyLive:
+    """One live Discord message per purchase run. Network happens on its own
+    thread; callers (holding _lock) only drop the latest text in."""
+    IDLE_LIMIT_S = 3 * 3600
+
+    def __init__(self, text):
+        self.text, self.final, self.ev = text, False, threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def set(self, text, final=False):
+        self.text = text
+        self.final = self.final or final
+        self.ev.set()
+
+    def _run(self):
+        ed = _LiveEditor(_discord_live_start(self.text))
+        shown, idle = self.text, 0
+        while True:
+            if not self.ev.wait(timeout=60):
+                idle += 60
+                if idle >= self.IDLE_LIMIT_S:
+                    return                    # an abandoned run: stop watching
+                continue
+            self.ev.clear()
+            idle = 0
+            t = self.text
+            if t != shown:
+                ed.push(t, force=True)
+                shown = t
+            if self.final and self.text == shown:
+                return
+            time.sleep(1.2)                   # pace the edits; anything newer is picked up next loop
+
+
+def _buy_live_begin(job):
+    """A purchase run (dry or real) was handed to the extension."""
+    job["run_started"] = _buy_now()
+    job["now"] = "handed to the browser extension — waiting for it to pick the job up"
+    _buy_live[job["id"]] = _BuyLive(_buy_live_render(job))
+
+
+def _buy_live_update(job):
+    lv = _buy_live.get(job.get("id"))
+    if not lv:
+        return
+    final = job.get("status") not in BUY_RUN_STATES
+    if final:
+        job.pop("now", None)
+    lv.set(_buy_live_render(job), final=final)
+    if final:
+        _buy_live.pop(job["id"], None)
+        if job.get("status") == "failed":
+            head = (f"❌ {job.get('series', '')} — book {job.get('n')}: the purchase stopped "
+                    f"({str(job.get('note') or '')[:160]}). Nothing was bought.")
+            _notify_with_button(head + " Retry once it's sorted:",
+                                [("Retry", f"rr:retry:{job['id']}")],
+                                fallback=head + " Retry it from the dashboard's purchase card (or `!retry`).")
+
+
 
 def _bat_path():
     p = (get_settings().get("buy_bat") or "").strip()
@@ -3265,10 +3864,63 @@ def _bat_path():
     return None
 
 
-def _run_bat_once(bat, on_output=None):
+LIBATION_MB_PER_MIN = 0.91      # measured: Riftside 4 1202 min -> 1093 MB, Loopbreaker 1 1313 min -> 1194 MB
+_libation_len_cache = {}
+
+
+def _libation_length_minutes(asin):
+    if asin in _libation_len_cache:
+        return _libation_len_cache[asin]
+    d = _libation_files_dir()
+    mins = None
+    if d:
+        try:
+            con = sqlite3.connect(_libation_ro_uri(d), uri=True, timeout=2)
+            try:
+                row = con.execute("select LengthInMinutes from Books where AudibleProductId = ?", (asin,)).fetchone()
+            finally:
+                con.close()
+            mins = int(row[0]) if row and row[0] else None
+        except Exception:       # noqa: BLE001
+            mins = None
+    _libation_len_cache[asin] = mins
+    return mins
+
+
+def _libation_download_pct(asin):
+    """How far Libation's in-flight download of a book is, 0-99, or None.
+    LibationCli prints nothing between 'Begin' and 'Completed'; the growing
+    file in its DownloadsInProgress folder, against the book's length, is the
+    only progress there is (the encrypted download is ~0.91 MB per minute)."""
+    if not asin:
+        return None
+    temp = os.path.join(os.environ.get("LOCALAPPDATA") or "", "Temp")
+    size = None
+    try:
+        for name in os.listdir(temp):
+            if not name.lower().startswith("libation"):
+                continue
+            d = os.path.join(temp, name, "DownloadsInProgress")
+            if not os.path.isdir(d):
+                continue
+            for f in os.listdir(d):
+                if f.upper().startswith(asin.upper() + "."):
+                    size = max(size or 0, os.path.getsize(os.path.join(d, f)))
+    except OSError:
+        return None
+    if size is None:
+        return None
+    mins = _libation_length_minutes(asin)
+    if not mins:
+        return None
+    return int(min(99, 100 * size / (mins * LIBATION_MB_PER_MIN * 1048576)))
+
+
+def _run_bat_once(bat, on_output=None, on_tick=None):
     """Run Update Audiobooks.bat --auto hidden; returns (rc, tail of its output).
     on_output, when given, receives each new chunk of the bat's output while it
-    runs (drives the live Discord progress message)."""
+    runs (drives the live Discord progress message); on_tick runs every couple
+    of seconds regardless of output (a download prints nothing while it runs)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     logf = os.path.join(data_dir(), "autobuy-bat.log")
     with open(logf, "ab") as f:
@@ -3299,6 +3951,11 @@ def _run_bat_once(bat, on_output=None):
                 break
             except subprocess.TimeoutExpired:
                 _drain()
+                if on_tick:
+                    try:
+                        on_tick()
+                    except Exception:   # noqa: BLE001 - progress sampling must never stop the run
+                        pass
                 if time.monotonic() > deadline:
                     p.kill()
                     rc = -1
@@ -3331,17 +3988,44 @@ def _run_update_audiobooks(job=None, delay=None):
             prog.feed(chunk)
             editor.push(prog.render())
 
+        def _on_tick():
+            # the book in flight: sample Libation's temp file for a per-book bar
+            if prog.phase == "download" and prog.current_asin and not prog.finished:
+                pct = _libation_download_pct(prog.current_asin)
+                if pct is not None and pct != prog.book_pct:
+                    prog.book_pct = pct
+                    editor.push(prog.render())
+
+        downloaded = None
         for attempt in range(1, BUY_BAT_RETRIES + 1):
             prog.attempt = attempt
-            rc, tail = _run_bat_once(bat, on_output=_on_output)
-            owned = _libation_owns(asin) if asin else None
+            rc, tail = _run_bat_once(bat, on_output=_on_output, on_tick=_on_tick)
+            # DOWNLOADED, not merely in the library: Audible's licence service
+            # can fail right after a purchase (29 Sep 2026) while the book
+            # already sits in Libation's list
+            got = (_libation_match(asin, job.get("series"), job.get("n"),
+                                   srs=_find(job.get("series_id")) if job.get("series_id") else None)
+                   if job else None)
+            if job and got is not None and not got["downloaded"]:
+                # the picker's own word: the ONE book it took for THIS series, now in
+                # Libation. Two picks for the series and it can't tell which was bought.
+                ours = [pid for pid, why in prog.picked_ids.items()
+                        if _series_key(why.split(" (")[0]) == _series_key(job.get("series"))]
+                if len(ours) == 1:
+                    m = _libation_match(ours[0])
+                    if m and m["downloaded"]:
+                        got = m
+            downloaded = None if got is None else got["downloaded"]
             held = " (some books HELD — see the bat log)" if rc == 2 else ""
+            said = {True: "yes", False: "not yet", None: "can't tell"}[downloaded]
             with _lock:
                 if job:
-                    _job_step(job, "bat", rc in (0, 2), f"attempt {attempt}: rc={rc}{held}; Libation has it: {owned}")
+                    _job_step(job, "bat", rc in (0, 2) and downloaded is not False,
+                              f"attempt {attempt}: rc={rc}{held}; downloaded: {said}")
                 save_state()
-            add_log(f"Update Audiobooks ran (rc={rc}){held}; Libation has {asin or 'n/a'}: {owned}")
-            if owned or owned is None or not job:
+            add_log(f"Update Audiobooks ran (rc={rc}){held}" +
+                    (f"; {job.get('series', '')} {job.get('n')} downloaded: {said}" if job else ""))
+            if downloaded or downloaded is None or not job:
                 break
             time.sleep(BUY_BAT_RETRY_GAP_S)
         prog.finished = True
@@ -3353,9 +4037,20 @@ def _run_update_audiobooks(job=None, delay=None):
             except Exception:
                 pass
         if job:
-            _release_card_line(job.get("series_id"), job.get("n"),
-                               "🗂️ filed into the library — complete ✔" if rc in (0, 2)
-                               else "❌ download/filing failed — see autobuy-bat.log", replace_last=True)
+            if downloaded is False:
+                line = "❌ bought, but Libation couldn't download it — see below"
+            elif rc in (0, 2):
+                line = "🗂️ filed into the library — complete ✔"
+            else:
+                line = "❌ download/filing failed — see autobuy-bat.log"
+            _release_card_line(job.get("series_id"), job.get("n"), line, replace_last=True)
+            if downloaded is False:
+                head = (f"⚠️ {job.get('series', '')} — book {job.get('n')} is bought, but Libation couldn't "
+                        f"download it after {BUY_BAT_RETRIES} tries (usually Audible's licence service right after "
+                        f"a purchase).")
+                _notify_with_button(head + " Try the download again:",
+                                    [("Download again", f"rr:download:{job['id']}")],
+                                    fallback=head + " Send `!download` later, or hit Liberate in Libation.")
         if editor.url:
             editor.push(prog.render(), force=True)      # the live message becomes the summary
         else:
@@ -3373,6 +4068,116 @@ def _run_update_audiobooks(job=None, delay=None):
 # token nothing starts.
 # ---------------------------------------------------------------------------
 _bot_state = {"running": False, "err": ""}
+_bot_channel = {"webhook": None, "id": None}
+
+
+def _bot_channel_id():
+    """The channel the webhook posts into - the bot posts there too, so buttons
+    land next to the rest of the radar's messages. A GET on the webhook URL
+    answers with its channel id; cached per webhook."""
+    wh = (get_settings().get("discord_webhook") or "").strip()
+    if not wh:
+        return None
+    if _bot_channel["webhook"] == wh and _bot_channel["id"]:
+        return _bot_channel["id"]
+    try:
+        with urlopen(Request(wh, headers={"User-Agent": APP_NAME}), timeout=10) as r:
+            cid = int(json.loads(r.read().decode("utf-8", "replace")).get("channel_id"))
+    except Exception as e:      # noqa: BLE001
+        add_log(f"Discord bot: couldn't look up the webhook's channel ({_no_secrets(str(e))})")
+        return None
+    _bot_channel.update(webhook=wh, id=cid)
+    return cid
+
+
+async def _bot_send(client, channel_id, text, buttons=()):
+    import discord
+    ch = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+    view = None
+    if buttons:
+        view = discord.ui.View(timeout=None)
+        for label, cid in buttons:
+            view.add_item(discord.ui.Button(label=label, custom_id=cid, style=discord.ButtonStyle.primary))
+    await ch.send(text[:1900], view=view)
+
+
+def _bot_post(text, buttons=()):
+    """Post as the BOT - a webhook message can't carry a button anyone can
+    click. Blocking: call from a worker thread, never from the bot's own loop.
+    True when it was sent."""
+    import asyncio
+    client, loop = _bot_state.get("client"), _bot_state.get("loop")
+    if not (_bot_state.get("running") and client and loop):
+        return False
+    ch_id = _bot_channel_id()
+    if not ch_id:
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(_bot_send(client, ch_id, text, buttons), loop).result(timeout=20)
+        return True
+    except Exception as e:      # noqa: BLE001
+        add_log(f"Discord bot post failed: {_no_secrets(str(e))}")
+        return False
+
+
+def _notify_with_button(text, buttons, fallback):
+    """The message with its buttons via the bot, or the plain fallback text via
+    the webhook when the bot isn't available. Fire-and-forget."""
+    def _go():
+        try:
+            if not _bot_post(text, buttons):
+                _discord_notify(fallback)
+        except Exception as e:  # noqa: BLE001
+            add_log(f"Discord notify error: {e}")
+    threading.Thread(target=_go, daemon=True).start()
+
+
+def handle_bot_button(custom_id, who="discord"):
+    """A button press ('rr:<action>:<arg>') -> reply text. Pure dispatch, like
+    the ! commands, so it is testable without Discord."""
+    parts = (custom_id or "").split(":")
+    if len(parts) == 3 and parts[0] == "rr" and parts[1] == "retry":
+        with _lock:
+            job = _buy_job_by_id(parts[2])
+            if not job:
+                return "that purchase job no longer exists."
+            if job.get("status") not in BUY_RETRYABLE:
+                return f"nothing to retry — {job.get('series', '?')} #{job.get('n')} is {job.get('status')} now."
+            _buy_retry(job, who=f"Discord ({who})")
+            save_state()
+        return (f"\U0001f501 checking Amazon again for {job.get('series', '?')} #{job.get('n')} — "
+                "if you're signed in, it carries on by itself.")
+    if len(parts) == 3 and parts[0] == "rr" and parts[1] == "download":
+        with _lock:
+            job = _buy_job_by_id(parts[2])
+        if not _bat_path():
+            return "Update Audiobooks.bat not found — set its path in Settings."
+        _run_update_audiobooks(job, delay=0)
+        return "\U0001f4e6 running Update Audiobooks again (tracked series only) — progress appears here."
+    return "that button isn't one of mine."
+
+
+async def _bot_announce_parked(client):
+    """Jobs parked for a sign-in without a button yet (posted while the bot was
+    offline, or before buttons existed) get one when the bot connects."""
+    import asyncio
+    with _lock:
+        jobs = [j for j in _state.get("buy_jobs", [])
+                if j.get("status") == "needs_signin" and not j.get("signin_button_at")]
+    if not jobs:
+        return
+    ch_id = await asyncio.get_running_loop().run_in_executor(None, _bot_channel_id)
+    if not ch_id:
+        return
+    for j in jobs:
+        await _bot_send(client, ch_id,
+                        f"\U0001f511 Still waiting on an Amazon sign-in to buy {j.get('series', '?')} — book {j.get('n')}. "
+                        "Sign in on the PC, then hit the button.",
+                        [("I've signed in — retry now", f"rr:retry:{j['id']}")])
+        with _lock:
+            j["signin_button_at"] = _buy_now()
+    with _lock:
+        save_state()
 
 
 def _bot_invite_url():
@@ -3445,6 +4250,7 @@ def handle_bot_command(text):
                 "`!jobs` - purchase jobs\n"
                 "`!buy <series> [book#]` - price-check a book's audiobook (asks before buying)\n"
                 "`!approve [series]` / `!deny [series]` - decide a waiting purchase\n"
+                "`!retry [series]` - re-check a stopped purchase now (e.g. after signing back in to Amazon)\n"
                 "`!download` - run Update Audiobooks now\n"
                 "`!research <series>` - AI web-research on the next book\n"
                 "`!holds` - books the filer couldn't place")
@@ -3478,6 +4284,12 @@ def handle_bot_command(text):
             _buy_approve(job, who="discord")
             save_state()
         return f"\u2705 approved: {_bot_fmt_job(job)} \u2014 buying now."
+
+    if cmd == "retry":
+        job, err = _bot_find_job(arg, BUY_RETRYABLE)
+        if err:
+            return err
+        return handle_bot_button(f"rr:retry:{job['id']}", who="!retry")
 
     if cmd == "deny":
         job, err = _bot_find_job(arg, ("awaiting_approval", "retry_later", "probing", "waiting_offer"))
@@ -3549,8 +4361,31 @@ def _start_discord_bot():
 
         @client.event
         async def on_ready():
-            _bot_state.update(running=True, err="")
+            _bot_state.update(running=True, err="", client=client, loop=asyncio.get_running_loop())
             add_log(f"Discord bot online as {client.user}")
+            try:
+                await _bot_announce_parked(client)
+            except Exception as e:      # noqa: BLE001
+                add_log(f"Discord bot: couldn't post retry buttons ({_no_secrets(str(e))})")
+
+        @client.event
+        async def on_interaction(interaction):
+            # button presses; handled here rather than by View callbacks so a
+            # button still works after the app restarts
+            cid = (getattr(interaction, "data", None) or {}).get("custom_id") or ""
+            if not cid.startswith("rr:"):
+                return
+            try:
+                reply = await asyncio.get_running_loop().run_in_executor(
+                    None, handle_bot_button, cid, str(interaction.user))
+            except Exception as e:      # noqa: BLE001
+                reply = f"error: {e}"
+            try:
+                base = interaction.message.content if interaction.message else ""
+                await interaction.response.edit_message(content=(base + f"\n→ {reply}")[:1990], view=None)
+            except Exception:           # noqa: BLE001
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(reply[:1900])
 
         @client.event
         async def on_message(message):
@@ -3711,7 +4546,7 @@ def _libation_asin_set():
     if not d:
         return set()
     try:
-        con = sqlite3.connect(f"file:{os.path.join(d, 'LibationContext.db')}?mode=ro", uri=True, timeout=2)
+        con = sqlite3.connect(_libation_ro_uri(d), uri=True, timeout=2)
         try:
             rows = con.execute("select AudibleProductId from Books").fetchall()
         finally:
@@ -3854,13 +4689,16 @@ def _abs_resolve_base(u, t):
     return u                     # let the caller fail loudly with the pasted value
 
 
-def _abs_req(path, method="GET", timeout=15):
+def _abs_req(path, method="GET", timeout=15, payload=None):
     u, t = _abs_conf()
     if not u:
         return None
-    req = Request(u + path, method=method,
-                  headers={"Authorization": f"Bearer {t}", "Accept": "application/json",
-                           "User-Agent": APP_NAME})
+    headers = {"Authorization": f"Bearer {t}", "Accept": "application/json", "User-Agent": APP_NAME}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = Request(u + path, data=data, method=method, headers=headers)
     with urlopen(req, timeout=timeout) as resp:
         raw = resp.read()
     try:
@@ -3954,6 +4792,45 @@ def _abs_refresh_progress(force=False):
         _abs_cache["err"] = str(e)
 
 
+def _abs_short_date(iso, today_iso):
+    try:
+        d = date.fromisoformat(str(iso)[:10])
+    except (TypeError, ValueError):
+        return str(iso or "")
+    s = f"{d.day} {d.strftime('%b')}"
+    return s if str(today_iso)[:4] == str(d.year) else f"{s} {d.year}"
+
+
+def _abs_status_line(v, today_iso=None):
+    """ONE plain fact the radar knows that Audiobookshelf doesn't, for a
+    series view, or "" when there is nothing to add: an overdue audiobook
+    (and by how much), else the next dated release, else the estimate still
+    ahead. No emoji, no listening progress (that is ABS's own data). The same
+    words as the extension's overlay chip (abs.js rrAbsChipText)."""
+    t = today_iso or today().isoformat()
+    n = f" {v.get('predicted_book_n')}" if v.get("predicted_book_n") is not None else ""
+    est = v.get("predicted_date") or None
+    if est and est < t:
+        try:
+            late = (date.fromisoformat(t) - date.fromisoformat(est[:10])).days
+        except ValueError:
+            late = 0
+        return f"Audio{n} overdue by {late} day{'' if late == 1 else 's'}"
+    dated = v.get("next_date") if (v.get("next_date") and not v.get("next_estimate") and v["next_date"] >= t) else None
+    # audio facts first - this is an audiobook player; a novel date only when
+    # the radar has no audio projection at all
+    if dated and v.get("next_kind") == "audiobook":
+        return f"Audiobook {_abs_short_date(dated, t)}"
+    if est:
+        return f"Audio{n} est. {_abs_short_date(est, t)}"
+    if v.get("next_est_date") and v["next_est_date"] >= t:
+        m = f" {v.get('next_est_book_n')}" if v.get("next_est_book_n") is not None else ""
+        return f"Audio{m} est. {_abs_short_date(v['next_est_date'], t)}"
+    if dated:
+        return f"{'Novel' if v.get('next_kind') == 'novel' else 'Next'} {_abs_short_date(dated, t)}"
+    return ""
+
+
 def _abs_listening_for(series_name):
     try:
         import file_audiobooks as _fa
@@ -3961,6 +4838,165 @@ def _abs_listening_for(series_name):
     except Exception:
         key = (series_name or "").lower()
     return _abs_cache["series"].get(key)
+
+
+# ---- the radar's line INSIDE Audiobookshelf ---------------------------------
+# ABS keeps a per-series description (PATCH /api/series/:id) that none of its
+# clients show yet (11 Oct 2026: the web client is being rewritten in React
+# and frontend pull requests are paused). It is the official, scan-proof home
+# for one line like "Audio 2 overdue by 10 days": the server stores it
+# untouched across its updates, the user's patched phone app shows it under the
+# series name, and any future client can. A description the radar did not
+# write is never touched; a line the radar wrote is removed again the moment
+# there is nothing to say.
+ABS_SYNC_TTL_S = 3600
+
+
+def _abs_series_listing():
+    """[{id, name, description}] for every series in the book library."""
+    lid = _abs_library_id()
+    if not lid:
+        return []
+    out, page = [], 0
+    while True:
+        d = _abs_req(f"/api/libraries/{lid}/series?limit=500&page={page}&minified=1") or {}
+        res = d.get("results") or []
+        out.extend({"id": r.get("id"), "name": r.get("name") or "", "description": r.get("description") or ""}
+                   for r in res if r.get("id"))
+        page += 1
+        if not res or len(out) >= (d.get("total") or 0) or page > 20:
+            break
+    return out
+
+
+def _abs_status_plan(views, listing, written, today_iso=None):
+    """Pure. views: the radar's series views; listing: _abs_series_listing();
+    written: {ABS series id: {"text": ...}} the radar put there before.
+    -> (writes [(id, name, text)], clears [(id, name)], foreign [(id, name)])
+    foreign = a tracked series whose ABS description holds someone else's words."""
+    by_key = {}
+    for a in listing:
+        by_key.setdefault(_series_key(a["name"]), a)
+
+    def find(name):
+        key = _series_key(name)
+        if not key:
+            return None
+        if key in by_key:
+            return by_key[key]
+        # ABS names a series differently ("Stormweaver Series" for "Warformed:
+        # Stormweaver"): one name inside the other, when that leaves exactly one
+        near = [a for k, a in by_key.items() if len(k) >= 6 and (k in key or key in k)]
+        return near[0] if len(near) == 1 else None
+
+    want = {}
+    for v in views:
+        a = find(v.get("name"))
+        if not a:
+            continue
+        line = _abs_status_line(v, today_iso)
+        if line:
+            want[a["id"]] = (a, line)
+    writes, clears, foreign = [], [], []
+    for sid, (a, line) in want.items():
+        cur = a.get("description") or ""
+        ours = (written.get(sid) or {}).get("text") or ""
+        if cur == line:
+            continue
+        if cur and cur != ours:
+            foreign.append((sid, a["name"]))
+            continue
+        writes.append((sid, a["name"], line))
+    for sid, rec in written.items():
+        if sid in want:
+            continue
+        a = next((x for x in listing if x["id"] == sid), None)
+        if a is not None and (a.get("description") or "") == (rec.get("text") or "") and rec.get("text"):
+            clears.append((sid, a["name"]))
+    return writes, clears, foreign
+
+
+def _abs_sync_status(force=False):
+    """Hourly (or on demand): put the radar's line in each tracked series'
+    Audiobookshelf description, refresh it when it changes, remove it when
+    there is nothing to say. Returns the counts, or None when it didn't run."""
+    if not get_settings().get("abs_write_status", True):
+        return None
+    now = time.monotonic()
+    if not force and now - _abs_cache.get("sync_at", 0.0) < ABS_SYNC_TTL_S:
+        return None
+    _abs_cache["sync_at"] = now
+    u, _t = _abs_conf()
+    if not u:
+        return None
+    try:
+        listing = _abs_series_listing()
+    except Exception as e:      # noqa: BLE001
+        _abs_cache["err"] = str(e)
+        return None
+    with _lock:
+        views = [series_view(s) for s in _state.get("series", [])]
+        written = dict(_state.get("abs_written") or {})
+    writes, clears, foreign = _abs_status_plan(views, listing, written)
+    done = {"written": 0, "cleared": 0, "left_alone": len(foreign), "failed": 0}
+    for sid, name, text in writes:
+        try:
+            _abs_req(f"/api/series/{sid}", method="PATCH", payload={"description": text})
+            written[sid] = {"text": text, "name": name, "at": datetime.now().isoformat(timespec="seconds")}
+            add_log(f"Audiobookshelf: {name} — \"{text}\"")
+            done["written"] += 1
+        except Exception as e:  # noqa: BLE001
+            done["failed"] += 1
+            _abs_cache["err"] = str(e)
+    for sid, name in clears:
+        try:
+            _abs_req(f"/api/series/{sid}", method="PATCH", payload={"description": ""})
+            written.pop(sid, None)
+            add_log(f"Audiobookshelf: {name} — nothing to add now, line removed")
+            done["cleared"] += 1
+        except Exception as e:  # noqa: BLE001
+            done["failed"] += 1
+            _abs_cache["err"] = str(e)
+    # forget records for series ABS no longer has, or whose words are no longer ours
+    just_wrote = {w[0] for w in writes}
+    for sid in list(written):
+        if sid in just_wrote:
+            continue
+        a = next((x for x in listing if x["id"] == sid), None)
+        if a is None or (a.get("description") or "") != (written[sid].get("text") or ""):
+            written.pop(sid, None)
+    with _lock:
+        _state["abs_written"] = written
+        save_state()
+    return done
+
+
+@app.post("/api/abs/sync-now")
+def api_abs_sync_now():
+    """The Settings button: write the radar's lines into Audiobookshelf now."""
+    u, _t = _abs_conf()
+    if not u:
+        return jsonify({"ok": False, "error": "Audiobookshelf URL and token are not set"}), 400
+    if not get_settings().get("abs_write_status", True):
+        return jsonify({"ok": False, "error": "writing to Audiobookshelf is switched off"}), 400
+    done = _abs_sync_status(force=True) or {}
+    return jsonify({"ok": True, **done, "err": _abs_cache.get("err")})
+
+
+def _abs_clear_status():
+    """Take every line the radar wrote back out (the setting was turned off)."""
+    with _lock:
+        written = dict(_state.get("abs_written") or {})
+    for sid, rec in written.items():
+        try:
+            _abs_req(f"/api/series/{sid}", method="PATCH", payload={"description": ""})
+        except Exception as e:  # noqa: BLE001
+            _abs_cache["err"] = str(e)
+    with _lock:
+        _state["abs_written"] = {}
+        save_state()
+    if written:
+        add_log(f"Audiobookshelf: removed the radar's line from {len(written)} series")
 
 
 
@@ -3973,9 +5009,66 @@ def _abs_listening_for(series_name):
 AI_INTEL_TTL_DAYS = 14          # re-research a series at most this often
 AI_DAILY_MAX = 3                # automatic research calls per day (cost bound)
 AI_TIMEOUT_S = 120
+AI_AUTH_CACHE_S = 3600          # a CLI sign-in check stays trusted this long
+AI_EFFORT = "max"               # a few calls a night; thoroughness is the whole point
+AI_FAIL_NIGHTS_ALERT = 2        # whole batches failing this many nights running -> a person
+
+# One headless CLI at a time. Three parallel runs raced to refresh the same
+# OAuth token on 11 Sep 2026; the refresh rotates the token, the losers hit the
+# server with a stale one and the CLI signed itself out for good - four silent
+# nights of "OAuth session expired and could not be refreshed".
+_ai_cli_lock = threading.Lock()
+_ai_cli_auth = {"ok": None, "at": 0.0}
+_ai_worker_busy = False
+_ai_worker_since = 0.0
+AI_HUNG_S = 1800                # a batch older than this is stuck: say so (the CLI timeouts should make it impossible)
+
+AI_AUTH_WHAT = ("AI research is down: the Claude Code CLI on this PC is signed out, "
+                "so the nightly series research can't run.")
+AI_AUTH_DETAIL = ("On the PC, open a terminal and run `claude auth login` — or run `claude setup-token` "
+                  "and paste the token into Settings → Integrations → AI key. Research resumes by itself.")
+AI_AUTH_HINT = ("the Claude Code CLI is signed out on this PC — run `claude auth login` in a terminal "
+                "(or paste a `claude setup-token` token in Settings), then try again")
+# the same failure class for the API providers is a bad key, not a sign-out
+AI_KEY_WHAT = "AI research is down: the {prov} API rejected the key."
+AI_KEY_DETAIL = "Paste a valid key in Settings → Integrations → AI key."
+AI_KEY_HINT = "the {prov} API rejected the key — paste a valid one in Settings → Integrations, then try again"
+_SHIM_EXT = (".cmd", ".bat", ".ps1")
+
+
+def _ai_cli_exe():
+    """The real claude executable. npm installs a claude.cmd shim on Windows;
+    running that goes through cmd.exe, which ends the command line at the first
+    newline of the (multi-line) prompt - every flag and the JSON instructions
+    were silently dropped for weeks (the 7 Sep 2026 'permission' apology).
+    Resolve the binary the shim points at; if that fails, hand the shim back so
+    the UI still says 'configured' and _ai_call can explain the refusal."""
+    import shutil as _sh
+    exe = _sh.which("claude")
+    if not exe or os.path.splitext(exe)[1].lower() not in _SHIM_EXT:
+        return exe
+    for cand in (os.path.join(os.path.dirname(exe), "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+                 os.path.join(os.path.expanduser("~"), ".local", "bin", "claude.exe")):
+        if os.path.isfile(cand):
+            return cand
+    return exe
+
+
+def _ai_env(conf):
+    """Child environment for the CLI: ours minus every Claude Code / Anthropic
+    session variable. Started from a Claude Code session, the app would pass
+    CLAUDECODE / CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH etc. down, and the CLI then
+    hands its OAuth refresh to a 'host' that doesn't exist; an ANTHROPIC_API_KEY
+    would silently bill the API instead of the subscription. A configured
+    long-lived token goes in explicitly."""
+    env = {k: v for k, v in os.environ.items()
+           if not (k.upper().startswith(("CLAUDE", "ANTHROPIC")) or k.upper() in ("TRACEPARENT", "TRACESTATE"))}
+    if conf.get("token"):
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = conf["token"]
+    return env
 
 AI_DEFAULT_MODELS = {
-    "claude-code": "sonnet",       # headless Claude Code: plan-usage friendly default
+    "claude-code": "opus",         # a few calls a night, and the answer's quality is the whole point
     "anthropic": "claude-opus-5",
     "openrouter": "perplexity/sonar",
     "openai": "gpt-5-mini",
@@ -3992,12 +5085,12 @@ def _ai_conf():
     if prov == "claude-code":
         # runs the local Claude Code CLI under someone's own subscription login -
         # no API key involved; configured iff the CLI is installed
-        import shutil as _sh
-        exe = _sh.which("claude")
+        exe = _ai_cli_exe()
         if not exe:
             return None
         model = (st.get("ai_model") or "").strip() or AI_DEFAULT_MODELS["claude-code"]
-        return {"provider": prov, "key": "", "model": model, "exe": exe}
+        # the key field doubles as an optional long-lived token (`claude setup-token`)
+        return {"provider": prov, "key": "", "token": key, "model": model, "exe": exe}
     if not key:
         return None
     model = (st.get("ai_model") or "").strip() or AI_DEFAULT_MODELS.get(prov, "")
@@ -4011,6 +5104,49 @@ def _ai_http(url, payload, headers):
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
+def _ai_error_kind(msg):
+    """auth = a person must sign the CLI in again; limit = wait; other."""
+    m = (msg or "").lower()
+    if re.search(r"authenticat|oauth|logged in|log in|login|sign in|signed in|credential|\b401\b|\b403\b", m):
+        return "auth"
+    if re.search(r"usage limit|rate limit|\b429\b|overloaded|too many requests|quota", m):
+        return "limit"
+    return "other"
+
+
+def _ai_cli_logged_in(force=False):
+    """Cheap pre-flight (no model call): is the Claude Code CLI signed in?
+    True/False, or None when it can't tell (old CLI, timeout)."""
+    conf = _ai_conf()
+    if not conf or conf["provider"] != "claude-code":
+        return None
+    if conf.get("token"):
+        # A long-lived token bypasses the CLI's own session, and `auth status`
+        # can't vouch for it - only a real call can. Unknown, not "signed in":
+        # otherwise a bad token would be cleared as fixed five minutes after
+        # every failure.
+        return None
+    now = time.time()
+    if not force and _ai_cli_auth["at"] and now - _ai_cli_auth["at"] < AI_AUTH_CACHE_S:
+        return _ai_cli_auth["ok"]
+    if not _ai_cli_lock.acquire(timeout=5):
+        return None                     # a research call is running: can't tell, don't wait
+    ok = None
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        r = subprocess.run([conf["exe"], "auth", "status", "--json"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=60, cwd=data_dir(), creationflags=flags, stdin=subprocess.DEVNULL,
+                           env=_ai_env(conf))
+        ok = bool(json.loads(r.stdout or "{}").get("loggedIn"))   # exit code is 1 when signed out
+    except Exception:                                             # noqa: BLE001
+        ok = None
+    finally:
+        _ai_cli_lock.release()
+    _ai_cli_auth.update({"ok": ok, "at": now})
+    return ok
+
+
 def _ai_call(prompt):
     """One web-search-capable completion; returns the model's text or raises."""
     conf = _ai_conf()
@@ -4021,14 +5157,26 @@ def _ai_call(prompt):
         # Headless Claude Code with web search, billed to the subscription the
         # CLI is logged into (usage limits apply; a maxed-out window errors).
         # Run from data_dir so it never picks up a project's CLAUDE.md context.
+        # The tool set is pinned to web search/fetch (no shell, files or MCP
+        # servers), which is what makes skipping the permission prompts safe:
+        # in print mode an unapproved tool is silently denied and the model
+        # then answers with a "permission hasn't come through" apology instead
+        # of research (7 Sep 2026). One CLI at a time - see _ai_cli_lock.
+        if os.path.splitext(conf["exe"])[1].lower() in _SHIM_EXT:
+            raise RuntimeError("only the npm claude.cmd shim was found and it mangles multi-line "
+                               "prompts — reinstall the Claude Code CLI")
+        env = _ai_env(conf)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        r = subprocess.run(
-            [conf["exe"], "-p", prompt, "--model", model,
-             "--tools", "WebSearch", "WebFetch",
-             "--allowedTools", "WebSearch", "WebFetch"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=max(AI_TIMEOUT_S, 240), cwd=data_dir(), creationflags=flags,
-            stdin=subprocess.DEVNULL)
+        with _ai_cli_lock:
+            r = subprocess.run(
+                [conf["exe"], "-p", prompt, "--model", model,
+                 "--tools", "WebSearch", "WebFetch",
+                 "--allowedTools", "WebSearch", "WebFetch",
+                 "--permission-mode", "bypassPermissions", "--allow-dangerously-skip-permissions",
+                 "--strict-mcp-config", "--effort", AI_EFFORT],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=max(AI_TIMEOUT_S, 240), cwd=data_dir(), creationflags=flags,
+                stdin=subprocess.DEVNULL, env=env)
         if r.returncode != 0:
             raise RuntimeError(f"claude CLI failed ({r.returncode}): "
                                f"{(r.stderr or r.stdout or '').strip()[:200] or 'no output'}")
@@ -4069,26 +5217,153 @@ def _ai_call(prompt):
     return ((d.get("choices") or [{}])[0].get("message") or {}).get("content", "")
 
 
-def _ai_prompt_for(srs):
+def _ai_prompt_for(srs, missed=None):
     tl = sorted([e for e in srs.get("timeline", []) if _entry_n(e) is not None],
                 key=lambda e: _entry_n(e))
     hist = "; ".join(f"book {_entry_n(e)}: novel {e.get('novel') or '?'}"
                      + (f", audio {e.get('audiobook')}" if e.get("audiobook") else "")
                      for e in tl[-5:])
+    focus = ""
+    if missed:
+        focus = (f"Based on the author's usual pace, book {(srs.get('novel_n') or 0) + 1} was expected around "
+                 f"{missed.isoformat()} and has not appeared - find out why and when it is now expected.\n")
+    # the specific gaps in the data are the questions - "research this series"
+    # came back as a restatement of the Amazon listings we already had
+    questions = []
+    novels = [e for e in tl if parse_date(e.get("novel"))]
+    if novels:
+        last = novels[-1]
+        if parse_date(last["novel"]) <= today():
+            questions.append(f"novel {_entry_n(last) + 1}: nothing known - when?")
+        else:
+            questions.append(f"anything announced beyond book {_entry_n(last)} (due {last['novel']})?")
+    if any(e.get("audiobook") for e in tl):
+        undated = [str(_entry_n(e)) for e in tl if e.get("novel") and not e.get("audiobook")]
+        if undated:
+            questions.append(f"audiobook{'s' if len(undated) > 1 else ''} for book{'s' if len(undated) > 1 else ''} "
+                             f"{', '.join(undated)}: no date known - what has the author or the studio said?")
+    if questions:
+        focus += "Open questions, in order of importance: " + " / ".join(questions) + "\n"
+    author = re.sub(r"^by\s+", "", srs.get("author") or "", flags=re.I) or "unknown author"
+    name = srs.get("name", "")
+    searches = (f'"{author} {name} audiobook", "{name} book {(_entry_n(novels[-1]) + 1) if novels else "next"} release", '
+                f'"site:reddit.com {name} audiobook", "site:royalroad.com {name} author note", "{author} patreon {name}"')
+    # links the user keeps in the series notes (its Royal Road page, Patreon, a
+    # Discord announcement mirror) are the author's own places: read them first
+    links = re.findall(r"https?://\S+", srs.get("notes") or "")
+    if links:
+        focus += "Read these pages FIRST, they are the author's own: " + " ".join(links[:4]) + "\n"
+    # what the browser extension harvested from Royal Road (the research tool
+    # itself gets a 403 there): the author's announcements, notes and replies
+    rr = srs.get("rr_notes") or {}
+    if rr.get("items"):
+        lines, size = [], 0
+        for it in sorted(rr["items"], key=lambda i: i.get("date") or "", reverse=True):
+            line = f"[{(it.get('date') or '')[:10]} · {it.get('chapter', '')[:60]} · {it.get('kind', '')}] {it.get('text', '')[:700]}"
+            if size + len(line) > 3500:
+                break
+            lines.append(line)
+            size += len(line)
+        focus += ("The author's own words on Royal Road, collected by the browser (newest first) - timing stated "
+                  "here is authoritative, quote it in 'said':\n" + "\n".join(lines) + "\n")
+    # Schedule-only brief. The first version asked for "1-2 factual sentences"
+    # and got trivia back (where the series is serialised, what it is about);
+    # the user wants what he'd find himself: the author's own words on WHEN -
+    # "book 10 in November, then 11-13 back to back" - with the source.
     return (
-        f"Research the book series '{srs.get('name', '')}' by {srs.get('author') or 'unknown author'} "
-        f"(LitRPG/progression fantasy, sold on Amazon/Audible/Royal Road).\n"
-        f"Known release history (may be incomplete): {hist or 'none recorded'}.\n"
-        f"Today is {today().isoformat()}.\n\n"
-        "Search the web for CURRENT information: has the author announced the next book or its audiobook, "
-        "is the series complete, on hiatus, or cancelled? Author newsletters, Patreon, Reddit "
-        "(r/litrpg, r/ProgressionFantasy), publisher (Aethon) announcements and Amazon pre-order pages are good sources.\n\n"
-        "Answer with ONLY a JSON object, no other text:\n"
+        f"You research release dates for ONE book series. Find what the AUTHOR or PUBLISHER has said about "
+        f"WHEN the next books come out - novels and audiobooks. Nothing else matters: no plot, no trivia "
+        f"(where it is serialised, Kindle Unlimited, awards, narrators), nothing about books already out.\n"
+        f"Series: '{name}' by {author}. "
+        f"Already known - do NOT repeat any of it, a pre-order listed here is not news: "
+        f"{hist or 'nothing recorded'}. Today is {today().isoformat()}.\n{focus}"
+        f"Run at least four different searches before answering, such as: {searches}. "
+        "Then READ pages, don't stop at search snippets: on Royal Road open the fiction's newest chapters - "
+        "the author's note and the author's own replies in the chapter COMMENTS are where 'book 10 is with "
+        "the narrator, out in November' gets said. Also the author's Patreon posts, their Discord or Reddit "
+        "posts (r/litrpg, r/ProgressionFantasy), their newsletter or website, and studio/publisher announcements "
+        "(Aethon, Podium, Soundbooth, Tantor). An Amazon or Audible listing alone is not an answer. "
+        "Prefer the author's own words and note WHEN they said it. A plan like 'book 10 in November, then "
+        "11 to 13 back to back' is exactly what is wanted - give each book its own entry, with the month. "
+        "If all you find is progress (drafting, chapters going up on Patreon), report that as the summary "
+        "with its month and give no dated entries. Found nothing beyond what is already known? Then "
+        "releases is [] and the summary is exactly \"no release news found\" - never fill the space with "
+        "the series' history or where it is published.\n\n"
+        "Answer with ONLY this JSON, no other text, no padding:\n"
         '{"status": "ongoing|completed|hiatus|cancelled|unknown",\n'
-        ' "next_book": {"n": <number or null>, "kind": "novel|audiobook|null", "expected": "<date or timeframe or null>"},\n'
-        ' "summary": "<1-2 factual sentences, cite where the information came from>",\n'
+        ' "releases": [{"n": <book number>, "kind": "novel|audiobook", '
+        '"expected": "<YYYY-MM-DD, or YYYY-MM, or \\"early 2027\\" / \\"Q1 2027\\" / \\"spring 2027\\">", '
+        '"said": "<their words, max 15 words>", "source": "<who, where, when - e.g. author on Patreon, Sep 2026>"}],\n'
+        ' "royalroad": "<the fiction\'s Royal Road URL if you came across it, else null>",\n'
+        ' "summary": "<ONE sentence, max 25 words, release timing only; exactly \\"no release news found\\" if there is none>",\n'
         ' "confidence": "high|medium|low"}'
     )
+
+
+_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+_PART_DAY = {"early": 5, "mid": 15, "late": 25}
+_SEASON_MONTH = {"spring": 4, "summer": 7, "autumn": 10, "fall": 10, "winter": 1}
+
+
+def _intel_parse_when(text):
+    """An author's 'when' as (ISO date, precision) or None. Vague forms land on
+    a representative day - the 15th of a month, the middle of a quarter or
+    season, mid-year - and the precision says how much to trust the day."""
+    t = re.sub(r"[,.]", " ", (text or "").strip().lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t or t in ("null", "none", "tba", "tbd", "tbc", "unknown", "unannounced"):
+        return None
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", t)
+    if m:
+        return (t, "day") if parse_date(t) else None
+    m = re.fullmatch(r"(\d{4})-(\d{2})", t)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return f"{m.group(1)}-{m.group(2)}-15", "month"
+    if re.fullmatch(r"\d{4}-\d{2}(?:-\d{2})?", t):
+        return None                                   # ISO-shaped but not a date (2026-13)
+    m = re.search(r"\b(?:(early|mid|late)[- ])?([a-z]+) (\d{4})\b", t)
+    if m and m.group(2)[:3] in _MONTHS and (len(m.group(2)) <= 3 or m.group(2).startswith(("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december", "sept"))):
+        return f"{m.group(3)}-{_MONTHS[m.group(2)[:3]]:02d}-{_PART_DAY.get(m.group(1), 15):02d}", "month"
+    m = re.search(r"\bq([1-4]) (\d{4})\b", t)
+    if m:
+        return f"{m.group(2)}-{int(m.group(1)) * 3 - 1:02d}-15", "quarter"
+    m = re.search(r"\bh([12]) (\d{4})\b", t)
+    if m:
+        return (f"{m.group(2)}-03-31", "half") if m.group(1) == "1" else (f"{m.group(2)}-09-30", "half")
+    m = re.search(r"\b(spring|summer|autumn|fall|winter) (?:of )?(\d{4})\b", t)
+    if m:
+        return f"{m.group(2)}-{_SEASON_MONTH[m.group(1)]:02d}-15", "season"
+    m = re.search(r"\b(?:(early|mid|late)[- ])?(\d{4})\b", t)
+    if m:
+        day = {"early": "02-15", "mid": "06-30", "late": "11-15"}.get(m.group(1), "07-01")
+        return f"{m.group(2)}-{day}", "year"
+    return None
+
+
+def _intel_apply(srs, intel):
+    """Store each author-stated date on the series ('kind:n' -> record) so the
+    estimates use it. A book that already has a real date is left alone.
+    Returns the entries applied, for the log."""
+    now = _buy_now()
+    tl = srs.get("timeline") or []
+    out = srs.setdefault("intel_dates", {})
+    applied = []
+    rr = (intel.get("royalroad") or "").strip()
+    if rr.startswith("https://www.royalroad.com/fiction/") and not srs.get("rr_url"):
+        srs["rr_url"] = rr                           # next time the browser reads the author's notes first
+    for r in intel.get("releases") or []:
+        n, kind = r.get("n"), r.get("kind")
+        if n is None or kind not in ("novel", "audiobook"):
+            continue
+        when = _intel_parse_when(r.get("expected"))
+        if not when:
+            continue
+        if any(_entry_n(e) == n and e.get(kind) for e in tl):
+            continue                                  # the store already dated it
+        out[f"{kind}:{n}"] = {"date": when[0], "precision": when[1], "expected": r.get("expected") or "",
+                              "said": r.get("said") or "", "source": r.get("source") or "", "at": now}
+        applied.append(f"{kind} {n} ~{r.get('expected')}")
+    return applied
 
 
 def _ai_parse(text):
@@ -4101,85 +5376,281 @@ def _ai_parse(text):
         return None
     if not isinstance(d, dict) or "status" not in d:
         return None
+
+    def _s(v, cap):
+        return "" if v is None or str(v).strip().lower() in ("", "null", "none") else str(v).strip()[:cap]
+
+    releases = []
+    for r in (d.get("releases") or []) if isinstance(d.get("releases"), list) else []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            n = int(r.get("n"))
+        except (TypeError, ValueError):
+            n = None
+        kind = _s(r.get("kind"), 12).lower()
+        releases.append({"n": n, "kind": "audiobook" if kind.startswith("audio") else ("novel" if kind.startswith("novel") else kind),
+                         "expected": _s(r.get("expected"), 60), "said": _s(r.get("said"), 160), "source": _s(r.get("source"), 120)})
     return {"status": str(d.get("status", "unknown"))[:12],
-            "next_book": d.get("next_book") if isinstance(d.get("next_book"), dict) else None,
-            "summary": str(d.get("summary", ""))[:400],
+            "releases": releases,
+            "royalroad": _s(d.get("royalroad"), 200),
+            "summary": _s(d.get("summary"), 200),
             "confidence": str(d.get("confidence", ""))[:8]}
 
 
-def _ai_research_series(sid, manual=False):
+def _ai_intel_line(intel):
+    """One line for the activity log: the dated entries, else the summary."""
+    rel = [f"{r['kind']} {r['n']} ~{r['expected']}" + (f" ({r['source']})" if r.get("source") else "")
+           for r in intel.get("releases") or [] if r.get("expected")]
+    main = "; ".join(rel) or intel.get("summary") or ""
+    if not main or main.lower().startswith("no release news"):
+        main = "no release news found"
+    st = intel.get("status")
+    return f"series {st}: {main}" if st in ("completed", "hiatus", "cancelled") else main
+
+
+def _ai_research_series(sid, manual=False, why=None):
     """Run one research pass for a series; stores the result on the series and
-    pings Discord when the picture changed. Returns (ok, message)."""
+    pings Discord when the picture changed - always, when the pass was
+    triggered by a missed estimate (why="overdue"). Returns (ok, message)."""
     if not _ai_conf():
         return False, "no AI key configured (Settings \u2192 Integrations)"
     with _lock:
         srs = _find(sid)
         if not srs:
             return False, "unknown series"
-        prompt = _ai_prompt_for(srs)
+        missed = predicted_novel_date(srs) if why == "overdue" else None
+        n_next = (srs.get("novel_n") or 0) + 1
+        prompt = _ai_prompt_for(srs, missed=missed)
         old = (srs.get("intel") or {}).get("status")
         name = srs.get("name", "")
     try:
         raw = _ai_call(prompt)
     except Exception as e:      # noqa: BLE001 - HTTP/auth/parse all end up here
         add_log(f"AI research failed for {name}: {e}")
+        if not manual:
+            _ai_mark_tried(sid)             # a hand-triggered try spent no budget: keep tonight's slot
+        kind = _ai_error_kind(str(e))
+        if kind == "auth":
+            prov = (_ai_conf() or {}).get("provider") or "claude-code"
+            if prov == "claude-code":
+                _ai_cli_auth.update({"ok": False, "at": time.time()})
+                _problem("ai_auth", what=AI_AUTH_WHAT, detail=AI_AUTH_DETAIL)
+                return False, AI_AUTH_HINT
+            _problem("ai_key", what=AI_KEY_WHAT.format(prov=prov), detail=AI_KEY_DETAIL)
+            return False, AI_KEY_HINT.format(prov=prov)
+        if kind == "limit":
+            return False, "the AI provider's usage limit is hit right now — try again later"
         return False, f"research failed: {e}"
     intel = _ai_parse(raw)
     if not intel:
         add_log(f"AI research for {name}: unparseable answer ({(raw or '')[:120]!r})")
+        if not manual:
+            _ai_mark_tried(sid)
         return False, "the model's answer wasn't parseable"
     intel["at"] = _buy_now()
+    # Nothing is posted anywhere: an author-stated date becomes the card's
+    # estimate (with its source on hover) and the schedule, hero and digest
+    # pick it up from there - the user reads dates, not research prose.
     with _lock:
         srs = _find(sid)
         if srs is not None:
             srs["intel"] = intel
+            applied = _intel_apply(srs, intel)
             save_state()
-    add_log(f"AI research: {name} -> {intel['status']} ({intel['confidence']})")
-    nb = intel.get("next_book") or {}
-    if (intel["status"] != (old or intel["status"]) or nb.get("expected")) and intel["status"] != "unknown":
-        bits = f" Next: book {nb.get('n')} {nb.get('kind') or ''} ~{nb.get('expected')}." if nb.get("expected") else ""
-        _discord_notify(f"\U0001f50e **{name}** research: {intel['status']}.{bits}\n{intel['summary']}")
+        else:
+            applied = []
+    add_log(f"AI research: {name} -> " + ("; ".join(applied) if applied else _ai_intel_line(intel)))
+    _ai_cli_auth.update({"ok": True, "at": time.time()})
+    _problem_clear("ai_auth", what="AI research is working again.")
+    _problem_clear("ai_key", what="AI research is working again.")
+    _problem_clear("ai_failing", what="AI research is producing answers again.")
     return True, intel["status"]
 
 
+# ---- the author's Royal Road notes come first --------------------------------
+# Royal Road refuses the research tool (403) but not the browser, so the
+# extension collects the author's announcements, notes and comment replies and
+# the research reads them. Research for a series with a known Royal Road page
+# waits (briefly) for a fresh harvest.
+RR_NOTES_FRESH_H = 20
+RR_WAIT_S = 600
+
+
+def _rr_url(srs):
+    u = (srs.get("rr_url") or "").strip()
+    if not u:
+        m = re.search(r"https?://(?:www\.)?royalroad\.com/fiction/\d+[^\s]*", srs.get("notes") or "")
+        u = m.group(0) if m else ""
+    return u if "royalroad.com/fiction/" in u else ""
+
+
+def _rr_notes_fresh(srs):
+    try:
+        return datetime.now() - datetime.fromisoformat((srs.get("rr_notes") or {}).get("at") or "") < timedelta(hours=RR_NOTES_FRESH_H)
+    except (TypeError, ValueError):
+        return False
+
+
+def _rr_request(srs):
+    """Ask the extension for the author's Royal Road notes when they are stale.
+    True while the research should wait for them. Caller holds _lock."""
+    if not _rr_url(srs) or _rr_notes_fresh(srs):
+        return False
+    if datetime.now() - _ext_last_poll > timedelta(minutes=10):
+        return False                                  # nobody to fetch them: research without
+    try:
+        asked = datetime.fromisoformat(srs.get("rr_requested_at") or "")
+    except (TypeError, ValueError):
+        asked = None
+    if asked and datetime.now() - asked < timedelta(seconds=RR_WAIT_S):
+        return True                                   # on its way
+    if asked and datetime.now() - asked < timedelta(hours=24):
+        return False                                  # asked, nothing came: don't hold research up again today
+    srs["rr_requested_at"] = _buy_now()
+    _push_command(type="rrnotes", sid=srs["id"], url=_rr_url(srs))
+    add_log(f"asked the extension for {srs.get('name', '')}'s Royal Road notes before researching")
+    return True
+
+
+def _ai_mark_tried(sid):
+    """A series that failed today leaves the automatic batch for the day, so the
+    budget isn't spent re-running one broken call every five minutes."""
+    with _lock:
+        srs = _find(sid)
+        if srs is not None:
+            srs["ai_tried"] = today().isoformat()
+
+
+def _novel_overdue(srs):
+    """The next NOVEL is overdue: the forecast the card would show has passed
+    and nothing is pre-ordered. Only this earns an automatic research call
+    (the user's rule) - a missing audiobook or a merely quiet series does not;
+    the manual Check button stays available for those."""
+    pred = predicted_novel_date(srs)
+    if not pred or pred >= today():
+        return False
+    return not any((parse_date(e.get("novel")) or date.min) >= today() for e in srs.get("timeline") or [])
+
+
 def _ai_candidates():
-    """Series worth researching: overdue audio or dormant, intel stale/missing."""
+    """[(sid, urgent)] for every series with an overdue novel, urgent first.
+
+    Urgent = the estimate was missed since the series was last researched (or
+    it never was): that is researched the night the estimate passes, cap or no
+    cap - the trigger is the estimate itself, nothing else. The rest are
+    periodic re-checks of long-overdue series, every AI_INTEL_TTL_DAYS, within
+    the daily cap. Most-overdue first within each group."""
     out = []
     cutoff = datetime.now() - timedelta(days=AI_INTEL_TTL_DAYS)
     with _lock:
         for srs in _state.get("series", []):
-            intel = srs.get("intel") or {}
-            try:
-                fresh = datetime.fromisoformat(intel.get("at", "")) > cutoff
-            except (TypeError, ValueError):
-                fresh = False
-            if fresh:
+            if srs.get("ai_tried") == today().isoformat() or not _novel_overdue(srs):
                 continue
-            tl = srs.get("timeline") or []
-            dates = [parse_date(e.get(k)) for e in tl for k in ("novel", "audiobook")]
-            dates = [d for d in dates if d]
-            newest = max(dates) if dates else None
-            dormant = newest is not None and (today() - newest).days > 270
-            overdue = bool(srs.get("audio_overdue")) or any(
-                parse_date(e.get("novel")) and not e.get("audiobook")
-                and (today() - parse_date(e.get("novel"))).days > 180 for e in tl)
-            if dormant or overdue:
-                out.append((newest or today(), srs["id"]))
+            pred = predicted_novel_date(srs)
+            try:
+                at = datetime.fromisoformat((srs.get("intel") or {}).get("at", ""))
+            except (TypeError, ValueError):
+                at = None
+            urgent = at is None or at.date() <= pred      # nothing researched since the miss
+            if not urgent and at > cutoff:
+                continue                                   # re-check not due yet
+            out.append((0 if urgent else 1, pred, srs["id"], urgent))
     out.sort()
-    return [sid for _, sid in out]
+    return [(sid, urgent) for _, _, sid, urgent in out]
+
+
+def _ai_note_night(results):
+    """Two consecutive all-failed batches (parse errors, timeouts, a bad model
+    name...) are worth a person; one bad night isn't. Sign-out is reported on
+    its own and mustn't be double-counted here."""
+    if not results:
+        return
+    d = today().isoformat()
+    with _lock:
+        if any(results):
+            _state["ai_fail_nights"] = 0
+        elif _state.get("ai_fail_day") != d:          # several batches in a day count once
+            _state["ai_fail_nights"] = int(_state.get("ai_fail_nights") or 0) + 1
+        _state["ai_fail_day"] = d
+        n = _state["ai_fail_nights"]
+        signed_out = "ai_auth" in (_state.get("problems") or {})
+        save_state()
+    if n == 0:
+        _problem_clear("ai_failing", what="AI research is producing answers again.")
+    elif n >= AI_FAIL_NIGHTS_ALERT and not signed_out:
+        _problem("ai_failing", what=f"AI research has failed {n} nights running.",
+                 detail="The dashboard's activity log has the error; Settings → Integrations has the provider and model.")
 
 
 def _ai_tick():
-    if not _ai_conf():
+    global _ai_worker_busy, _ai_worker_since
+    conf = _ai_conf()
+    # problems that describe a configuration the user has since walked away
+    # from must not outlive it (the banner would prescribe the wrong fix)
+    if not conf:
+        for key in ("ai_auth", "ai_key", "ai_failing"):
+            _problem_clear(key, notify=False)
         return
+    _problem_clear("ai_key" if conf["provider"] == "claude-code" else "ai_auth", notify=False)
+    if _ai_worker_busy:
+        if time.time() - _ai_worker_since > AI_HUNG_S:
+            _problem("ai_hung", what="An AI research call has been stuck for over half an hour.",
+                     detail="Quit Release Radar from the tray and start it again to free it.")
+        return
+    _problem_clear("ai_hung", notify=False)   # no worker: whatever was stuck is gone (restart included)
     d = today().isoformat()
     if _ai_day["date"] != d:
         _ai_day.update({"date": d, "used": 0})
-    if _ai_day["used"] >= AI_DAILY_MAX:
+    cands = _ai_candidates()
+    urgent = [sid for sid, u in cands if u]
+    rechecks = [sid for sid, u in cands if not u][: max(0, AI_DAILY_MAX - _ai_day["used"])]
+    sids = urgent + rechecks
+    with _lock:
+        signed_out_open = "ai_auth" in (_state.get("problems") or {})
+    if conf["provider"] == "claude-code" and (sids or signed_out_open):
+        # The (cached, cheap) sign-in check runs whenever there is work or an
+        # open sign-out problem, so research resumes - and the banner clears -
+        # within the hour of a re-login instead of waiting for tomorrow's batch.
+        signed = _ai_cli_logged_in()
+        if signed is False:
+            _problem("ai_auth", what=AI_AUTH_WHAT, detail=AI_AUTH_DETAIL)
+            return                              # the day's budget is kept for when it works
+        if signed:
+            _problem_clear("ai_auth", what="The Claude Code CLI is signed in again — AI research is back.")
+    if not sids:
         return
-    for sid in _ai_candidates()[: AI_DAILY_MAX - _ai_day["used"]]:
-        _ai_day["used"] += 1
-        threading.Thread(target=_ai_research_series, args=(sid,), daemon=True).start()
+    # a series with a Royal Road page gets its author's notes harvested first;
+    # it joins a later tick once they have arrived (or the wait ran out)
+    with _lock:
+        waiting = {sid for sid in sids if (srs := _find(sid)) is not None and _rr_request(srs)}
+        if waiting:
+            save_state()
+    urgent = [sid for sid in urgent if sid not in waiting]
+    rechecks = [sid for sid in rechecks if sid not in waiting]
+    sids = urgent + rechecks
+    if not sids:
+        return
+    _ai_day["used"] += len(rechecks)            # a just-missed estimate is researched cap or no cap
+    _ai_worker_busy, _ai_worker_since = True, time.time()
+
+    def _run():
+        global _ai_worker_busy
+        results = []
+        try:
+            for sid in sids:                    # one at a time, never in parallel
+                results.append(_ai_research_series(sid, why="overdue" if sid in urgent else None)[0])
+        except Exception as e:                  # noqa: BLE001 - a state write can fail; never die silently
+            add_log(f"AI research batch error: {e}")
+        finally:
+            _ai_worker_busy = False
+        try:
+            _problem_clear("ai_hung", what="The stuck AI research call has finished.")
+            _ai_note_night(results)
+        except Exception as e:                  # noqa: BLE001
+            add_log(f"AI research bookkeeping error: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 _ai_running = set()
@@ -4189,8 +5660,13 @@ _ai_running = set()
 def api_series_research(sid):
     """Kick one research pass off in the background and answer at once - the
     call takes 1-3 minutes (web search) and the Check popup must not hang."""
-    if not _ai_conf():
+    conf = _ai_conf()
+    if not conf:
         return jsonify({"ok": False, "message": "no AI configured (Settings \u2192 Integrations)"}), 400
+    if conf["provider"] == "claude-code" and _ai_cli_logged_in(force=True) is False:
+        # a two-minute wait for a certain failure helps nobody: say so now
+        _problem("ai_auth", what=AI_AUTH_WHAT, detail=AI_AUTH_DETAIL)
+        return jsonify({"ok": False, "message": AI_AUTH_HINT}), 400
     with _lock:
         if not _find(sid):
             return jsonify({"ok": False, "message": "unknown series"}), 404
@@ -4198,15 +5674,29 @@ def api_series_research(sid):
             return jsonify({"ok": True, "message": "already researching \u2014 give it a couple of minutes"})
         _ai_running.add(sid)
 
+    with _lock:
+        srs = _find(sid)
+        wait = bool(srs and _rr_request(srs))
+        if wait:
+            save_state()
+
     def _go():
         try:
+            if wait:
+                for _ in range(RR_WAIT_S // 5):      # the harvest takes a minute or two
+                    time.sleep(5)
+                    with _lock:
+                        s2 = _find(sid)
+                        if s2 is None or _rr_notes_fresh(s2):
+                            break
             _ai_research_series(sid, manual=True)
         finally:
             _ai_running.discard(sid)
 
     threading.Thread(target=_go, daemon=True).start()
-    return jsonify({"ok": True, "message": "AI check started \u2014 the result lands on the card "
-                                           "(and Discord if the picture changed) in a couple of minutes."})
+    return jsonify({"ok": True, "message": ("AI check started \u2014 reading the author's Royal Road notes first; "
+                                            "the card's estimate updates in a few minutes." if wait else
+                                            "AI check started \u2014 the card's estimate updates in a couple of minutes.")})
 
 
 
@@ -4218,7 +5708,8 @@ def _buy_tick():
             st = job.get("status")
             if st in ("waiting_offer", "needs_signin"):
                 try:
-                    created = datetime.fromisoformat(job.get("created"))
+                    # a Retry restarts the probe window (window_start)
+                    created = datetime.fromisoformat(job.get("window_start") or job.get("created"))
                     last = datetime.fromisoformat(job.get("last_probe") or job.get("created"))
                 except (TypeError, ValueError):
                     continue
@@ -4237,6 +5728,7 @@ def _buy_tick():
                 if now >= due:
                     _job_set(job, "running", f"retrying the purchase (try {int(job.get('store_retries') or 0) + 1})")
                     _push_command(type="buy", phase="execute", job=_job_cmd(job))
+                    _buy_live_begin(job)
                     changed = True
             elif st == "awaiting_approval":
                 try:
@@ -4267,6 +5759,7 @@ def api_buy_report():
         if not job:
             return jsonify({"ok": False, "error": "unknown job"}), 404
         _buy_handle_report(job, str(body.get("phase") or ""), bool(body.get("ok")), body.get("detail") or {})
+        _buy_live_update(job)
         save_state()
         status = job["status"]
     return jsonify({"ok": True, "status": status})
@@ -4286,9 +5779,7 @@ def api_buy_action(jid, action):
         elif action == "deny" and job["status"] in ("awaiting_approval", "probing", "waiting_offer", "running", "retry_later"):
             _buy_deny(job, who="dashboard")
         elif action == "retry":
-            job["dry_run"] = bool(get_settings().get("buy_dry_run", True))
-            _job_set(job, "probing", "retry from dashboard")
-            _buy_push_probe(job)
+            _buy_retry(job, who="dashboard")
         elif action == "cancel":
             _job_set(job, "cancelled", "cancelled from dashboard")
         elif action == "returnku":
@@ -4338,7 +5829,7 @@ def _buy_for_book(sid, n, source="the timeline"):
         existing = _buy_job_for(sid, n)
         if existing:
             return False, f"a job for this book already exists ({existing['status']})"
-        if audio and _libation_owns(audio):
+        if audio and _libation_owns(audio, series=srs.get("name"), n=n, srs=srs):
             return False, "Libation already has this audiobook"
         ent = next((e for e in srs.get("timeline", []) if _entry_n(e) == n), {}) or {}
         if ent.get("ku") is False:
@@ -4584,6 +6075,30 @@ def api_ext_refresh():
     return jsonify({"ok": True})
 
 
+@app.post("/api/rr-notes")
+def api_rr_notes():
+    """The extension's harvest of the author's own words on Royal Road
+    (announcement chapters, author's notes, replies in the comments), kept on
+    the series for the research to quote."""
+    body = request.get_json(force=True, silent=True) or {}
+    items = []
+    for it in (body.get("items") or [])[:40]:
+        if isinstance(it, dict) and str(it.get("text") or "").strip():
+            items.append({"chapter": str(it.get("chapter") or "")[:120], "date": str(it.get("date") or "")[:25],
+                          "kind": str(it.get("kind") or "")[:16], "text": str(it.get("text") or "")[:1200]})
+    with _lock:
+        srs = _find(str(body.get("sid") or ""))
+        if not srs:
+            return jsonify({"ok": False, "error": "unknown series"}), 404
+        srs["rr_notes"] = {"at": _buy_now(), "url": str(body.get("url") or "")[:300],
+                           "author": str(body.get("author") or "")[:80], "items": items}
+        srs.pop("rr_requested_at", None)
+        name = srs.get("name", "")
+        save_state()
+    add_log(f"Royal Road notes for {name}: {len(items)} item(s)")
+    return jsonify({"ok": True, "items": len(items)})
+
+
 @app.post("/api/ext/crawl-series")
 def api_ext_crawl_series():
     """Ask the extension to re-crawl a SINGLE series (find new/updated books for it),
@@ -4690,8 +6205,11 @@ def api_get_settings():
                     "ai_provider": s.get("ai_provider", "openrouter"),
                     "ai_api_key_set": bool(s.get("ai_api_key")),
                     "ai_model": s.get("ai_model", ""),
+                    "ai_signed_out": "ai_auth" in (_state.get("problems") or {}),
                     "abs_url": ("" if remote else s.get("abs_url", "")),
                     "abs_token_set": bool(s.get("abs_token")),
+                    "abs_write_status": bool(s.get("abs_write_status", True)),
+                    "abs_written_count": len(_state.get("abs_written") or {}),
                     "buy_libation_found": _libation_files_dir() or ""})
 
 
@@ -4709,7 +6227,13 @@ def api_set_settings():
             if m in ("audiobook", "novel"):
                 s["upcoming_mode"] = m
         if "discord_webhook" in body:
-            s["discord_webhook"] = (body.get("discord_webhook") or "").strip()
+            new_wh = (body.get("discord_webhook") or "").strip()
+            if new_wh != s.get("discord_webhook", ""):
+                # a different (or no) webhook: the old one's failures are history
+                for key in ("discord", "digest"):
+                    (_state.get("problems") or {}).pop(key, None)
+                _discord_fail["n"] = 0
+            s["discord_webhook"] = new_wh
         for k in ("buy_master", "buy_dry_run"):
             if k in body:
                 s[k] = bool(body.get(k))
@@ -4723,6 +6247,7 @@ def api_set_settings():
         if body.get("buy_smtp_pass_clear"):
             s["buy_smtp_pass"] = ""
         # integration secrets: same write-only rules
+        ai_before = (s.get("ai_provider"), s.get("ai_api_key"))
         for sec in ("bot_token", "ai_api_key", "abs_token"):
             if sec in body and (body.get(sec) or "").strip():
                 s[sec] = body[sec].strip()
@@ -4730,10 +6255,23 @@ def api_set_settings():
                 s[sec] = ""
         if body.get("ai_provider") in ("openrouter", "anthropic", "openai", "grok", "claude-code"):
             s["ai_provider"] = body["ai_provider"]
+        if (s.get("ai_provider"), s.get("ai_api_key")) != ai_before:
+            # a new provider/key: whatever the old one's problem was, it's gone,
+            # and a cached sign-in verdict must not outlive the config it judged
+            for key in ("ai_auth", "ai_key", "ai_failing"):
+                (_state.get("problems") or {}).pop(key, None)
+            _ai_cli_auth.update({"ok": None, "at": 0.0})
         if "ai_model" in body:
             s["ai_model"] = (body.get("ai_model") or "").strip()
         if "abs_url" in body:
             s["abs_url"] = (body.get("abs_url") or "").strip().rstrip("/")
+        if "abs_write_status" in body:
+            want = bool(body.get("abs_write_status"))
+            if want != bool(s.get("abs_write_status", True)):
+                s["abs_write_status"] = want
+                # off: take the radar's lines back out of ABS; on: put them in now
+                threading.Thread(target=_abs_clear_status if not want else (lambda: _abs_sync_status(force=True)),
+                                 daemon=True).start()
         if "buy_cap_default" in body:
             s["buy_cap_default"] = _clean_buy_cap(body.get("buy_cap_default")) or BUY_DEFAULT_CAP
         if "buy_weekly_max" in body:
@@ -4774,6 +6312,8 @@ def api_discord_test():
     if not wh:
         return jsonify({"ok": False, "message": "No webhook URL set."})
     ok, err = _discord_post(wh, _fmt_line("test"))
+    if ok:
+        _problem_clear("discord", notify=False)
     return jsonify({"ok": ok, "message": "Sent! Check your Discord channel." if ok else f"Failed: {err}"})
 
 
@@ -4787,6 +6327,8 @@ def api_discord_digest_now():
     ok, err = _send_digest(wh)
     if ok:
         add_log("Sent a forecast digest to Discord (manual)")
+        _problem_clear("digest", notify=False)
+        _problem_clear("discord", notify=False)
     return jsonify({"ok": ok, "message": "Sent! Go see what she has to say." if ok else f"Failed: {err}"})
 
 

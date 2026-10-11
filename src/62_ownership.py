@@ -36,7 +36,7 @@ def _libation_asin_set():
     if not d:
         return set()
     try:
-        con = sqlite3.connect(f"file:{os.path.join(d, 'LibationContext.db')}?mode=ro", uri=True, timeout=2)
+        con = sqlite3.connect(_libation_ro_uri(d), uri=True, timeout=2)
         try:
             rows = con.execute("select AudibleProductId from Books").fetchall()
         finally:

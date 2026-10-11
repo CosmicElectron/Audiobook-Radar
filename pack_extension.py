@@ -42,7 +42,7 @@ def main():
     import subprocess
     # Two suites: synthetic shapes, and the REAL saved Amazon pages (the latter
     # is what caught a hidden pre-order alert flipping every released novel).
-    for tname in ("test_extract.js", "test_fixtures.js", "test_buy.js"):
+    for tname in ("test_extract.js", "test_fixtures.js", "test_buy.js", "test_background.js", "test_pagestep.js", "test_rrnotes.js", "test_abs.js"):
         test = os.path.join(SRC, "test", tname)
         if shutil.which("node") and os.path.exists(test):
             r = subprocess.run(["node", test], capture_output=True, text=True)

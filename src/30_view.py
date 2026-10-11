@@ -103,6 +103,10 @@ def series_view(s):
         "novel_history_count": len(novel_gap_days_list(s)),
         "predicted_novel_date": iso(n_pred),
         "predicted_novel_confidence": n_pred and novel_conf,
+        # who said so, when an estimate is the author's own date (hover asterisk)
+        "predicted_novel_source": predicted_novel_source(s),
+        "predicted_audio_source": (audio_fc or {}).get("source"),
+        "next_est_source": (audio_next or {}).get("source"),
         "next_date": None,
         "next_kind": None,
         "next_estimate": False,
@@ -147,6 +151,8 @@ def _audio_estimate(series):
     if not f:
         return None
     pred = f["date"]
+    if f.get("source"):
+        return pred, _intel_note(f["source"])
     if f["queued"]:
         # the audio queue, not the novel, is what's holding this one back — say so
         after = f" book {f['after_n']}'s" if f.get("after_n") is not None else " the previous"
@@ -164,11 +170,20 @@ def _audio_estimate(series):
     return pred, note
 
 
+def _intel_note(src):
+    """The estimate's basis when it is the author's own word."""
+    said = (src.get("said") or src.get("expected") or "").strip()
+    return f"author: {said}" if said else "author's stated timing"
+
+
 def _novel_estimate(series):
     """(predicted_date, note) for the next-novel forecast, or None."""
     pred = predicted_novel_date(series)
     if not pred or pred < today():
         return None
+    src = predicted_novel_source(series)
+    if src:
+        return pred, _intel_note(src)
     avg = predicted_gap_days(novel_gap_days_list(series))
     if avg is None:
         note = "estimated from past releases"
@@ -244,6 +259,7 @@ def upcoming_of_kind(kind, include_estimates):
             ent = None
             n = None
             fc = None
+            source = predicted_novel_source(s) if kind == "novel" else None
             if kind == "novel":
                 # The predicted novel doesn't exist as a timeline entry yet — it's
                 # the book AFTER the latest known NOVEL (the estimate anchors on
@@ -259,6 +275,7 @@ def upcoming_of_kind(kind, include_estimates):
                 # number straight from the same row that produced the date.
                 fc = _audio_next_forecast(s)
                 n = fc.get("n") if fc else None
+                source = fc.get("source") if fc else None
                 ent = next((e for e in s.get("timeline", []) if _entry_n(e) == n), None) if n is not None else None
             if n is not None and n in seen:
                 continue                      # this book already has a real date listed
@@ -285,7 +302,9 @@ def upcoming_of_kind(kind, include_estimates):
                 "kind": kind,
                 "estimate": True,
                 "note": note,
-                "confidence": _estimate_confidence(gaps),
+                # an author-stated date needs no confidence chip: the asterisk says who said it
+                "confidence": None if source else _estimate_confidence(gaps),
+                "source": source,
                 "countdown_days": (nd - t).days,
                 "cover": (ent.get("cover") if ent else None) or s.get("cover_url") or None,
             })

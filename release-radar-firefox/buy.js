@@ -211,13 +211,27 @@ function RR_pageStep(opts) {
       // after the click: what did the page become?
       var ok = /thank you|thanks for your (?:order|purchase)|order (?:has been )?placed|added to your library|has been added|you now own|enjoy your/i.test(bodyText);
       var mentionsAudio = /audiobook|audible|narration/i.test(bodyText);
-      var p = opts.price != null ? price(bodyText.slice(0, 4000)) : null;
-      res.found = { url: location.href, title: title.slice(0, 120), thanks: ok, audio: mentionsAudio, price_seen: p, excerpt: bodyText.slice(0, 500) };
-      try { res.html = (document.documentElement.outerHTML || "").slice(0, 200000); } catch (e) {}
-      // a KU borrow alone also says "thank you" - only count it when the page
-      // talks about the audiobook (or shows its price)
-      res.ok = ok && (mentionsAudio || p != null);
-      res.info = (ok ? "confirmation page" : "no confirmation text") + (mentionsAudio ? ", mentions the audiobook" : ", does NOT mention the audiobook") + (p != null ? (", shows $" + p) : "");
+      // Evidence that THIS purchase went through, not just any thank-you page.
+      // Audible's page says "Thank you for choosing <title>" and links the
+      // audiobook, but shows no price - and its "you might like" carousel is
+      // full of "$16.45/mo" membership prices (the first price on the page was
+      // once reported as if it were the charge, Riftside 4, 29 Sep 2026).
+      var low = bodyText.toLowerCase();
+      var tFull = clean(opts.title || "").toLowerCase(), tShort = tFull.split(":")[0].trim();
+      var titleSeen = !!tFull && (low.indexOf(tFull) >= 0 || (tShort.length >= 6 && low.indexOf(tShort) >= 0));
+      var html = ""; try { html = document.documentElement.outerHTML || ""; } catch (e) {}
+      var asinSeen = !!opts.audio_asin && html.indexOf(opts.audio_asin) >= 0;
+      var priceSeen = opts.price != null && new RegExp("\\$\\s?" + Number(opts.price).toFixed(2).replace(".", "\\.") + "(?!\\d)").test(bodyText);
+      res.found = { url: location.href, title: title.slice(0, 120), thanks: ok, audio: mentionsAudio, title_seen: titleSeen,
+                    asin_seen: asinSeen, price_seen: priceSeen, excerpt: bodyText.slice(0, 500) };
+      res.html = html.slice(0, 200000);
+      // a KU borrow's thank-you page names the same title, so the title alone
+      // only counts when the page is about the audiobook
+      res.ok = ok && (asinSeen || priceSeen || (titleSeen && mentionsAudio));
+      var ev = [];
+      if (titleSeen) ev.push("names this book"); if (asinSeen) ev.push("links this audiobook"); if (priceSeen) ev.push("shows the $" + Number(opts.price).toFixed(2));
+      res.info = (ok ? "confirmation page" : "no confirmation text") +
+                 (ev.length ? (", " + ev.join(", ")) : (ok ? ", but it doesn't name this audiobook or show its price" : ""));
       return res;
     }
 
@@ -254,6 +268,11 @@ function RR_pageStep(opts) {
     if (!narrAsin && narrBlock) { var im = (narrBlock.innerHTML || "").match(/audibleAsin['"]?\)\.val\(["']([A-Z0-9]{10})["']\)/); if (im) narrAsin = im[1]; }
     var addAudioBtns = all.filter(function (b) { if (!visible(b)) return false; var l = labelOf(b).toLowerCase(); return ADD_AUDIO_LABEL.test(l); });
     try { res.html = (scope.outerHTML || "").slice(0, 120000); } catch (e) {}
+    // "Read Now" instead of a borrow button: the Kindle edition is already in
+    // the library (borrowed earlier, or owned). Nothing to borrow - and nothing
+    // of ours to return afterwards (Riftside 4, 29 Sep 2026, stopped here).
+    var IN_LIB = RX("in_library_label", "^read now\\b|^read (?:it )?in the (?:free )?kindle app");
+    var readNowBtns = all.filter(function (b) { return visible(b) && IN_LIB.test(labelOf(b).toLowerCase()); });
     var sameForm = !!(narrChk && borrowBtns.length === 1 && narrChk.form && borrowBtns[0].form && narrChk.form === borrowBtns[0].form);
     res.found = { same_form: sameForm,
                   borrow: borrowBtns.map(function (b) { return { id: (b.closest("span.a-button") || b).id || b.id || "", label: labelOf(b) }; }),
@@ -261,7 +280,9 @@ function RR_pageStep(opts) {
                   add_audio: addAudioBtns.map(function (b) { return { id: (b.closest("span.a-button") || b).id || b.id || "", label: labelOf(b) }; }),
                   narration_checkbox: !!narrChk, narration_visible: !!(narrBlock && visible(narrBlock)), narration_price: narrPrice, narration_asin: narrAsin,
                   narration_text: narrText.slice(0, 160), borrowed_already: /you borrowed this|return this book|you're borrowing|borrowed on \w+|manage your kindle unlimited titles|already borrowed this title/i.test(bodyText),
+                  in_library: readNowBtns.length > 0 && borrowBtns.length === 0,
                   url: location.href };
+    var skipBorrow = !!(res.found.borrowed_already || res.found.in_library);
 
     // -- checks common to look/borrow
     var problems = [];
@@ -370,22 +391,22 @@ function RR_pageStep(opts) {
 
     // borrow path
     var plan = [];
-    if (res.found.borrowed_already) plan.push("already borrowed - skip the borrow");
+    if (skipBorrow) plan.push(res.found.in_library ? "already in your Kindle library ('Read Now') - no borrow needed" : "already borrowed - skip the borrow");
     else if (borrowBtns.length === 1) plan.push("borrow: click '" + labelOf(borrowBtns[0]) + "' (" + (res.found.borrow[0].id || "no id") + ")");
     else plan.push(borrowBtns.length ? ("AMBIGUOUS: " + borrowBtns.length + " borrow buttons") : "NO borrow / Add-to-library button found");
     if (narrChk && sameForm) plan.push("tick #" + (narrChk.id || "narration checkbox") + (narrPrice != null ? (" ($" + narrPrice + ")") : "") + " in the borrow form");
     else plan.push("audiobook offer expected AFTER the borrow");
     res.info = plan.join("; ") + (problems.length ? (" | PROBLEMS: " + problems.join("; ")) : "");
 
-    if (opts.mode === "look") { res.ok = (borrowBtns.length === 1 || res.found.borrowed_already) && !problems.length; return res; }
+    if (opts.mode === "look") { res.ok = (borrowBtns.length === 1 || skipBorrow) && !problems.length; return res; }
 
     // mode === "borrow": really do it (a KU borrow is free and is returned at the end)
     if (problems.length) return res;
-    if (!res.found.borrowed_already && borrowBtns.length !== 1) return res;
+    if (!skipBorrow && borrowBtns.length !== 1) return res;
     var useChk = !!(narrChk && sameForm);
     if (useChk && !narrChk.checked) { narrChk.click(); if (!narrChk.checked) { narrChk.checked = true; narrChk.dispatchEvent(new Event("change", { bubbles: true })); } }
     if (useChk && !narrChk.checked) { res.info = "could not tick the audiobook checkbox"; return res; }
-    if (res.found.borrowed_already) { res.ok = true; res.info = "already borrowed - looking for the audiobook offer"; res.needs_offer = true; return res; }
+    if (skipBorrow) { res.ok = true; res.info = (res.found.in_library ? "already in your Kindle library ('Read Now') - no borrow needed" : "already borrowed") + " - looking for the audiobook offer"; res.needs_offer = true; return res; }
     // the KU button is a JS widget, not a form submit: give it a real mouse
     // sequence on the inner button AND its a-button host, then let the page act
     var tgt = borrowBtns[0], hostSpan = tgt.closest("span.a-button") || tgt;
@@ -556,6 +577,8 @@ async function RR_runBuy(cmd) {
     await _rrReport(job.id, rphase, ok, d);
     logLine("buy[" + phase + "] " + name + ": " + (ok ? "ok " : "FAIL ") + info);
   }
+  // what it is doing right now, for the app's live Discord message (not a step)
+  async function now(info) { try { await _rrReport(job.id, "progress", true, { info: info }); } catch (e) {} }
   var host = job.store_host || "www.amazon.com.au";
   var kindle = job.kindle_asin;
   if (!kindle && job.audio_asin) {
@@ -565,6 +588,7 @@ async function RR_runBuy(cmd) {
   var tab = null, borrowed = false;
   async function returnBorrow() {
     if (!borrowed && !job.ku_borrowed_by_us) { await step("return", true, "nothing to return (the borrow was not mine)"); return true; }
+    await now("returning the Kindle Unlimited borrow");
     var ret = await RR_returnBorrow(host, kindle);
     await step("return", ret.ok, ret.info, dry ? { final: false } : null);
     return ret.ok;
@@ -576,6 +600,7 @@ async function RR_runBuy(cmd) {
     //   foreground - a normal tab in the current window, focused (known to work)
     //   window     - its own small window opened WITHOUT focus (doesn't steal the keyboard)
     //   background - an unfocused tab (Firefox throttles page scripts there; the KU widget did not fire)
+    await now("opening the Kindle page for book " + job.n);
     var mode = (job.cfg && job.cfg.tab_mode) || "foreground";
     var madeWindow = null;
     if (mode === "window") {
@@ -589,11 +614,13 @@ async function RR_runBuy(cmd) {
     await new Promise(function (r) { setTimeout(r, 4000); });     // let Amazon's widgets bind
     var base = { audio_asin: job.audio_asin, price: job.price, cap: job.cap, cfg: job.cfg };
     // 1. borrow (free; returned at the end in both modes)
+    await now("looking for the Kindle Unlimited borrow button");
     var b = await _rrExec(tab.id, Object.assign({ mode: "borrow" }, base));
     await step("borrow", b.ok, b.info, { clicked: !!b.clicked, found: b.found, html: b.html || "" });
     if (!b.ok) { if (dry) await _rrReport(job.id, "dry", false, { info: "stopped at borrow: " + b.info, final: true }); return; }
-    if (b.found && b.found.borrowed_already && !b.clicked) borrowed = false;   // was already borrowed before me: leave it alone
+    if (b.found && (b.found.borrowed_already || b.found.in_library) && !b.clicked) borrowed = false;   // was already borrowed before me: leave it alone
     if (b.clicked) {
+      await now("borrow pressed - waiting for Amazon to confirm it");
       // VERIFY the borrow: the widget normally redirects to the thank-you page;
       // failing that, the loan must show up in KU Central
       var navigated = await _rrWaitLoad(tab.id, 25000, true);
@@ -616,6 +643,7 @@ async function RR_runBuy(cmd) {
     if (job.audio_asin) places.push(["audiobook page", _rrUrl(host, job.audio_asin)]);
     for (var i = 0; i < places.length && !offer; i++) {
       if (places[i][1]) { await browser.tabs.update(tab.id, { url: places[i][1] }); await _rrWaitLoad(tab.id, 40000, true); }
+      await now("looking for the $" + job.price + " audiobook offer on the " + places[i][0]);
       var o = await _rrExec(tab.id, Object.assign({ mode: "offer", commit: false }, base));
       if (!o.ok && o.expanded) {        // a collapsed buying option was opened: look again
         await new Promise(function (r) { setTimeout(r, 1800); });
@@ -637,6 +665,7 @@ async function RR_runBuy(cmd) {
       return;
     }
     // 3. buy (execute only): click the one offer button we just verified
+    await now("pressing Buy on the $" + job.price + " audiobook offer");
     var c1 = await _rrExec(tab.id, Object.assign({ mode: "offer", commit: true, no_expand: true }, base));
     await step("buy-click", c1.ok, c1.info, { clicked: !!c1.clicked });
     if (!c1.ok) { await returnBorrow(); return; }
@@ -645,7 +674,8 @@ async function RR_runBuy(cmd) {
     // pages render late, so look several times before deciding
     var c = null, rv = null, pages = 0;
     while (pages++ < 5) {                         // payment page -> review page -> confirmation
-      c = await _rrExec(tab.id, { mode: "confirm", price: job.price, cfg: job.cfg });
+      await now("reading the checkout page");
+      c = await _rrExec(tab.id, { mode: "confirm", price: job.price, title: job.title, audio_asin: job.audio_asin, cfg: job.cfg });
       if (c.ok) break;
       if (c.blocked) { rv = c; break; }
       rv = null;

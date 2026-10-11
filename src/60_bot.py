@@ -6,6 +6,116 @@
 # token nothing starts.
 # ---------------------------------------------------------------------------
 _bot_state = {"running": False, "err": ""}
+_bot_channel = {"webhook": None, "id": None}
+
+
+def _bot_channel_id():
+    """The channel the webhook posts into - the bot posts there too, so buttons
+    land next to the rest of the radar's messages. A GET on the webhook URL
+    answers with its channel id; cached per webhook."""
+    wh = (get_settings().get("discord_webhook") or "").strip()
+    if not wh:
+        return None
+    if _bot_channel["webhook"] == wh and _bot_channel["id"]:
+        return _bot_channel["id"]
+    try:
+        with urlopen(Request(wh, headers={"User-Agent": APP_NAME}), timeout=10) as r:
+            cid = int(json.loads(r.read().decode("utf-8", "replace")).get("channel_id"))
+    except Exception as e:      # noqa: BLE001
+        add_log(f"Discord bot: couldn't look up the webhook's channel ({_no_secrets(str(e))})")
+        return None
+    _bot_channel.update(webhook=wh, id=cid)
+    return cid
+
+
+async def _bot_send(client, channel_id, text, buttons=()):
+    import discord
+    ch = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+    view = None
+    if buttons:
+        view = discord.ui.View(timeout=None)
+        for label, cid in buttons:
+            view.add_item(discord.ui.Button(label=label, custom_id=cid, style=discord.ButtonStyle.primary))
+    await ch.send(text[:1900], view=view)
+
+
+def _bot_post(text, buttons=()):
+    """Post as the BOT - a webhook message can't carry a button anyone can
+    click. Blocking: call from a worker thread, never from the bot's own loop.
+    True when it was sent."""
+    import asyncio
+    client, loop = _bot_state.get("client"), _bot_state.get("loop")
+    if not (_bot_state.get("running") and client and loop):
+        return False
+    ch_id = _bot_channel_id()
+    if not ch_id:
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(_bot_send(client, ch_id, text, buttons), loop).result(timeout=20)
+        return True
+    except Exception as e:      # noqa: BLE001
+        add_log(f"Discord bot post failed: {_no_secrets(str(e))}")
+        return False
+
+
+def _notify_with_button(text, buttons, fallback):
+    """The message with its buttons via the bot, or the plain fallback text via
+    the webhook when the bot isn't available. Fire-and-forget."""
+    def _go():
+        try:
+            if not _bot_post(text, buttons):
+                _discord_notify(fallback)
+        except Exception as e:  # noqa: BLE001
+            add_log(f"Discord notify error: {e}")
+    threading.Thread(target=_go, daemon=True).start()
+
+
+def handle_bot_button(custom_id, who="discord"):
+    """A button press ('rr:<action>:<arg>') -> reply text. Pure dispatch, like
+    the ! commands, so it is testable without Discord."""
+    parts = (custom_id or "").split(":")
+    if len(parts) == 3 and parts[0] == "rr" and parts[1] == "retry":
+        with _lock:
+            job = _buy_job_by_id(parts[2])
+            if not job:
+                return "that purchase job no longer exists."
+            if job.get("status") not in BUY_RETRYABLE:
+                return f"nothing to retry — {job.get('series', '?')} #{job.get('n')} is {job.get('status')} now."
+            _buy_retry(job, who=f"Discord ({who})")
+            save_state()
+        return (f"\U0001f501 checking Amazon again for {job.get('series', '?')} #{job.get('n')} — "
+                "if you're signed in, it carries on by itself.")
+    if len(parts) == 3 and parts[0] == "rr" and parts[1] == "download":
+        with _lock:
+            job = _buy_job_by_id(parts[2])
+        if not _bat_path():
+            return "Update Audiobooks.bat not found — set its path in Settings."
+        _run_update_audiobooks(job, delay=0)
+        return "\U0001f4e6 running Update Audiobooks again (tracked series only) — progress appears here."
+    return "that button isn't one of mine."
+
+
+async def _bot_announce_parked(client):
+    """Jobs parked for a sign-in without a button yet (posted while the bot was
+    offline, or before buttons existed) get one when the bot connects."""
+    import asyncio
+    with _lock:
+        jobs = [j for j in _state.get("buy_jobs", [])
+                if j.get("status") == "needs_signin" and not j.get("signin_button_at")]
+    if not jobs:
+        return
+    ch_id = await asyncio.get_running_loop().run_in_executor(None, _bot_channel_id)
+    if not ch_id:
+        return
+    for j in jobs:
+        await _bot_send(client, ch_id,
+                        f"\U0001f511 Still waiting on an Amazon sign-in to buy {j.get('series', '?')} — book {j.get('n')}. "
+                        "Sign in on the PC, then hit the button.",
+                        [("I've signed in — retry now", f"rr:retry:{j['id']}")])
+        with _lock:
+            j["signin_button_at"] = _buy_now()
+    with _lock:
+        save_state()
 
 
 def _bot_invite_url():
@@ -78,6 +188,7 @@ def handle_bot_command(text):
                 "`!jobs` - purchase jobs\n"
                 "`!buy <series> [book#]` - price-check a book's audiobook (asks before buying)\n"
                 "`!approve [series]` / `!deny [series]` - decide a waiting purchase\n"
+                "`!retry [series]` - re-check a stopped purchase now (e.g. after signing back in to Amazon)\n"
                 "`!download` - run Update Audiobooks now\n"
                 "`!research <series>` - AI web-research on the next book\n"
                 "`!holds` - books the filer couldn't place")
@@ -111,6 +222,12 @@ def handle_bot_command(text):
             _buy_approve(job, who="discord")
             save_state()
         return f"\u2705 approved: {_bot_fmt_job(job)} \u2014 buying now."
+
+    if cmd == "retry":
+        job, err = _bot_find_job(arg, BUY_RETRYABLE)
+        if err:
+            return err
+        return handle_bot_button(f"rr:retry:{job['id']}", who="!retry")
 
     if cmd == "deny":
         job, err = _bot_find_job(arg, ("awaiting_approval", "retry_later", "probing", "waiting_offer"))
@@ -182,8 +299,31 @@ def _start_discord_bot():
 
         @client.event
         async def on_ready():
-            _bot_state.update(running=True, err="")
+            _bot_state.update(running=True, err="", client=client, loop=asyncio.get_running_loop())
             add_log(f"Discord bot online as {client.user}")
+            try:
+                await _bot_announce_parked(client)
+            except Exception as e:      # noqa: BLE001
+                add_log(f"Discord bot: couldn't post retry buttons ({_no_secrets(str(e))})")
+
+        @client.event
+        async def on_interaction(interaction):
+            # button presses; handled here rather than by View callbacks so a
+            # button still works after the app restarts
+            cid = (getattr(interaction, "data", None) or {}).get("custom_id") or ""
+            if not cid.startswith("rr:"):
+                return
+            try:
+                reply = await asyncio.get_running_loop().run_in_executor(
+                    None, handle_bot_button, cid, str(interaction.user))
+            except Exception as e:      # noqa: BLE001
+                reply = f"error: {e}"
+            try:
+                base = interaction.message.content if interaction.message else ""
+                await interaction.response.edit_message(content=(base + f"\n→ {reply}")[:1990], view=None)
+            except Exception:           # noqa: BLE001
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(reply[:1900])
 
         @client.event
         async def on_message(message):
