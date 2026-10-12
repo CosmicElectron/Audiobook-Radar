@@ -839,7 +839,7 @@ def test_retry_button_rechecks_now_and_realerts_if_still_signed_out(env):
     live_read(c); j = job()
     probe(c, j["id"], signed_in=False, ok=False)
     n = len(cmds("probe"))
-    reply = radar.handle_bot_button(f"rr:retry:{j['id']}", who="the user")
+    reply = radar.handle_bot_button(f"rr:retry:{j['id']}", who="reader")
     assert "checking Amazon again" in reply
     assert j["status"] == "probing" and len(cmds("probe")) == n + 1 and j["probes"] == 1
     assert "signin_notified" not in j and j["window_start"]
