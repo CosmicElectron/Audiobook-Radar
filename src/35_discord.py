@@ -81,7 +81,7 @@ def _discord_notify(text, embeds=None):
             else:
                 _problem_clear("discord", what="Discord messages are going through again.")
         except Exception as e:                  # noqa: BLE001 - a state write can fail; never die silently
-            add_log(f"Discord notify error: {e}")
+            add_log(f"Discord notify error: {_no_secrets(str(e))}")
 
     threading.Thread(target=_go, daemon=True).start()
 
@@ -124,7 +124,7 @@ def _alert_post(key, text):
             else:
                 _discord_notify(text)
         except Exception as e:  # noqa: BLE001
-            add_log(f"Discord alert error: {e}")
+            add_log(f"Discord alert error: {_no_secrets(str(e))}")
         finally:
             ev.set()
             _alert_inflight.pop(key, None)

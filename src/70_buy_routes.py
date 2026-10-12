@@ -1,11 +1,18 @@
 # ---- routes (local: dashboard + extension)
 @app.get("/api/buy/jobs")
 def api_buy_jobs():
+    remote = _is_remote()
     with _lock:
         jobs = [dict(j, token_hash=None) for j in reversed(_state.get("buy_jobs", []))]
         ledger = dict(_state.get("buy_ledger", {}))
+    if remote:
+        # the phone view gets the jobs, not local paths, who-approved-it
+        # identities or the purchase ledger
+        jobs = [_public_job(j) for j in jobs]
+        ledger = {}
     return jsonify({"jobs": jobs[:30], "ledger": ledger, "week_auto": _buy_week_count(),
-                    "bat": _bat_path() or "", "libation": _libation_files_dir() or ""})
+                    "bat": "" if remote else (_bat_path() or ""),
+                    "libation": "" if remote else (_libation_files_dir() or "")})
 
 
 @app.post("/api/buy/report")

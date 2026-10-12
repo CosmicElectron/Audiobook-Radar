@@ -691,8 +691,9 @@ async function loadBuySettings(){
     $('#buyEmailTo').value=s.buy_email_to||''; $('#buySmtpUser').value=s.buy_smtp_user||'';
     $('#buySmtpPass').value=''; $('#buySmtpPassHint').textContent=s.buy_smtp_pass_set?'A password is saved. Type a new one to replace it.':'Not set yet.';
     $('#buyPublicBase').value=s.buy_public_base||''; $('#buyBat').value=s.buy_bat||'';
+    $('#tunnelRequireAccess').checked=!!s.tunnel_require_access; $('#tunnelRequireAccess').disabled=!!s.remote_readonly;
     $('#buyBatHint').textContent=s.buy_bat_found?('Using: '+s.buy_bat_found):'Not found — paste the full path to Update Audiobooks.bat.';
-    ['#buyMaster','#buyDry','#buyCapDefault','#buyWeeklyMax','#buyEmailTo','#buySmtpUser','#buySmtpPass','#buyPublicBase','#buyBat'].forEach(sel=>{const el=$(sel); if(el) el.disabled=!!s.remote_readonly;});
+    ['#buyMaster','#buyDry','#buyCapDefault','#buyWeeklyMax','#buyEmailTo','#buySmtpUser','#buySmtpPass','#buyPublicBase','#buyBat','#tunnelRequireAccess'].forEach(sel=>{const el=$(sel); if(el) el.disabled=!!s.remote_readonly;});
   }catch(_){}
   loadBuyJobs();
 }
@@ -701,12 +702,13 @@ async function saveBuy(){
   const body={buy_master:$('#buyMaster').checked,buy_dry_run:$('#buyDry').checked,
     buy_cap_default:$('#buyCapDefault').value,buy_weekly_max:parseInt($('#buyWeeklyMax').value,10),
     buy_email_to:$('#buyEmailTo').value.trim(),buy_smtp_user:$('#buySmtpUser').value.trim(),
-    buy_public_base:$('#buyPublicBase').value.trim(),buy_bat:$('#buyBat').value.trim()};
+    buy_public_base:$('#buyPublicBase').value.trim(),buy_bat:$('#buyBat').value.trim(),
+    tunnel_require_access:$('#tunnelRequireAccess').checked};
   const pw=$('#buySmtpPass').value.trim(); if(pw) body.buy_smtp_pass=pw;
   try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
       if(pw){$('#buySmtpPass').value='';$('#buySmtpPassHint').textContent='Saved.';}}catch(_){}
 }
-['#buyMaster','#buyDry','#buyCapDefault','#buyWeeklyMax','#buyEmailTo','#buySmtpUser','#buySmtpPass','#buyPublicBase','#buyBat'].forEach(sel=>{
+['#buyMaster','#buyDry','#buyCapDefault','#buyWeeklyMax','#buyEmailTo','#buySmtpUser','#buySmtpPass','#buyPublicBase','#buyBat','#tunnelRequireAccess'].forEach(sel=>{
   const el=$(sel); if(el) el.addEventListener('change',saveBuy);
 });
 const STATUS_CLASS={done:'good',dry_done:'good',owned:'good',running:'wait',probing:'wait',waiting_offer:'wait',awaiting_approval:'wait',approved:'wait',

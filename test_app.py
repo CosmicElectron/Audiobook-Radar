@@ -1900,3 +1900,131 @@ def test_abs_sync_status_patches_the_series_and_remembers(monkeypatch):
     # switched off -> the lines come back out
     radar._abs_clear_status()
     assert calls[-1] == ("PATCH", "/api/series/s-loop", {"description": ""}) and radar._state["abs_written"] == {}
+
+
+# ---------------------------------------------------------------- what the tunnel may say about the owner (12 Oct 2026)
+# The read-only tunnel has no login in front of it. A reviewer found the
+# machine's folder layout, a pytest temp path and the Discord user behind a
+# button in what a stranger could read. Release dates are public; the owner is not.
+
+REMOTE = {"X-Forwarded-For": "203.0.113.50", "Host": "radar.example.org"}
+
+
+def test_public_text_strips_paths_local_urls_and_discord_identities():
+    pt = radar._public_text
+    assert pt(r"filed to T:\Books\AudioBooks\Author\Series - Book 5") == "filed to <path>"
+    assert pt(r"bat at C:\Users\someone\Desktop\x\Update Audiobooks.bat not found") == "bat at <path>"   # spaces in paths: the rest of the clause goes too
+    assert pt(r"NEW  Author / Series / Book 3 -> T:\Books\AudioBooks\Author\Series\Book 3  (new series)") == "NEW  Author / Series / Book 3 -> <path>(new series)"
+    assert pt("Audiobookshelf base resolved: http://localhost:13378/audiobookshelf/config -> http://localhost:13378/audiobookshelf") == "Audiobookshelf base resolved: <local url> -> <local url>"
+    assert pt("retry from Discord (somebody#1234)") == "retry from Discord"
+    assert pt("Ingested from Amazon: Riftside book 4 (audiobook 2026-10-02)") == "Ingested from Amazon: Riftside book 4 (audiobook 2026-10-02)"
+    assert pt(None) is None
+
+
+def _remote_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(radar, "save_state", lambda: None)
+    monkeypatch.setattr(radar, "add_log", lambda m: None)
+    monkeypatch.setattr(radar, "_bat_path", lambda: r"C:\Users\someone\Desktop\Update Audiobooks.bat")
+    monkeypatch.setattr(radar, "_libation_files_dir", lambda: r"C:\Users\someone\Libation")
+    radar._state = {"series": [], "log": [{"at": "2026-10-12T10:00:00", "msg": r"filed to T:\Books\X - Book 1"},
+                                          {"at": "2026-10-12T10:01:00", "msg": "Audiobookshelf base resolved: http://localhost:13378/a -> http://localhost:13378"}],
+                    "ext_commands": [], "cmd_seq": 0, "buy_ledger": {}, "discord_notified": [], "problems": {},
+                    "buy_jobs": [{"id": "j1", "series": "Riftside", "n": 4, "status": "done", "note": "bought",
+                                  "steps": [{"at": "x", "step": "retry", "ok": True, "detail": "retry from Discord (somebody)"}],
+                                  "token_hash": "abc"}],
+                    "settings": {"buy_bat": r"C:\Users\someone\Desktop\Update Audiobooks.bat", "abs_url": "http://localhost:13378"}}
+    return radar.app.test_client()
+
+
+def test_remote_views_carry_no_machine_or_identity_details(monkeypatch, tmp_path):
+    c = _remote_env(monkeypatch, tmp_path)
+    s = c.get("/api/settings", headers=REMOTE).get_json()
+    assert s["remote_readonly"] is True
+    assert s["buy_bat"] == "" and s["buy_bat_found"] == "" and s["buy_libation_found"] == "" and s["abs_url"] == ""
+    local = c.get("/api/settings").get_json()
+    assert local["buy_bat_found"].endswith("Update Audiobooks.bat")                     # the PC still sees its own paths
+    j = c.get("/api/buy/jobs", headers=REMOTE).get_json()
+    assert j["bat"] == "" and j["libation"] == ""
+    assert j["jobs"][0]["steps"][0]["detail"] == "retry from Discord" and j["jobs"][0]["token_hash"] is None
+    assert c.get("/api/buy/jobs").get_json()["jobs"][0]["steps"][0]["detail"] == "retry from Discord (somebody)"
+    st = c.get("/api/state", headers=REMOTE).get_json()
+    msgs = [e["msg"] for e in st["log"]]
+    assert msgs[0] == "filed to <path>" and "<local url>" in msgs[1] and "localhost" not in json.dumps(st["log"])
+    assert "localhost" in json.dumps(c.get("/api/state").get_json()["log"])
+
+
+def test_remote_holds_show_the_book_not_the_folder(monkeypatch, tmp_path):
+    c = _remote_env(monkeypatch, tmp_path)
+    held = tmp_path / "Libation Audiobooks" / "Somebody" / "Thing - Book 2"
+    held.mkdir(parents=True)
+    rep = tmp_path / "filer-report.json"
+    rep.write_text(json.dumps({"results": [{"author": "Somebody", "series": None, "book": "Thing - Book 2", "src": str(held),
+                                            "action": "HELD", "target": None, "reason": "ambiguous: 'Thing' exists under ['A', 'B']"}]}), encoding="utf-8")
+    monkeypatch.setattr(radar, "_filer_report_path", lambda: str(rep))
+    h = c.get("/api/holds", headers=REMOTE).get_json()["holds"]
+    assert h[0]["src"] == "Thing - Book 2" and h[0]["candidates"] == ["A", "B"]
+    assert c.get("/api/holds").get_json()["holds"][0]["src"] == str(held)
+
+
+def test_tunnel_can_demand_a_cloudflare_access_login(monkeypatch, tmp_path):
+    c = _remote_env(monkeypatch, tmp_path)
+    assert c.get("/api/state", headers=REMOTE).status_code == 200                       # default: read-only, open
+    radar._state["settings"]["tunnel_require_access"] = True
+    assert c.get("/api/state", headers=REMOTE).status_code == 403
+    assert c.get("/", headers=REMOTE).status_code == 403
+    assert c.get("/api/state", headers={**REMOTE, "Cf-Access-Authenticated-User-Email": "owner@example.org"}).status_code == 200
+    assert c.get("/api/state").status_code == 200                                       # the PC itself never needs it
+    # the switch cannot be flipped from the tunnel side
+    r = c.post("/api/settings", json={"tunnel_require_access": False}, headers={**REMOTE, "Cf-Access-Authenticated-User-Email": "owner@example.org"})
+    assert r.status_code == 403 and radar._state["settings"]["tunnel_require_access"] is True
+
+
+def test_public_text_second_pass_covers_ips_tags_webhooks_and_keeps_public_urls():
+    pt = radar._public_text
+    assert pt("Discord bot online as Alice-Chan#8496") == "Discord bot online as Discord"
+    assert pt("refused a remote POST (from 203.0.113.7)") == "refused a remote POST (from <ip>)"
+    assert pt("HTTP Error 400: https://discord.com/api/webhooks/123/abcTOKEN") == "HTTP Error 400: https://discord.com/api/webhooks/<redacted>"
+    assert pt("Ingested from https://www.amazon.com.au/dp/B0HJ9DX4S2") == "Ingested from https://www.amazon.com.au/dp/B0HJ9DX4S2"
+    assert pt("ABS at http://nas:13378/audiobookshelf and http://192.168.1.20:13378") == "ABS at <local url> and <local url>"
+    assert pt("copied from " + "\\\\" + r"nas\books\Author\Book 1 (new)") == "copied from <path>(new)"     # UNC share
+    assert pt("in /c/Users/someone/Desktop/x.bat today") == "in <path> today"
+
+
+def test_remote_ext_commands_poll_is_inert(monkeypatch, tmp_path):
+    c = _remote_env(monkeypatch, tmp_path)
+    radar._state["ext_commands"] = [{"id": "c1", "kind": "crawl"}]
+    seen = []
+    monkeypatch.setattr(radar, "_ext_seen", lambda: seen.append(1))
+    assert c.get("/api/ext-commands", headers=REMOTE).get_json() == {"commands": []} and seen == []
+    assert c.get("/api/ext-commands").get_json()["commands"][0]["id"] == "c1" and seen == [1]
+    assert c.get("/api/instance", headers=REMOTE).get_json()["pid"] == 0
+    assert c.get("/api/instance").get_json()["pid"] > 0
+
+
+def test_refused_requests_do_not_reach_the_public_activity_feed(monkeypatch, tmp_path):
+    c = _remote_env(monkeypatch, tmp_path)
+    logged = []
+    monkeypatch.setattr(radar, "add_log", lambda m: logged.append(m))
+    r = c.post("/api/series/clear", headers={**REMOTE, "Cf-Connecting-Ip": "203.0.113.77"})
+    assert r.status_code == 403 and logged == []
+    r = c.post("/api/quit", headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403 and logged == []
+
+
+def test_lan_devices_are_remote_too(monkeypatch, tmp_path):
+    c = _remote_env(monkeypatch, tmp_path)
+    r = c.get("/api/settings", environ_base={"REMOTE_ADDR": "192.168.1.55"}, headers={"Host": "127.0.0.1:8765"})
+    assert r.get_json()["remote_readonly"] is True and r.get_json()["buy_bat_found"] == ""
+    assert c.get("/api/settings", environ_base={"REMOTE_ADDR": "127.0.0.1"}).get_json()["remote_readonly"] is False
+
+
+def test_buy_page_escapes_what_it_shows(monkeypatch, tmp_path):
+    c = _remote_env(monkeypatch, tmp_path)
+    tok = "t" * 32
+    radar._state["buy_jobs"].append({"id": "j2", "series": "<img src=x onerror=alert(1)>", "n": 3, "title": "T & Co", "status": "awaiting_approval",
+                                     "note": r"queued from C:\Users\someone\x", "cap": 10, "price": 7.5,
+                                     "token_hash": radar._buy_token_hash(tok) if hasattr(radar, "_buy_token_hash") else None})
+    monkeypatch.setattr(radar, "_buy_find_by_token", lambda t: radar._state["buy_jobs"][-1] if t == tok else None)
+    html_out = c.get(f"/buy/{tok}", headers=REMOTE).get_data(as_text=True)
+    assert "<img src=x" not in html_out and "&lt;img src=x onerror=alert(1)&gt;" in html_out
+    assert "T &amp; Co" in html_out and "someone" not in html_out and "&lt;path&gt;" in html_out

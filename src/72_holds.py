@@ -36,9 +36,16 @@ def api_holds():
         authors = _fa._subdirs(_fa.DEFAULT_DST)
     except Exception:
         authors = []
+    remote = _is_remote()
     out = []
     for h in holds:
-        out.append({**h, "candidates": _hold_candidates(h.get("reason"))})
+        row = {**h, "candidates": _hold_candidates(h.get("reason"))}
+        if remote:
+            # over the tunnel: the book, never the machine's folder layout
+            for key in ("src", "target"):
+                if row.get(key):
+                    row[key] = os.path.basename(str(row[key]).rstrip("\\/"))
+        out.append(row)
     return jsonify({"holds": out, "authors": authors})
 
 

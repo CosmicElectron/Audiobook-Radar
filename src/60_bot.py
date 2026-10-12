@@ -66,7 +66,7 @@ def _notify_with_button(text, buttons, fallback):
             if not _bot_post(text, buttons):
                 _discord_notify(fallback)
         except Exception as e:  # noqa: BLE001
-            add_log(f"Discord notify error: {e}")
+            add_log(f"Discord notify error: {_no_secrets(str(e))}")
     threading.Thread(target=_go, daemon=True).start()
 
 
@@ -81,7 +81,10 @@ def handle_bot_button(custom_id, who="discord"):
                 return "that purchase job no longer exists."
             if job.get("status") not in BUY_RETRYABLE:
                 return f"nothing to retry — {job.get('series', '?')} #{job.get('n')} is {job.get('status')} now."
-            _buy_retry(job, who=f"Discord ({who})")
+            # the job record travels to the phone view: a fixed label there,
+            # the Discord user only in the file log
+            log.info("retry of %s pressed on Discord by %s", job.get("id"), who)
+            _buy_retry(job, who="Discord")
             save_state()
         return (f"\U0001f501 checking Amazon again for {job.get('series', '?')} #{job.get('n')} — "
                 "if you're signed in, it carries on by itself.")

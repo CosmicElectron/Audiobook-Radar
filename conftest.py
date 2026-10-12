@@ -28,5 +28,12 @@ _spec.loader.exec_module(radar)
 @pytest.fixture(autouse=True)
 def never_touch_the_real_data_file(tmp_path, monkeypatch):
     monkeypatch.setattr(radar, "DATA_FILE", str(tmp_path / "data.json"))
+    # the filer's machine-readable report feeds the dashboard's "Held books" and
+    # the tunnel: a test run once left a pytest temp path in the live one
+    try:
+        import file_audiobooks as _fa
+        monkeypatch.setattr(_fa, "REPORT_PATH", str(tmp_path / "filer-report.json"))
+    except ImportError:
+        pass
     monkeypatch.setattr(radar, "BACKUP_DIR", str(tmp_path / "backups"))
     monkeypatch.setattr(radar, "_LINES_DIR", str(tmp_path / "digest_lines"))

@@ -208,7 +208,9 @@
     </div>
     <div class="two">
       <div><label>Gmail app password</label><input id="buySmtpPass" type="password" placeholder="16-character app password" autocomplete="new-password"><div class="hint" id="buySmtpPassHint" style="margin:2px 0 0"></div></div>
-      <div><label>Public link base (for the phone)</label><input id="buyPublicBase" type="text" placeholder="https://radar.your-tunnel.example" autocomplete="off" spellcheck="false"></div>
+      <div><label>Public link base (for the phone)</label><input id="buyPublicBase" type="text" placeholder="https://radar.your-tunnel.example" autocomplete="off" spellcheck="false">
+        <label class="chk" style="margin-top:6px"><input type="checkbox" id="tunnelRequireAccess" style="width:auto;margin:0"> Require a Cloudflare Access login on the tunnel</label>
+        <div class="hint" style="margin:2px 0 0">Turn on after adding the hostname as a self-hosted application in Cloudflare Zero Trust with an Allow policy for your email. Requests that did not pass that login are refused, reads included. Local use is unaffected.</div></div>
     </div>
     <div class="hint">Gmail: turn on 2-Step Verification, then create an <b>App password</b> (Google Account → Security → App passwords). It is stored only on this PC and never shown again. Approval links open a page where you tap Approve or Deny — the link itself does nothing.</div>
     <label style="margin-top:10px">Update Audiobooks.bat</label>

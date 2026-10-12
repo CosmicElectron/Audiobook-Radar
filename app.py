@@ -1369,7 +1369,7 @@ def _discord_notify(text, embeds=None):
             else:
                 _problem_clear("discord", what="Discord messages are going through again.")
         except Exception as e:                  # noqa: BLE001 - a state write can fail; never die silently
-            add_log(f"Discord notify error: {e}")
+            add_log(f"Discord notify error: {_no_secrets(str(e))}")
 
     threading.Thread(target=_go, daemon=True).start()
 
@@ -1412,7 +1412,7 @@ def _alert_post(key, text):
             else:
                 _discord_notify(text)
         except Exception as e:  # noqa: BLE001
-            add_log(f"Discord alert error: {e}")
+            add_log(f"Discord alert error: {_no_secrets(str(e))}")
         finally:
             ev.set()
             _alert_inflight.pop(key, None)
@@ -2549,12 +2549,78 @@ def _is_remote():
     h = request.headers
     if h.get("Cf-Connecting-Ip") or h.get("Cf-Ray") or h.get("X-Forwarded-For"):
         return True
+    # bound to 0.0.0.0 (RADAR_HOST), a LAN device is not this machine either
+    if request.remote_addr and request.remote_addr not in ("127.0.0.1", "::1"):
+        return True
     host = (request.host or "").strip().lower()
     if host.startswith("["):                       # [::1]:8765
         host = host[1:host.find("]")] if "]" in host else host
     else:
         host = host.split(":")[0]
     return host not in ("127.0.0.1", "localhost", "::1", "")
+
+
+# What a stranger who knows the tunnel hostname may read. Release dates are
+# the point of the public page; the machine's folder layout, local URLs and
+# the Discord user who pressed a button are not (12 Oct 2026).
+# Windows paths carry spaces ("T:\Movies and TV shows\..."), so a path runs to
+# the next quote, bracket or line end; swallowing a trailing word is the safe
+# side of that trade
+_PUBLIC_PATH_RE = re.compile(r"\b[A-Za-z]:[\\/][^\"'<>|()\n]*|\\\\[^\s\\\"'<>|]+\\[^\"'<>|()\n]*|(?<![\w/])/[a-z]/Users/[^\s\"'<>|]*")
+_PUBLIC_URL_RE = re.compile(r"https?://([^\s/\"'<>:@]+)(?::\d+)?(?:/[^\s\"'<>]*)?", re.I)
+_PUBLIC_DISCORD_RE = re.compile(r"Discord \([^)]*\)|\b[\w.-]{2,32}#\d{4}\b")
+_PUBLIC_IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{1,4}\b", re.I)
+_PUBLIC_WEBHOOK_RE = re.compile(r"webhooks/\S+")
+
+
+def _is_private_host(h):
+    """Loopback, RFC1918, link-local, .local/.lan/.home, or a bare machine name."""
+    h = (h or "").strip("[]").lower()
+    if h in ("localhost", "::1") or h.startswith(("127.", "10.", "192.168.", "169.254.", "fe80:", "fd")):
+        return True
+    if h.startswith("172.") and h.split(".")[1].isdigit() and 16 <= int(h.split(".")[1]) <= 31:
+        return True
+    return "." not in h or h.endswith((".local", ".lan", ".home", ".internal", ".localdomain"))
+
+
+def _public_text(s):
+    """Text as it may leave the machine: local paths (drive, UNC, /c/Users),
+    private or single-label URLs, IP addresses, webhook tails and Discord
+    identities removed; public URLs and everything else intact."""
+    if not isinstance(s, str):
+        return s
+    s = _PUBLIC_WEBHOOK_RE.sub("webhooks/<redacted>", s)
+    s = _PUBLIC_PATH_RE.sub("<path>", s)
+    s = _PUBLIC_URL_RE.sub(lambda m: "<local url>" if _is_private_host(m.group(1)) else m.group(0), s)
+    s = _PUBLIC_IP_RE.sub("<ip>", s)
+    return _PUBLIC_DISCORD_RE.sub("Discord", s)
+
+
+def _public_job(job):
+    """A buy job for the phone view: steps and notes scrubbed, token hash gone."""
+    j = dict(job, token_hash=None)
+    if isinstance(j.get("note"), str):
+        j["note"] = _public_text(j["note"])
+    steps = []
+    for st in j.get("steps") or []:
+        if isinstance(st, dict):
+            st = dict(st)
+            for k in ("detail", "note", "who"):
+                if isinstance(st.get(k), str):
+                    st[k] = _public_text(st[k])
+        steps.append(st)
+    j["steps"] = steps
+    return j
+
+
+def _tunnel_login_missing():
+    """True when the owner asked for a Cloudflare Access login in front of the
+    tunnel and this remote request carries none. Access puts the signed-in
+    identity in Cf-Access-Authenticated-User-Email (and a JWT); a request
+    without it did not pass the login page."""
+    if not _is_remote() or not get_settings().get("tunnel_require_access"):
+        return False
+    return not (request.headers.get("Cf-Access-Authenticated-User-Email") or request.headers.get("Cf-Access-Jwt-Assertion"))
 
 
 @app.before_request
@@ -2568,16 +2634,22 @@ def _refuse_cross_site_writes():
        in front of it, so without this, anyone who learned the hostname could
        post to /api/quit or /api/series/clear, and GET /api/settings handed out
        the Discord webhook (it is masked for remote readers below)."""
+    if _tunnel_login_missing():
+        # the owner put Cloudflare Access in front of the tunnel: nothing, not
+        # even a read, for a request that did not come through its login
+        return jsonify({"error": "sign in through Cloudflare Access"}), 403
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     origin = request.headers.get("Origin")
     if _origin_kind(origin) == "web" and not (request.path.startswith("/buy/") and _is_own_origin(origin)):
-        add_log(f"refused a cross-site {request.method} to {request.path}")
+        # file log only: the activity feed is public over the tunnel, and a
+        # refused request carries attacker-chosen text and an IP
+        log.info("refused a cross-site %s to %s", request.method, request.path[:80])
         return jsonify({"error": "cross-site request refused"}), 403
     if _is_remote() and not request.path.startswith("/buy/"):
         # /buy/<token>/... is gated by its single-use token instead
-        add_log(f"refused a remote {request.method} to {request.path} "
-                f"(from {request.headers.get('Cf-Connecting-Ip') or request.remote_addr})")
+        log.info("refused a remote %s to %s (from %s)", request.method, request.path[:80],
+                 request.headers.get("Cf-Connecting-Ip") or request.remote_addr)
         return jsonify({"error": "read-only over the tunnel - make changes on the PC"}), 403
     return None
 
@@ -2632,7 +2704,7 @@ FAVICON_SVG = (
 @app.get("/api/instance")
 def api_instance():
     """Identity marker so a second launch can tell this port is already us."""
-    return jsonify({"app": "release-radar", "pid": os.getpid()})
+    return jsonify({"app": "release-radar", "pid": (0 if _is_remote() else os.getpid())})
 
 
 @app.get("/favicon.svg")
@@ -2650,6 +2722,19 @@ def api_state():
     p = build_state_payload()
     p["app_build"] = APP_BUILD
     p["ext_seen_s"] = int((datetime.now() - _ext_last_poll).total_seconds())
+    if _is_remote():
+        # the activity feed names local folders, local URLs and Discord users.
+        # Copies, never the shared state's own dicts: a remote read must not
+        # redact the owner's feed.
+        p["log"] = [dict(e, msg=_public_text(e["msg"])) if isinstance(e, dict) and isinstance(e.get("msg"), str) else e
+                    for e in (p.get("log") or [])]
+        probs = p.get("problems")
+        if isinstance(probs, list):
+            p["problems"] = [{k: (_public_text(v) if isinstance(v, str) else v) for k, v in pr.items()}
+                             if isinstance(pr, dict) else _public_text(pr) for pr in probs]
+        elif isinstance(probs, dict):
+            p["problems"] = {key: ({k: (_public_text(v) if isinstance(v, str) else v) for k, v in pr.items()}
+                                   if isinstance(pr, dict) else _public_text(pr)) for key, pr in probs.items()}
     return jsonify(p)
 
 
@@ -3024,6 +3109,11 @@ def _push_command(**cmd):
 
 @app.get("/api/ext-commands")
 def api_ext_commands_get():
+    if _is_remote():
+        # only the extension on this machine polls this; a visitor must not be
+        # able to mark it alive (and silence the extension-down alarm) or read
+        # its queue
+        return jsonify({"commands": []})
     _ext_seen()
     with _lock:
         cmds = list(_state.get("ext_commands", []))
@@ -3567,7 +3657,7 @@ def _discord_live_start(text, embeds=None):
             mid = json.loads(resp.read().decode("utf-8", "replace")).get("id")
         return f"{wh.split('?')[0]}/messages/{mid}" if mid else None
     except Exception as e:      # noqa: BLE001
-        add_log(f"Discord live message failed: {e}")
+        add_log(f"Discord live message failed: {_no_secrets(str(e))}")
         return None
 
 
@@ -4128,7 +4218,7 @@ def _notify_with_button(text, buttons, fallback):
             if not _bot_post(text, buttons):
                 _discord_notify(fallback)
         except Exception as e:  # noqa: BLE001
-            add_log(f"Discord notify error: {e}")
+            add_log(f"Discord notify error: {_no_secrets(str(e))}")
     threading.Thread(target=_go, daemon=True).start()
 
 
@@ -4143,7 +4233,10 @@ def handle_bot_button(custom_id, who="discord"):
                 return "that purchase job no longer exists."
             if job.get("status") not in BUY_RETRYABLE:
                 return f"nothing to retry — {job.get('series', '?')} #{job.get('n')} is {job.get('status')} now."
-            _buy_retry(job, who=f"Discord ({who})")
+            # the job record travels to the phone view: a fixed label there,
+            # the Discord user only in the file log
+            log.info("retry of %s pressed on Discord by %s", job.get("id"), who)
+            _buy_retry(job, who="Discord")
             save_state()
         return (f"\U0001f501 checking Amazon again for {job.get('series', '?')} #{job.get('n')} — "
                 "if you're signed in, it carries on by itself.")
@@ -5744,11 +5837,18 @@ def _buy_tick():
 # ---- routes (local: dashboard + extension)
 @app.get("/api/buy/jobs")
 def api_buy_jobs():
+    remote = _is_remote()
     with _lock:
         jobs = [dict(j, token_hash=None) for j in reversed(_state.get("buy_jobs", []))]
         ledger = dict(_state.get("buy_ledger", {}))
+    if remote:
+        # the phone view gets the jobs, not local paths, who-approved-it
+        # identities or the purchase ledger
+        jobs = [_public_job(j) for j in jobs]
+        ledger = {}
     return jsonify({"jobs": jobs[:30], "ledger": ledger, "week_auto": _buy_week_count(),
-                    "bat": _bat_path() or "", "libation": _libation_files_dir() or ""})
+                    "bat": "" if remote else (_bat_path() or ""),
+                    "libation": "" if remote else (_libation_files_dir() or "")})
 
 
 @app.post("/api/buy/report")
@@ -5905,9 +6005,16 @@ def api_holds():
         authors = _fa._subdirs(_fa.DEFAULT_DST)
     except Exception:
         authors = []
+    remote = _is_remote()
     out = []
     for h in holds:
-        out.append({**h, "candidates": _hold_candidates(h.get("reason"))})
+        row = {**h, "candidates": _hold_candidates(h.get("reason"))}
+        if remote:
+            # over the tunnel: the book, never the machine's folder layout
+            for key in ("src", "target"):
+                if row.get(key):
+                    row[key] = os.path.basename(str(row[key]).rstrip("\\/"))
+        out.append(row)
     return jsonify({"holds": out, "authors": authors})
 
 
@@ -6026,12 +6133,17 @@ def buy_page(token):
             return Response(_BUY_PAGE % "<h1>Unknown or used link</h1><div class='m'>Nothing was done.</div>", mimetype="text/html"), 404
         price = job.get("price")
         ptxt = f"${price:.2f}" if isinstance(price, (int, float)) else "price unknown"
+        # this page is served on the public hostname: every field escaped, the
+        # note scrubbed like anything else that leaves the machine
+        esc = lambda v: html.escape(str(v or ""))                # noqa: E731
+        series, n, title = esc(job.get("series")), esc(job.get("n")), esc(job.get("title"))
+        note, status = esc(_public_text(job.get("note") or "")), esc(job["status"])
         if job["status"] != "awaiting_approval":
-            body = f"<h1>Already decided</h1><div class='t'>{job.get('series','')} — book {job.get('n')}</div><div class='m'>Status: {job['status']}. {job.get('note','')}</div>"
+            body = f"<h1>Already decided</h1><div class='t'>{series} — book {n}</div><div class='m'>Status: {status}. {note}</div>"
             return Response(_BUY_PAGE % body, mimetype="text/html")
-        body = (f"<h1>Buy this audiobook?</h1><div class='t'>{job.get('series','')} — book {job.get('n')}</div>"
-                f"<div class='m'>{job.get('title','')}</div><div class='p'>{ptxt}</div>"
-                f"<div class='m'>Cap ${float(job.get('cap') or 0):.2f} · {job.get('note','')}</div>"
+        body = (f"<h1>Buy this audiobook?</h1><div class='t'>{series} — book {n}</div>"
+                f"<div class='m'>{title}</div><div class='p'>{ptxt}</div>"
+                f"<div class='m'>Cap ${float(job.get('cap') or 0):.2f} · {note}</div>"
                 f"<div class='m'>Borrows the Kindle edition on KU, buys the audiobook at the companion price, returns the borrow, runs Update Audiobooks.</div>"
                 f"<form method='post' action='/buy/{token}/approve'><button class='ok'>Approve</button></form>"
                 f"<form method='post' action='/buy/{token}/deny'><button class='no'>Deny</button></form>")
@@ -6196,8 +6308,10 @@ def api_get_settings():
                     "buy_smtp_user": ("" if remote else s.get("buy_smtp_user", "")),
                     "buy_smtp_pass_set": bool(s.get("buy_smtp_pass")),
                     "buy_public_base": s.get("buy_public_base", ""),
-                    "buy_bat": s.get("buy_bat", ""),
-                    "buy_bat_found": _bat_path() or "",
+                    # local folder layout never leaves the machine
+                    "buy_bat": ("" if remote else s.get("buy_bat", "")),
+                    "buy_bat_found": ("" if remote else (_bat_path() or "")),
+                    "tunnel_require_access": bool(s.get("tunnel_require_access")),
                     "buy_tab_mode": s.get("buy_tab_mode", "foreground"),
                     "bot_token_set": bool(s.get("bot_token")),
                     "bot_running": _bot_state["running"], "bot_err": _bot_state["err"],
@@ -6210,7 +6324,7 @@ def api_get_settings():
                     "abs_token_set": bool(s.get("abs_token")),
                     "abs_write_status": bool(s.get("abs_write_status", True)),
                     "abs_written_count": len(_state.get("abs_written") or {}),
-                    "buy_libation_found": _libation_files_dir() or ""})
+                    "buy_libation_found": ("" if remote else (_libation_files_dir() or ""))})
 
 
 @app.post("/api/settings")
@@ -6265,6 +6379,8 @@ def api_set_settings():
             s["ai_model"] = (body.get("ai_model") or "").strip()
         if "abs_url" in body:
             s["abs_url"] = (body.get("abs_url") or "").strip().rstrip("/")
+        if "tunnel_require_access" in body and not _is_remote():
+            s["tunnel_require_access"] = bool(body.get("tunnel_require_access"))
         if "abs_write_status" in body:
             want = bool(body.get("abs_write_status"))
             if want != bool(s.get("abs_write_status", True)):

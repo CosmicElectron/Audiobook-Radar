@@ -23,12 +23,17 @@ def buy_page(token):
             return Response(_BUY_PAGE % "<h1>Unknown or used link</h1><div class='m'>Nothing was done.</div>", mimetype="text/html"), 404
         price = job.get("price")
         ptxt = f"${price:.2f}" if isinstance(price, (int, float)) else "price unknown"
+        # this page is served on the public hostname: every field escaped, the
+        # note scrubbed like anything else that leaves the machine
+        esc = lambda v: html.escape(str(v or ""))                # noqa: E731
+        series, n, title = esc(job.get("series")), esc(job.get("n")), esc(job.get("title"))
+        note, status = esc(_public_text(job.get("note") or "")), esc(job["status"])
         if job["status"] != "awaiting_approval":
-            body = f"<h1>Already decided</h1><div class='t'>{job.get('series','')} — book {job.get('n')}</div><div class='m'>Status: {job['status']}. {job.get('note','')}</div>"
+            body = f"<h1>Already decided</h1><div class='t'>{series} — book {n}</div><div class='m'>Status: {status}. {note}</div>"
             return Response(_BUY_PAGE % body, mimetype="text/html")
-        body = (f"<h1>Buy this audiobook?</h1><div class='t'>{job.get('series','')} — book {job.get('n')}</div>"
-                f"<div class='m'>{job.get('title','')}</div><div class='p'>{ptxt}</div>"
-                f"<div class='m'>Cap ${float(job.get('cap') or 0):.2f} · {job.get('note','')}</div>"
+        body = (f"<h1>Buy this audiobook?</h1><div class='t'>{series} — book {n}</div>"
+                f"<div class='m'>{title}</div><div class='p'>{ptxt}</div>"
+                f"<div class='m'>Cap ${float(job.get('cap') or 0):.2f} · {note}</div>"
                 f"<div class='m'>Borrows the Kindle edition on KU, buys the audiobook at the companion price, returns the borrow, runs Update Audiobooks.</div>"
                 f"<form method='post' action='/buy/{token}/approve'><button class='ok'>Approve</button></form>"
                 f"<form method='post' action='/buy/{token}/deny'><button class='no'>Deny</button></form>")
@@ -193,8 +198,10 @@ def api_get_settings():
                     "buy_smtp_user": ("" if remote else s.get("buy_smtp_user", "")),
                     "buy_smtp_pass_set": bool(s.get("buy_smtp_pass")),
                     "buy_public_base": s.get("buy_public_base", ""),
-                    "buy_bat": s.get("buy_bat", ""),
-                    "buy_bat_found": _bat_path() or "",
+                    # local folder layout never leaves the machine
+                    "buy_bat": ("" if remote else s.get("buy_bat", "")),
+                    "buy_bat_found": ("" if remote else (_bat_path() or "")),
+                    "tunnel_require_access": bool(s.get("tunnel_require_access")),
                     "buy_tab_mode": s.get("buy_tab_mode", "foreground"),
                     "bot_token_set": bool(s.get("bot_token")),
                     "bot_running": _bot_state["running"], "bot_err": _bot_state["err"],
@@ -207,7 +214,7 @@ def api_get_settings():
                     "abs_token_set": bool(s.get("abs_token")),
                     "abs_write_status": bool(s.get("abs_write_status", True)),
                     "abs_written_count": len(_state.get("abs_written") or {}),
-                    "buy_libation_found": _libation_files_dir() or ""})
+                    "buy_libation_found": ("" if remote else (_libation_files_dir() or ""))})
 
 
 @app.post("/api/settings")
@@ -262,6 +269,8 @@ def api_set_settings():
             s["ai_model"] = (body.get("ai_model") or "").strip()
         if "abs_url" in body:
             s["abs_url"] = (body.get("abs_url") or "").strip().rstrip("/")
+        if "tunnel_require_access" in body and not _is_remote():
+            s["tunnel_require_access"] = bool(body.get("tunnel_require_access"))
         if "abs_write_status" in body:
             want = bool(body.get("abs_write_status"))
             if want != bool(s.get("abs_write_status", True)):

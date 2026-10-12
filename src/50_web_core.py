@@ -57,12 +57,78 @@ def _is_remote():
     h = request.headers
     if h.get("Cf-Connecting-Ip") or h.get("Cf-Ray") or h.get("X-Forwarded-For"):
         return True
+    # bound to 0.0.0.0 (RADAR_HOST), a LAN device is not this machine either
+    if request.remote_addr and request.remote_addr not in ("127.0.0.1", "::1"):
+        return True
     host = (request.host or "").strip().lower()
     if host.startswith("["):                       # [::1]:8765
         host = host[1:host.find("]")] if "]" in host else host
     else:
         host = host.split(":")[0]
     return host not in ("127.0.0.1", "localhost", "::1", "")
+
+
+# What a stranger who knows the tunnel hostname may read. Release dates are
+# the point of the public page; the machine's folder layout, local URLs and
+# the Discord user who pressed a button are not (12 Oct 2026).
+# Windows paths carry spaces ("T:\Movies and TV shows\..."), so a path runs to
+# the next quote, bracket or line end; swallowing a trailing word is the safe
+# side of that trade
+_PUBLIC_PATH_RE = re.compile(r"\b[A-Za-z]:[\\/][^\"'<>|()\n]*|\\\\[^\s\\\"'<>|]+\\[^\"'<>|()\n]*|(?<![\w/])/[a-z]/Users/[^\s\"'<>|]*")
+_PUBLIC_URL_RE = re.compile(r"https?://([^\s/\"'<>:@]+)(?::\d+)?(?:/[^\s\"'<>]*)?", re.I)
+_PUBLIC_DISCORD_RE = re.compile(r"Discord \([^)]*\)|\b[\w.-]{2,32}#\d{4}\b")
+_PUBLIC_IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{1,4}\b", re.I)
+_PUBLIC_WEBHOOK_RE = re.compile(r"webhooks/\S+")
+
+
+def _is_private_host(h):
+    """Loopback, RFC1918, link-local, .local/.lan/.home, or a bare machine name."""
+    h = (h or "").strip("[]").lower()
+    if h in ("localhost", "::1") or h.startswith(("127.", "10.", "192.168.", "169.254.", "fe80:", "fd")):
+        return True
+    if h.startswith("172.") and h.split(".")[1].isdigit() and 16 <= int(h.split(".")[1]) <= 31:
+        return True
+    return "." not in h or h.endswith((".local", ".lan", ".home", ".internal", ".localdomain"))
+
+
+def _public_text(s):
+    """Text as it may leave the machine: local paths (drive, UNC, /c/Users),
+    private or single-label URLs, IP addresses, webhook tails and Discord
+    identities removed; public URLs and everything else intact."""
+    if not isinstance(s, str):
+        return s
+    s = _PUBLIC_WEBHOOK_RE.sub("webhooks/<redacted>", s)
+    s = _PUBLIC_PATH_RE.sub("<path>", s)
+    s = _PUBLIC_URL_RE.sub(lambda m: "<local url>" if _is_private_host(m.group(1)) else m.group(0), s)
+    s = _PUBLIC_IP_RE.sub("<ip>", s)
+    return _PUBLIC_DISCORD_RE.sub("Discord", s)
+
+
+def _public_job(job):
+    """A buy job for the phone view: steps and notes scrubbed, token hash gone."""
+    j = dict(job, token_hash=None)
+    if isinstance(j.get("note"), str):
+        j["note"] = _public_text(j["note"])
+    steps = []
+    for st in j.get("steps") or []:
+        if isinstance(st, dict):
+            st = dict(st)
+            for k in ("detail", "note", "who"):
+                if isinstance(st.get(k), str):
+                    st[k] = _public_text(st[k])
+        steps.append(st)
+    j["steps"] = steps
+    return j
+
+
+def _tunnel_login_missing():
+    """True when the owner asked for a Cloudflare Access login in front of the
+    tunnel and this remote request carries none. Access puts the signed-in
+    identity in Cf-Access-Authenticated-User-Email (and a JWT); a request
+    without it did not pass the login page."""
+    if not _is_remote() or not get_settings().get("tunnel_require_access"):
+        return False
+    return not (request.headers.get("Cf-Access-Authenticated-User-Email") or request.headers.get("Cf-Access-Jwt-Assertion"))
 
 
 @app.before_request
@@ -76,16 +142,22 @@ def _refuse_cross_site_writes():
        in front of it, so without this, anyone who learned the hostname could
        post to /api/quit or /api/series/clear, and GET /api/settings handed out
        the Discord webhook (it is masked for remote readers below)."""
+    if _tunnel_login_missing():
+        # the owner put Cloudflare Access in front of the tunnel: nothing, not
+        # even a read, for a request that did not come through its login
+        return jsonify({"error": "sign in through Cloudflare Access"}), 403
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     origin = request.headers.get("Origin")
     if _origin_kind(origin) == "web" and not (request.path.startswith("/buy/") and _is_own_origin(origin)):
-        add_log(f"refused a cross-site {request.method} to {request.path}")
+        # file log only: the activity feed is public over the tunnel, and a
+        # refused request carries attacker-chosen text and an IP
+        log.info("refused a cross-site %s to %s", request.method, request.path[:80])
         return jsonify({"error": "cross-site request refused"}), 403
     if _is_remote() and not request.path.startswith("/buy/"):
         # /buy/<token>/... is gated by its single-use token instead
-        add_log(f"refused a remote {request.method} to {request.path} "
-                f"(from {request.headers.get('Cf-Connecting-Ip') or request.remote_addr})")
+        log.info("refused a remote %s to %s (from %s)", request.method, request.path[:80],
+                 request.headers.get("Cf-Connecting-Ip") or request.remote_addr)
         return jsonify({"error": "read-only over the tunnel - make changes on the PC"}), 403
     return None
 
@@ -140,7 +212,7 @@ FAVICON_SVG = (
 @app.get("/api/instance")
 def api_instance():
     """Identity marker so a second launch can tell this port is already us."""
-    return jsonify({"app": "release-radar", "pid": os.getpid()})
+    return jsonify({"app": "release-radar", "pid": (0 if _is_remote() else os.getpid())})
 
 
 @app.get("/favicon.svg")
@@ -158,6 +230,19 @@ def api_state():
     p = build_state_payload()
     p["app_build"] = APP_BUILD
     p["ext_seen_s"] = int((datetime.now() - _ext_last_poll).total_seconds())
+    if _is_remote():
+        # the activity feed names local folders, local URLs and Discord users.
+        # Copies, never the shared state's own dicts: a remote read must not
+        # redact the owner's feed.
+        p["log"] = [dict(e, msg=_public_text(e["msg"])) if isinstance(e, dict) and isinstance(e.get("msg"), str) else e
+                    for e in (p.get("log") or [])]
+        probs = p.get("problems")
+        if isinstance(probs, list):
+            p["problems"] = [{k: (_public_text(v) if isinstance(v, str) else v) for k, v in pr.items()}
+                             if isinstance(pr, dict) else _public_text(pr) for pr in probs]
+        elif isinstance(probs, dict):
+            p["problems"] = {key: ({k: (_public_text(v) if isinstance(v, str) else v) for k, v in pr.items()}
+                                   if isinstance(pr, dict) else _public_text(pr)) for key, pr in probs.items()}
     return jsonify(p)
 
 
@@ -532,6 +617,11 @@ def _push_command(**cmd):
 
 @app.get("/api/ext-commands")
 def api_ext_commands_get():
+    if _is_remote():
+        # only the extension on this machine polls this; a visitor must not be
+        # able to mark it alive (and silence the extension-down alarm) or read
+        # its queue
+        return jsonify({"commands": []})
     _ext_seen()
     with _lock:
         cmds = list(_state.get("ext_commands", []))

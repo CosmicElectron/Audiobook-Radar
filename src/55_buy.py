@@ -525,7 +525,7 @@ def _discord_live_start(text, embeds=None):
             mid = json.loads(resp.read().decode("utf-8", "replace")).get("id")
         return f"{wh.split('?')[0]}/messages/{mid}" if mid else None
     except Exception as e:      # noqa: BLE001
-        add_log(f"Discord live message failed: {e}")
+        add_log(f"Discord live message failed: {_no_secrets(str(e))}")
         return None
 
 
